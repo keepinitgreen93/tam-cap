@@ -2,6 +2,8 @@ import type { HttpApi } from "@effect/platform";
 import type { Context, Layer as EffectLayer } from "effect";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("server-only", () => ({}));
+
 const mocks = vi.hoisted(() => ({
 	manifest: {} as Record<string, unknown>,
 	recordedLength: null as string | null,

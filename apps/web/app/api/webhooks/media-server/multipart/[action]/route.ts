@@ -1,18 +1,14 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend";
-import { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
-import { getProcessingState } from "@/lib/desktop-recording-jobs";
-import { getDesktopRecordingOutputKey } from "@/lib/desktop-recording-source";
 import {
 	LOOM_IMPORT_MAX_BYTES,
 	LOOM_IMPORT_PART_BYTES,
-} from "@/lib/loom-import-upload";
+} from "@/lib/loom-import-limits";
+import { getMediaMultipartVideo } from "@/lib/media-multipart-context";
 import { runPromise } from "@/lib/server";
 import { decodeStorageVideo } from "@/lib/video-storage";
 
@@ -69,92 +65,15 @@ async function getMultipartContext(
 	payload: MultipartPayload,
 	allowExpired = false,
 ) {
-	const [video] = await db()
-		.select()
-		.from(videos)
-		.where(eq(videos.id, Video.VideoId.make(payload.videoId)));
-
-	if (!video) {
+	const context = await getMediaMultipartVideo(db(), payload, allowExpired);
+	if ("error" in context)
 		return {
 			response: NextResponse.json(
-				{ error: "Video not found" },
-				{ status: 404 },
+				{ error: context.error },
+				{ status: context.status },
 			),
 		};
-	}
-
-	const fenced =
-		payload.generation !== undefined || payload.attemptId !== undefined;
-	const loom =
-		payload.loomImportAttemptId !== undefined ||
-		video.metadata?.loomImportUpload !== undefined;
-	if (loom) {
-		const receipt = video.metadata?.loomImportUpload;
-		const upload = [receipt?.source, receipt?.output].find(
-			(value) =>
-				value?.key === payload.key && value.uploadId === payload.uploadId,
-		);
-		if (
-			fenced ||
-			!receipt ||
-			receipt.attemptId !== payload.loomImportAttemptId ||
-			(video.metadata?.loomImportRun &&
-				!receipt.attemptId.startsWith(
-					`${video.metadata.loomImportRun.runId}:`,
-				)) ||
-			receipt.ownerId !== video.ownerId ||
-			receipt.organizationId !== video.orgId ||
-			!upload ||
-			!payload.key.startsWith(`${video.ownerId}/${video.id}/`)
-		) {
-			return {
-				response: NextResponse.json(
-					{ error: "Loom import upload is no longer current" },
-					{ status: 409 },
-				),
-			};
-		}
-	}
-	const expectedKey =
-		fenced && payload.generation && payload.attemptId
-			? getDesktopRecordingOutputKey(
-					video.ownerId,
-					video.id,
-					payload.generation,
-					payload.attemptId,
-				)
-			: `${video.ownerId}/${video.id}/result.mp4`;
-	if (
-		(!loom && payload.key !== expectedKey) ||
-		(fenced && (!payload.generation || !payload.attemptId))
-	) {
-		return {
-			response: NextResponse.json(
-				{ error: "Invalid multipart upload key" },
-				{ status: 400 },
-			),
-		};
-	}
-	if (fenced && !allowExpired) {
-		const job = await getProcessingState({ videoId: video.id });
-		if (
-			!job ||
-			job.ownerId !== video.ownerId ||
-			job.state !== "processing" ||
-			!job.source ||
-			job.generation !== payload.generation ||
-			job.attemptId !== payload.attemptId ||
-			!job.leaseExpiresAt ||
-			job.leaseExpiresAt <= new Date()
-		) {
-			return {
-				response: NextResponse.json(
-					{ error: "Recording attempt is no longer active" },
-					{ status: 409 },
-				),
-			};
-		}
-	}
+	const { video, fenced, loom } = context;
 
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),
@@ -274,9 +193,7 @@ export async function POST(
 			const result = await multipartContext.bucket.multipart
 				.complete(payload.data.key, payload.data.uploadId, {
 					MultipartUpload: { Parts: parts },
-					...(multipartContext.fenced || multipartContext.loom
-						? { IfNoneMatch: "*" }
-						: {}),
+					IfNoneMatch: "*",
 				})
 				.pipe(runPromise);
 

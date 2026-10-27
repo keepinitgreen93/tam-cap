@@ -1,254 +1,128 @@
-import { userIsPro } from "@cap/utils";
-import { Organisation } from "@cap/web-domain";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { organizationMembers, users } from "@cap/database/cloudflare/schema";
+import { eq } from "drizzle-orm";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import {
+	addTestSeat,
+	createTestOwner,
+	createTestTeam,
+} from "../helpers/cloudflare-team";
 
-const mocks = vi.hoisted(() => ({
-	getCurrentUser: vi.fn(),
-	requireManager: vi.fn(),
-	selectResults: [] as unknown[][],
-	user: { thirdPartyStripeSubscriptionId: null as string | null },
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	user: vi.fn(),
 }));
-
-const tables = vi.hoisted(() => ({
-	organizationMembers: {
-		id: "memberId",
-		userId: "memberUserId",
-		organizationId: "memberOrgId",
-		hasProSeat: "hasProSeat",
-	},
-	organizations: { id: "orgId", ownerId: "ownerId" },
-	users: {
-		id: "userId",
-		inviteQuota: "inviteQuota",
-		stripeSubscriptionId: "subscriptionId",
-		stripeSubscriptionStatus: "subscriptionStatus",
-		thirdPartyStripeSubscriptionId: "thirdPartySubscriptionId",
-	},
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
 }));
-
-const lockRows = vi.fn();
-const reads: { table: unknown; joined: boolean; locked: boolean }[] = [];
-const updates: { table: unknown; value: Record<string, unknown> }[] = [];
-
-type SelectQuery = Promise<unknown[]> & {
-	from(table: unknown): SelectQuery;
-	innerJoin(): SelectQuery;
-	where(): SelectQuery;
-	limit(): SelectQuery;
-	for(mode: string): SelectQuery;
-};
-
-function selectQuery() {
-	const read = { table: undefined as unknown, joined: false, locked: false };
-	reads.push(read);
-	const query: SelectQuery = Object.assign(
-		Promise.resolve(mocks.selectResults.shift() ?? []),
-		{
-			from: (table: unknown) => {
-				read.table = table;
-				return query;
-			},
-			innerJoin: () => {
-				read.joined = true;
-				return query;
-			},
-			where: () => query,
-			limit: () => query,
-			for: (mode: string) => {
-				read.locked = true;
-				lockRows(mode, read.table);
-				return query;
-			},
-		},
-	);
-	return query;
-}
-
-const database = {
-	select: vi.fn(selectQuery),
-	update: vi.fn((table: unknown) => ({
-		set: (value: Record<string, unknown>) => {
-			updates.push({ table, value });
-			if (table === tables.users && "thirdPartyStripeSubscriptionId" in value) {
-				mocks.user.thirdPartyStripeSubscriptionId =
-					(value.thirdPartyStripeSubscriptionId as string | null) ?? null;
-			}
-			return { where: async () => [{ affectedRows: 1 }] };
-		},
-	})),
-	transaction: vi.fn(async (fn: (tx: typeof database) => Promise<unknown>) =>
-		fn(database),
-	),
-};
-
-vi.mock("@cap/database", () => ({ db: () => database }));
-vi.mock("@cap/env", () => ({ buildEnv: { NEXT_PUBLIC_IS_CAP: "true" } }));
-vi.mock("@cap/database/auth/session", () => ({
-	getCurrentUser: mocks.getCurrentUser,
-}));
-vi.mock("@cap/database/schema", () => tables);
-vi.mock("@/actions/organization/authorization", () => ({
-	requireOrganizationProSeatManager: mocks.requireManager,
-}));
+vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: state.user }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
-const organizationId = Organisation.OrganisationId.make("org");
+import { toggleProSeat } from "@/actions/organization/toggle-pro-seat";
 
-async function toggle(enable: boolean) {
-	const { toggleProSeat } = await import(
-		"@/actions/organization/toggle-pro-seat"
-	);
-	return toggleProSeat("member", organizationId, enable);
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let team: Awaited<ReturnType<typeof createTestTeam>>;
+const toggle = (enable: boolean) =>
+	toggleProSeat(team.invite.memberId, team.owner.activeOrganizationId, enable);
+async function recipient() {
+	const [user] = await fixture.database
+		.select()
+		.from(users)
+		.where(eq(users.id, team.user.id));
+	if (!user) throw new Error("Fixture missing");
+	return user;
 }
-
-async function turnSeatOff(
-	remainingSeats: { stripeSubscriptionId: string | null }[],
-) {
-	mocks.selectResults = [
-		[{ id: "member", userId: "teammate", hasProSeat: true }],
-		[{ id: "teammate" }],
-		remainingSeats,
-	];
-	await toggle(false);
+async function seat() {
+	const [member] = await fixture.database
+		.select()
+		.from(organizationMembers)
+		.where(eq(organizationMembers.id, team.invite.memberId));
+	if (!member) throw new Error("Fixture missing");
+	return member;
 }
-
-function memberIsPro() {
-	return userIsPro({ stripeSubscriptionStatus: null, ...mocks.user });
-}
-
-describe("toggleProSeat", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
-		updates.length = 0;
-		reads.length = 0;
-		mocks.selectResults = [];
-		mocks.user.thirdPartyStripeSubscriptionId = "sub_this_org";
-		mocks.getCurrentUser.mockResolvedValue({ id: "owner" });
-		mocks.requireManager.mockResolvedValue({ ownerId: "owner", role: "owner" });
+describe("self-hosted seat control on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
 	});
-
-	describe("turning a seat off", () => {
-		it("clears Pro when the user has no other seat", async () => {
-			await turnSeatOff([]);
-
-			expect(updates[0]).toEqual({
-				table: tables.organizationMembers,
-				value: { hasProSeat: false },
-			});
-			expect(mocks.user.thirdPartyStripeSubscriptionId).toBeNull();
-			expect(memberIsPro()).toBe(false);
-		});
-
-		it("keeps Pro when a manager-sponsored seat remains", async () => {
-			await turnSeatOff([{ stripeSubscriptionId: null }]);
-
-			expect(mocks.user.thirdPartyStripeSubscriptionId).toBe("sub_this_org");
-			expect(memberIsPro()).toBe(true);
-		});
-
-		it("moves Pro onto a remaining seat the organization owner pays for", async () => {
-			await turnSeatOff([{ stripeSubscriptionId: "sub_other" }]);
-
-			expect(mocks.user.thirdPartyStripeSubscriptionId).toBe("sub_other");
-			expect(memberIsPro()).toBe(true);
-		});
-
-		it("prefers a paid seat when sponsored and paid seats both remain", async () => {
-			await turnSeatOff([
-				{ stripeSubscriptionId: null },
-				{ stripeSubscriptionId: "sub_other" },
-			]);
-
-			expect(mocks.user.thirdPartyStripeSubscriptionId).toBe("sub_other");
-			expect(memberIsPro()).toBe(true);
-		});
-
-		it("locks the member row and then the user row inside the transaction", async () => {
-			await turnSeatOff([{ stripeSubscriptionId: "sub_other" }]);
-
-			expect(database.transaction).toHaveBeenCalledTimes(1);
-			expect(database.select).toHaveBeenCalledTimes(3);
-			expect(lockRows.mock.calls).toEqual([
-				["update", tables.organizationMembers],
-				["update", tables.users],
-			]);
-			expect(reads.find((read) => !read.locked)).toEqual({
-				table: tables.organizationMembers,
-				joined: true,
-				locked: false,
-			});
-		});
-
-		it("does nothing when the seat is already off", async () => {
-			mocks.selectResults = [
-				[{ id: "member", userId: "teammate", hasProSeat: false }],
-			];
-
-			await toggle(false);
-
-			expect(updates).toEqual([]);
-			expect(mocks.user.thirdPartyStripeSubscriptionId).toBe("sub_this_org");
-		});
+	afterAll(async () => fixture.dispose());
+	beforeEach(async () => {
+		team = await createTestTeam(fixture.database);
+		state.user.mockReset().mockResolvedValue(team.owner);
 	});
-
-	describe("turning a seat on", () => {
-		const owner = {
-			id: "owner",
-			inviteQuota: 3,
-			stripeSubscriptionId: "sub_owner",
-			stripeSubscriptionStatus: "active",
-		};
-		const members = [
-			{ id: "owner-member", userId: "owner", hasProSeat: false },
-			{ id: "member", userId: "teammate", hasProSeat: false },
-		];
-
-		it("assigns the seat and points Pro at the seat provider", async () => {
-			mocks.user.thirdPartyStripeSubscriptionId = null;
-			mocks.selectResults = [
-				[{ id: "member", userId: "teammate", hasProSeat: false }],
-				members,
-				[owner],
-			];
-
-			await toggle(true);
-
-			expect(updates).toEqual([
-				{ table: tables.organizationMembers, value: { hasProSeat: true } },
-				{
-					table: tables.users,
-					value: { thirdPartyStripeSubscriptionId: "sub_owner" },
-				},
-			]);
-			expect(database.select).toHaveBeenCalledTimes(3);
-			expect(lockRows).toHaveBeenCalledTimes(2);
-			expect(memberIsPro()).toBe(true);
-		});
-
-		it("refuses when no Pro seats remain", async () => {
-			mocks.user.thirdPartyStripeSubscriptionId = null;
-			mocks.selectResults = [
-				[{ id: "member", userId: "teammate", hasProSeat: false }],
-				members,
-				[{ ...owner, inviteQuota: 1 }],
-			];
-
-			await expect(toggle(true)).rejects.toThrow("No Pro seats remaining");
-			expect(updates).toEqual([]);
-		});
-
-		it("refuses without an active subscription to sponsor the seat", async () => {
-			mocks.user.thirdPartyStripeSubscriptionId = null;
-			mocks.selectResults = [
-				[{ id: "member", userId: "teammate", hasProSeat: false }],
-				members,
-				[{ ...owner, stripeSubscriptionStatus: "canceled" }],
-			];
-
-			await expect(toggle(true)).rejects.toThrow(
-				"An active Cap Pro subscription is required",
-			);
-			expect(updates).toEqual([]);
-		});
+	it("clears legacy subscription sponsorship when no other seat remains", async () => {
+		await toggle(false);
+		expect((await seat()).hasProSeat).toBe(false);
+		expect((await recipient()).thirdPartyStripeSubscriptionId).toBeNull();
+	});
+	it("keeps legacy sponsorship when an unpaid manager-sponsored seat remains", async () => {
+		await addTestSeat(fixture.database, team.user, null);
+		await toggle(false);
+		expect((await recipient()).thirdPartyStripeSubscriptionId).toBe(
+			"sub_original",
+		);
+	});
+	it("moves legacy sponsorship to a remaining paid seat", async () => {
+		await addTestSeat(fixture.database, team.user, "sub_other");
+		await toggle(false);
+		expect((await recipient()).thirdPartyStripeSubscriptionId).toBe(
+			"sub_other",
+		);
+	});
+	it("prefers a remaining paid seat over an unpaid one", async () => {
+		await addTestSeat(fixture.database, team.user, null);
+		await addTestSeat(fixture.database, team.user, "sub_other");
+		await toggle(false);
+		expect((await recipient()).thirdPartyStripeSubscriptionId).toBe(
+			"sub_other",
+		);
+	});
+	it("keeps repeated removal consistent", async () => {
+		await toggle(false);
+		await toggle(false);
+		expect((await seat()).hasProSeat).toBe(false);
+		expect((await recipient()).thirdPartyStripeSubscriptionId).toBeNull();
+	});
+	it("permits self-hosted seat activation without a hosted billing subscription", async () => {
+		await toggle(false);
+		expect(await toggle(true)).toEqual({ success: true });
+		expect((await seat()).hasProSeat).toBe(true);
+		expect((await recipient()).thirdPartyStripeSubscriptionId).toBeNull();
+	});
+	it("rejects users outside the organization management roster", async () => {
+		const other = await createTestOwner(fixture.database);
+		state.user.mockResolvedValue(other);
+		await expect(toggle(false)).rejects.toThrow();
+		expect((await seat()).hasProSeat).toBe(true);
+	});
+	it("rejects changing the organization's owner's seat", async () => {
+		const [ownerMember] = await fixture.database
+			.select()
+			.from(organizationMembers)
+			.where(eq(organizationMembers.userId, team.owner.id));
+		if (!ownerMember) throw new Error("Owner member missing");
+		await expect(
+			toggleProSeat(ownerMember.id, team.owner.activeOrganizationId, true),
+		).rejects.toThrow("organization owner");
+	});
+	it("rejects a member ID from another organization", async () => {
+		await expect(
+			toggleProSeat(
+				team.invite.memberId,
+				team.user.activeOrganizationId,
+				false,
+			),
+		).rejects.toThrow();
+		expect((await seat()).hasProSeat).toBe(true);
 	});
 });

@@ -63,6 +63,15 @@ export async function getVideoStatus(
 
 	const metadata: VideoMetadata = (video.metadata as VideoMetadata) || {};
 
+	if (
+		video.transcriptionStatus === "PROCESSING" &&
+		metadata.transcriptionRun &&
+		metadata.transcriptionRun.dispatch !== "accepted" &&
+		isTranscriptionConfigured(serverEnv())
+	) {
+		await transcribeVideo(videoId, video.ownerId);
+	}
+
 	if (!video.transcriptionStatus && isTranscriptionConfigured(serverEnv())) {
 		const activeUpload = await db()
 			.select({
@@ -107,12 +116,8 @@ export async function getVideoStatus(
 			`[Get Status] Transcription not started for video ${videoId}, triggering transcription`,
 		);
 		try {
-			transcribeVideo(videoId, video.ownerId).catch((error) => {
-				console.error(
-					`[Get Status] Error starting transcription for video ${videoId}:`,
-					error,
-				);
-			});
+			const started = await transcribeVideo(videoId, video.ownerId);
+			if (!started.success) throw new Error(started.message);
 
 			return {
 				transcriptionStatus: "PROCESSING",
@@ -156,9 +161,11 @@ export async function getVideoStatus(
 
 	const shouldTriggerAiGeneration =
 		video.transcriptionStatus === "COMPLETE" &&
-		!metadata.aiGenerationStatus &&
-		!metadata.summary &&
-		isAiConfigured();
+		isAiConfigured() &&
+		((!metadata.aiGenerationStatus && !metadata.summary) ||
+			(["QUEUED", "PROCESSING"].includes(metadata.aiGenerationStatus ?? "") &&
+				metadata.aiGenerationRun &&
+				metadata.aiGenerationRun.dispatch !== "accepted"));
 
 	if (shouldTriggerAiGeneration) {
 		try {
@@ -177,12 +184,8 @@ export async function getVideoStatus(
 				console.log(
 					`[Get Status] AI generation not started for video ${videoId}, triggering generation`,
 				);
-				startAiGeneration(videoId, video.ownerId).catch((error) => {
-					console.error(
-						`[Get Status] Error starting AI generation for video ${videoId}:`,
-						error,
-					);
-				});
+				const started = await startAiGeneration(videoId, video.ownerId);
+				if (!started.success) throw new Error(started.message);
 
 				return {
 					transcriptionStatus:

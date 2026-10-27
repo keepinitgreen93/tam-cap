@@ -17,8 +17,10 @@ import {
 } from "@/lib/desktop-recording-verification";
 import { queueDesktopSegmentsFinalization } from "@/lib/desktop-segments-finalization";
 import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota";
+import { loomImportSourcePublication } from "@/lib/loom-import-artifacts";
 import { signalLoomImportFinished } from "@/lib/loom-import-signal";
 import { getLoomImportSignalToken } from "@/lib/loom-import-signal-token";
+import { ownsLoomImportSource } from "@/lib/loom-import-state";
 import {
 	queueVideoTranscription,
 	shouldQueueTranscriptionAfterMediaComplete,
@@ -225,6 +227,17 @@ export async function POST(request: NextRequest) {
 		const loomAttempt = currentVideo.metadata?.loomImportRun?.mediaDispatch;
 		if (
 			loomAttempt &&
+			!ownsLoomImportSource(
+				currentVideo,
+				currentVideo.metadata?.loomImportRun?.runId ?? "",
+			)
+		)
+			return NextResponse.json({
+				success: true,
+				status: "stale-import-source",
+			});
+		if (
+			loomAttempt &&
 			(request.nextUrl.searchParams.get("signal") !==
 				getLoomImportSignalToken(videoId, loomAttempt.attemptId) ||
 				(loomAttempt.jobId && loomAttempt.jobId !== payload.jobId))
@@ -359,6 +372,7 @@ export async function POST(request: NextRequest) {
 						.update(videos)
 						.set({
 							metadata,
+							...loomImportSourcePublication(video, metadata),
 							...(receipt ? { source: { type: "desktopMP4" as const } } : {}),
 							...(payload.metadata
 								? {

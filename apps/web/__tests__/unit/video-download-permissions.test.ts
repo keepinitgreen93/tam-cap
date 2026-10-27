@@ -3,8 +3,8 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ query: vi.fn() }));
 
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const client = drizzle(mocks.query);
 	return { db: () => client };
 });
@@ -30,17 +30,17 @@ beforeEach(() => {
 	spaceMember = false;
 	mocks.query.mockImplementation(async (query: string, params: unknown[]) => {
 		if (query.includes("inner join")) {
-			const organization = query.includes("`organization_members`");
+			const organization = query.includes('"organization_members"');
 			const membershipTable = organization
 				? "organization_members"
 				: "space_members";
 			const shareTable = organization ? "shared_videos" : "space_videos";
 			const key = organization ? "organizationId" : "spaceId";
 			expect(query).toContain(
-				`\`${shareTable}\`.\`${key}\` = \`${membershipTable}\`.\`${key}\``,
+				`"${shareTable}"."${key}" = "${membershipTable}"."${key}"`,
 			);
-			expect(query).toContain(`\`${membershipTable}\`.\`userId\` = ?`);
-			expect(query).toContain(`\`${shareTable}\`.\`videoId\` = ?`);
+			expect(query).toContain(`"${membershipTable}"."userId" = ?`);
+			expect(query).toContain(`"${shareTable}"."videoId" = ?`);
 			expect(query).toContain("limit ?");
 			expect(params).toEqual([OTHER, VIDEO, 1]);
 			const allowed = organization
@@ -48,16 +48,16 @@ beforeEach(() => {
 				: spaceShared && spaceMember;
 			return { rows: allowed ? [["membership-1"]] : [] };
 		}
-		if (query.includes("from `shared_videos`")) {
+		if (query.includes('from "shared_videos"')) {
 			return { rows: organizationShared ? [["org-1"]] : [] };
 		}
-		if (query.includes("from `organization_members`")) {
+		if (query.includes('from "organization_members"')) {
 			return { rows: organizationMember ? [["membership-1"]] : [] };
 		}
-		if (query.includes("from `space_videos`")) {
+		if (query.includes('from "space_videos"')) {
 			return { rows: spaceShared ? [["space-1"]] : [] };
 		}
-		if (query.includes("from `space_members`")) {
+		if (query.includes('from "space_members"')) {
 			return { rows: spaceMember ? [["membership-1"]] : [] };
 		}
 		throw new Error(`Unexpected query: ${query}`);
@@ -120,7 +120,7 @@ describe("canUserDownloadVideo", () => {
 
 	it("allows an org member even when the prefetched space lookup fails", async () => {
 		mocks.query.mockImplementation(async (query: string) => {
-			if (query.includes("`space_videos`"))
+			if (query.includes('"space_videos"'))
 				throw new Error("Space lookup failed");
 			return { rows: [["organization-member"]] };
 		});
@@ -130,7 +130,7 @@ describe("canUserDownloadVideo", () => {
 	it("propagates an org lookup failure even when the space lookup succeeds", async () => {
 		const failure = new Error("Organization lookup failed");
 		mocks.query.mockImplementation(async (query: string) => {
-			if (query.includes("`shared_videos`")) throw failure;
+			if (query.includes('"shared_videos"')) throw failure;
 			return { rows: [["space-member"]] };
 		});
 		await expect(call()).rejects.toMatchObject({ cause: failure });
@@ -139,7 +139,7 @@ describe("canUserDownloadVideo", () => {
 	it("propagates a space lookup failure when there is no org membership", async () => {
 		const failure = new Error("Space lookup failed");
 		mocks.query.mockImplementation(async (query: string) => {
-			if (query.includes("`space_videos`")) throw failure;
+			if (query.includes('"space_videos"')) throw failure;
 			return { rows: [] };
 		});
 		await expect(call()).rejects.toMatchObject({ cause: failure });

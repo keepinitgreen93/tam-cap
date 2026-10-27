@@ -1,7 +1,7 @@
 import type { User } from "@cap/web-domain";
 import { sql } from "drizzle-orm";
 import type { MySql2Database } from "drizzle-orm/mysql2";
-import { loopsSyncJobs } from "../schema";
+import { loopsSyncJobs } from "../legacy/schema";
 
 export async function enqueueLoopsSync(
 	database: Pick<MySql2Database, "insert">,

@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { organizations, signedBaas, users } from "@cap/database/schema";
+import { db } from "@cap/database/legacy";
+import { organizations, signedBaas, users } from "@cap/database/legacy/schema";
 import {
 	isProSubscription,
 	STRIPE_SIGNED_BAA_PRICE_IDS,
@@ -70,6 +70,10 @@ export async function ensureBaaHasPro(
 	subscription: Stripe.Subscription,
 	record: BaaIdentity,
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor BAA billing is unavailable on this self-hosted instance",
+		);
 	if (!isSignedBaaSubscription(subscription)) {
 		throw new Error("The subscription is not a Signed BAA.");
 	}
@@ -136,6 +140,10 @@ export async function attachPaidBaaCheckout(
 		organizationId: Organisation.OrganisationId;
 	},
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor BAA billing is unavailable on this self-hosted instance",
+		);
 	if (
 		session.mode !== "subscription" ||
 		session.status !== "complete" ||

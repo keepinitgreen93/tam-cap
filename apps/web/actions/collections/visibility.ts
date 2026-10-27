@@ -2,12 +2,14 @@
 
 import { getCurrentUser } from "@cap/database/auth/session";
 import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import { spaces } from "@cap/database/cloudflare/schema";
 import { PublicCollection, Space } from "@cap/web-domain";
 import { eq, type SQL, sql } from "drizzle-orm";
 import { Either, Schema } from "effect";
 import { revalidatePath } from "next/cache";
 import { isOrganizationOwnerPro } from "@/lib/org-pro";
+import { requireManagedSpace } from "@/lib/organization-settings-persistence";
 import { getSpaceAccess } from "../organization/space-authorization";
 
 const decodeSettingsPatch = Schema.decodeUnknownEither(
@@ -91,8 +93,16 @@ export async function setSpaceCollectionVisibility(input: {
 		)})`;
 	}
 
-	if (Object.keys(update).length > 0)
-		await db().update(spaces).set(update).where(eq(spaces.id, id));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireManagedSpace(snapshot, user.id, id);
+		return {
+			statements: Object.keys(update).length
+				? [database.update(spaces).set(update).where(eq(spaces.id, id))]
+				: [],
+			result: undefined,
+		};
+	});
 
 	revalidatePath("/dashboard");
 	revalidatePath(`/dashboard/spaces/${id}`);

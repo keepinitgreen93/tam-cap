@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizations } from "@cap/database/schema";
+import { organizations } from "@cap/database/legacy/schema";
 import type { Organisation } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { requireOrganizationSettingsManager } from "./authorization";
@@ -11,6 +11,10 @@ import { checkDomainStatus } from "./domain-utils";
 export async function checkOrganizationDomain(
 	organizationId: Organisation.OrganisationId,
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Domain provisioning is managed by this instance's operator",
+		);
 	const user = await getCurrentUser();
 
 	if (!user || !organizationId) {

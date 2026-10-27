@@ -5,6 +5,7 @@ import { generateText, stepCountIs, tool } from "ai";
 import { z } from "zod";
 import { runWithAiProviders } from "@/lib/ai/run";
 import { CAP_REFERENCE_GUIDE, MESSENGER_AGENT_PROMPT } from "./constants";
+import { buildSelfHostedMessengerPrompt } from "./self-hosted-prompt";
 import { getKnowledgeTag, searchSupermemory } from "./supermemory";
 
 type ConversationMessage = {
@@ -63,7 +64,12 @@ const supportEmailInputSchema = z.object({
 
 const SUPPORT_EMAIL_TOOL_NAME = "send_support_email";
 const SUPPORT_EMAIL_TOOL_DESCRIPTION =
-	"Send a concise support email to the Cap team after the signed-in user explicitly asks or agrees. The server controls the recipient, sender, reply-to address, account email, conversation id, and rate limit.";
+	"Send a concise support email to the configured instance support contact after the signed-in user explicitly asks or agrees. The server controls the recipient, sender, reply-to address, account email, conversation id, and rate limit.";
+
+const supportContact = () =>
+	process.env.CAP_RUNTIME === "cloudflare"
+		? process.env.CAP_OWNER_EMAIL?.trim() || "your workspace administrator"
+		: "hello@cap.so";
 
 const buildSystemPrompt = ({
 	userIdentity,
@@ -74,9 +80,15 @@ const buildSystemPrompt = ({
 	context: string;
 	supportEmailAvailable: boolean;
 }) =>
-	[
-		MESSENGER_AGENT_PROMPT,
-		`You are chatting with a Cap user in a live support chat. This is a real conversation, not a ticket. Write like you're messaging a colleague, not composing a formal email.
+	process.env.CAP_RUNTIME === "cloudflare"
+		? buildSelfHostedMessengerPrompt({
+				userIdentity,
+				context,
+				supportEmailAvailable,
+			})
+		: [
+				MESSENGER_AGENT_PROMPT,
+				`You are chatting with a Cap user in a live support chat. This is a real conversation, not a ticket. Write like you're messaging a colleague, not composing a formal email.
 
 Critical rules:
 - You ARE a Cap employee. Cap is YOUR company. ALWAYS use "we", "our", "us" when talking about Cap, its features, plans, and decisions. Never refer to Cap in the third person like an outsider. For example say "we built this to be lightweight" not "Cap is lightweight", say "our Pro plan includes..." not "Cap Pro includes...", say "we support Mac and Windows" not "Cap works on Mac and Windows". You're on the team, talk like it.
@@ -94,22 +106,22 @@ Critical rules:
 - Be genuinely helpful, personable, and respectful. You represent Cap and should leave the user feeling good about the interaction.
 - ONLY discuss Cap and topics directly related to Cap (screen recording, sharing, account, billing, technical issues with Cap, etc.). If a user asks about other apps, competitors, or unrelated topics, politely steer the conversation back to Cap. Never recommend, compare, or discuss competing products or unrelated software.
 - If you notice the conversation is going in circles, the user seems frustrated, or their issue isn't getting resolved after a few back-and-forth messages, offer to send it to the team if the support email tool is available. If the tool is unavailable, gently suggest emailing the configured instance support contact for more hands-on help.`,
-		supportEmailAvailable
-			? `Support email tool:
+				supportEmailAvailable
+					? `Support email tool:
 - You can send one support email to the configured instance support contact by using send_support_email, but only after the user explicitly asks you to send it or agrees to your offer.
 - Never ask for, accept, or invent a sender or recipient email address. The server uses the signed-in account email automatically.
 - Keep the email subject short and the body factual. Include the user's issue, useful details already shared, and what they need from the team.
 - After the tool result, tell the user briefly whether it was sent. If the tool says rate_limited, say they can still email the configured instance support contact directly.`
-			: `Support email:
+					: `Support email:
 - You cannot send support email for this user in the current chat. If a hands-on review is needed, ask them to email the configured instance support contact directly.`,
-		CAP_REFERENCE_GUIDE,
-		`The person you're talking to: ${userIdentity}`,
-		context
-			? `Additional context from knowledge base (use it to inform your answer naturally, don't quote it directly):\n${context}`
-			: "",
-	]
-		.filter((line) => line.length > 0)
-		.join("\n\n");
+				CAP_REFERENCE_GUIDE,
+				`The person you're talking to: ${userIdentity}`,
+				context
+					? `Additional context from knowledge base (use it to inform your answer naturally, don't quote it directly):\n${context}`
+					: "",
+			]
+				.filter((line) => line.length > 0)
+				.join("\n\n");
 
 const mapHistoryForLlm = (history: ConversationMessage[]) =>
 	history.slice(-20).map((message) => ({
@@ -137,7 +149,7 @@ const readSupportEmailInput = (input: unknown) => {
 
 const formatSupportEmailToolResult = (result: SupportEmailToolResult) => {
 	if (result.status === "sent") {
-		return `Support email sent to the configured instance support contact from the user's account email. Remaining sends today: ${result.remainingToday}.`;
+		return `Support email sent to ${supportContact()} from the user's account email. Remaining sends today: ${result.remainingToday}.`;
 	}
 	return "Support email was not sent because this user has reached the 2 emails per day limit.";
 };
@@ -150,9 +162,9 @@ const fallbackReplyFromSupportEmailToolResults = (
 		return "Done, I sent that to the team from your account email. We'll follow up with you there.";
 	}
 	if (firstToolResult?.isError) {
-		return "I couldn't send that to the team right now. Please email the configured instance support contact directly.";
+		return `I couldn't send that to the team right now. Please contact ${supportContact()} directly.`;
 	}
-	return "I couldn't send another support email from your account today. You're limited to 2 per day, but you can still email the configured instance support contact directly.";
+	return `I couldn't send another support email from your account today. You're limited to 2 per day, but you can still email ${supportContact()} directly.`;
 };
 
 const executeSupportEmailTool = async ({
@@ -293,6 +305,8 @@ export const generateMessengerAgentReply = async ({
 		if (state.toolResults.length > 0) {
 			return fallbackReplyFromSupportEmailToolResults(state.toolResults);
 		}
-		return MESSENGER_APOLOGY_REPLY;
+		return process.env.CAP_RUNTIME === "cloudflare"
+			? `I couldn't answer that right now. Please try again or contact ${supportContact()} for help.`
+			: MESSENGER_APOLOGY_REPLY;
 	}
 };

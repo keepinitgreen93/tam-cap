@@ -1,383 +1,310 @@
-import type { SQL } from "drizzle-orm";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	folders,
+	importedVideos,
+	sharedVideos,
+	users,
+	videos,
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { and, eq } from "drizzle-orm";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestTeam } from "../helpers/cloudflare-team";
 
-const mocks = vi.hoisted(() => ({
-	selects: [] as unknown[][],
-	updates: [] as Array<Record<string, unknown>>,
-	inserts: [] as Array<Record<string, unknown>>,
-	shares: [] as unknown[][],
-	deletes: 0,
-	member: vi.fn(),
-	provision: vi.fn(),
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
 	reassign: vi.fn(),
 }));
-
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", () => {
-	const selection = {
-		from: () => selection,
-		innerJoin: () => selection,
-		where: () => selection,
-		limit: async () => mocks.selects.shift() ?? [],
-		for: async () => [],
-		then: (resolve: (rows: unknown[]) => void) =>
-			resolve(mocks.shares.shift() ?? []),
-	};
-	const handle = {
-		select: () => selection,
-		update: () => ({
-			set: (values: Record<string, unknown>) => ({
-				where: async () => {
-					mocks.updates.push(values);
-				},
-			}),
-		}),
-		insert: () => ({
-			values: async (values: Record<string, unknown>) => {
-				mocks.inserts.push(values);
-			},
-		}),
-		delete: () => ({
-			where: async () => {
-				mocks.deletes++;
-			},
-		}),
-	};
-	return {
-		db: () => ({
-			...handle,
-			transaction: async (run: (tx: typeof handle) => Promise<unknown>) =>
-				run(handle),
-			select: () => selection,
-			update: () => ({
-				set: (values: Record<string, unknown>) => ({
-					where: async () => {
-						mocks.updates.push(values);
-					},
-				}),
-			}),
-			insert: () => ({
-				values: async (values: Record<string, unknown>) => {
-					mocks.inserts.push(values);
-				},
-			}),
-		}),
-	};
-});
-vi.mock("@cap/database/helpers", () => ({ nanoId: () => "shareaaaaaaaaaa" }));
-vi.mock("@cap/database/schema", () => ({
-	folders: { id: "f.id", organizationId: "f.org", spaceId: "f.space" },
-	importedVideos: { id: "i.id", orgId: "i.org", source: "i.source" },
-	organizations: { id: "o.id", ownerId: "o.owner" },
-	sharedVideos: {
-		id: "s.id",
-		videoId: "s.video",
-		organizationId: "s.org",
-		folderId: "s.folder",
-	},
-	videos: {
-		id: "v.id",
-		ownerId: "v.owner",
-		orgId: "v.org",
-		folderId: "v.folder",
-		effectiveCreatedAt: "v.date",
-		metadata: "v.metadata",
-	},
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
 }));
-vi.mock("@/lib/loom-csv-import", () => ({
-	getOrganizationMemberByEmail: mocks.member,
-	normalizeImportEmail: (email: string) => email.trim().toLowerCase(),
-	isValidImportEmail: (email: string) =>
-		/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email),
-}));
-vi.mock("@/lib/organization-provisioning", () => ({
-	provisionOrganizationInvitee: mocks.provision,
+vi.mock("@cap/env", () => ({
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "false" },
+	serverEnv: () => ({}),
 }));
 vi.mock("@/lib/loom-import-reassign", () => ({
-	reassignLoomImport: mocks.reassign,
+	reassignLoomImport: state.reassign,
 }));
 
-import { backfillLoomImport } from "@/lib/loom-import-backfill";
+import {
+	backfillLoomImport,
+	type LoomBackfillItem,
+} from "@/lib/loom-import-backfill";
 
-const org = "orgaaaaaaaaaaaa";
-const video = (overrides: Record<string, unknown> = {}) => ({
-	ownerId: "lukeaaaaaaaaaaa",
-	folderId: "folderaaaaaaaaa",
-	effectiveCreatedAt: new Date("2026-09-23T10:00:00Z"),
-	orgOwnerId: "lukeaaaaaaaaaaa",
-	...overrides,
-});
-
-beforeEach(() => {
-	mocks.selects = [];
-	mocks.updates = [];
-	mocks.inserts = [];
-	mocks.shares = [];
-	mocks.deletes = 0;
-	mocks.member.mockReset().mockResolvedValue({ userId: "mdaueraaaaaaaaa" });
-	mocks.provision.mockReset().mockResolvedValue({ userId: "newaaaaaaaaaaaa" });
-	mocks.reassign
-		.mockReset()
-		.mockResolvedValue({ status: "moved", copiedObjects: 3, cleanup: "done" });
-});
-
-const lukeFolder = (id = "folderbbbbbbbbb") => ({
-	id,
-	createdById: "lukeaaaaaaaaaaa",
-});
-
-describe("backfillLoomImport", () => {
-	it("moves the owner without touching sharing, into the sheet folder", async () => {
-		mocks.selects = [
-			[video()],
-			[lukeFolder()],
-			[lukeFolder("folderaaaaaaaaa")],
-		];
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				ownerEmail: "MDauer@greenprojecttech.com",
-				folderId: "folderbbbbbbbbb",
-			}),
-		).resolves.toEqual({
-			videoId: "videoaaaaaaaaaa",
-			status: "updated",
-			changes: ["owner", "folder"],
-		});
-		expect(mocks.member).toHaveBeenCalledWith(
-			org,
-			"mdauer@greenprojecttech.com",
-		);
-		expect(mocks.reassign).toHaveBeenCalledWith({
-			organizationId: org,
-			videoId: "videoaaaaaaaaaa",
-			fromUserId: "lukeaaaaaaaaaaa",
-			toUserId: "mdaueraaaaaaaaa",
-			options: { keepSharing: true, folderId: "folderbbbbbbbbb" },
-		});
-		expect(mocks.updates).toEqual([]);
+let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
+let team: Awaited<ReturnType<typeof createTestTeam>>;
+let videoId: typeof videos.$inferSelect.id;
+let ownFolder: typeof folders.$inferSelect.id;
+let targetFolder: typeof folders.$inferSelect.id;
+const invoke = (item: Partial<LoomBackfillItem> = {}) =>
+	backfillLoomImport(
+		team.owner.activeOrganizationId,
+		{ videoId, ...item },
+		team.owner.id,
+	);
+async function currentVideo() {
+	const [video] = await runtime.database
+		.select()
+		.from(videos)
+		.where(eq(videos.id, videoId));
+	if (!video) throw new Error("Fixture missing");
+	return video;
+}
+describe("Loom metadata backfill on D1", () => {
+	beforeAll(async () => {
+		runtime = await createTestDatabase();
+		state.database = runtime.database;
 	});
-
-	it("clears an inherited folder the new owner could not open", async () => {
-		mocks.selects = [
-			[video({ orgOwnerId: "owneraaaaaaaaaa" })],
-			[{ id: "folderaaaaaaaaa", createdById: "lukeaaaaaaaaaaa" }],
-		];
-		await backfillLoomImport(org, {
-			videoId: "videoaaaaaaaaaa",
-			ownerEmail: "mdauer@greenprojecttech.com",
+	afterAll(async () => runtime.dispose());
+	afterEach(() => vi.unstubAllEnvs());
+	beforeEach(async () => {
+		team = await createTestTeam(runtime.database);
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		vi.stubEnv("CAP_OWNER_EMAIL", team.owner.email);
+		videoId = nanoId() as typeof videos.$inferSelect.id;
+		ownFolder = nanoId() as typeof folders.$inferSelect.id;
+		targetFolder = nanoId() as typeof folders.$inferSelect.id;
+		await runtime.database.insert(folders).values([
+			{
+				id: ownFolder,
+				name: "Old personal folder",
+				organizationId: team.owner.activeOrganizationId,
+				createdById: team.owner.id,
+			},
+			{
+				id: targetFolder,
+				name: "Target personal folder",
+				organizationId: team.owner.activeOrganizationId,
+				createdById: team.user.id,
+			},
+		]);
+		await runtime.database
+			.insert(videos)
+			.values({
+				id: videoId,
+				ownerId: team.owner.id,
+				orgId: team.owner.activeOrganizationId,
+				folderId: ownFolder,
+				name: "Backfill",
+				source: { type: "webMP4" },
+				createdAt: new Date("2026-09-23T10:00:00Z"),
+			});
+		await runtime.database
+			.insert(importedVideos)
+			.values({
+				id: videoId,
+				orgId: team.owner.activeOrganizationId,
+				source: "loom",
+				sourceId: nanoId(),
+			});
+		state.reassign.mockReset().mockImplementation(async (input) => {
+			await runtime.database
+				.update(videos)
+				.set({ ownerId: input.toUserId, folderId: input.options.folderId })
+				.where(eq(videos.id, videoId));
+			return { status: "moved", copiedObjects: 3, cleanup: "done" };
 		});
-		expect(mocks.reassign).toHaveBeenCalledWith(
+	});
+	it("moves into the target owner's sheet folder while preserving sharing", async () => {
+		expect(
+			await invoke({
+				ownerEmail: team.user.email.toUpperCase(),
+				folderId: targetFolder,
+			}),
+		).toMatchObject({ status: "updated", changes: ["owner", "folder"] });
+		expect(state.reassign).toHaveBeenCalledWith(
 			expect.objectContaining({
-				options: { keepSharing: true, folderId: null },
+				operatorId: team.owner.id,
+				toUserId: team.user.id,
+				options: { keepSharing: true, folderId: targetFolder },
 			}),
 		);
+		expect((await currentVideo()).ownerId).toBe(team.user.id);
 	});
-
-	it("adds an owner who is not in the workspace yet", async () => {
-		mocks.selects = [[video()], [lukeFolder("folderaaaaaaaaa")]];
-		mocks.member.mockResolvedValue(null);
-		await backfillLoomImport(org, {
-			videoId: "videoaaaaaaaaaa",
-			ownerEmail: "zephy@greenprojecttech.com",
-		});
-		expect(mocks.provision).toHaveBeenCalledWith({
-			organizationId: org,
-			email: "zephy@greenprojecttech.com",
-			invitedByUserId: "lukeaaaaaaaaaaa",
-			role: "member",
-		});
-		expect(mocks.reassign).toHaveBeenCalledWith(
-			expect.objectContaining({ toUserId: "newaaaaaaaaaaaa" }),
-		);
+	it("clears inherited folders inaccessible to the new owner", async () => {
+		await invoke({ ownerEmail: team.user.email });
+		expect((await currentVideo()).folderId).toBeNull();
 	});
-
-	it("never creates accounts for invalid owner emails", async () => {
-		mocks.selects = [[video()]];
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				ownerEmail: "unknown",
-			}),
-		).resolves.toMatchObject({
+	it("provisions missing owners through the existing invitation contract", async () => {
+		const email = `${nanoId()}@example.com`;
+		await invoke({ ownerEmail: email });
+		const [user] = await runtime.database
+			.select()
+			.from(users)
+			.where(eq(users.email, email));
+		expect(user).toBeDefined();
+		expect((await currentVideo()).ownerId).toBe(user?.id);
+	});
+	it("does not provision invalid owner emails", async () => {
+		expect(await invoke({ ownerEmail: "invalid" })).toMatchObject({
 			status: "skipped",
 			reason: "invalid owner email",
 		});
-		expect(mocks.member).not.toHaveBeenCalled();
-		expect(mocks.provision).not.toHaveBeenCalled();
+		expect(state.reassign).not.toHaveBeenCalled();
 	});
-
-	it("leaves the owner alone when it already matches", async () => {
-		mocks.selects = [[video()], [lukeFolder("folderaaaaaaaaa")]];
-		mocks.member.mockResolvedValue({ userId: "lukeaaaaaaaaaaa" });
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				ownerEmail: "luke@greenprojecttech.com",
-			}),
-		).resolves.toMatchObject({ status: "unchanged" });
-		expect(mocks.reassign).not.toHaveBeenCalled();
-	});
-
-	it("sets the original date and the folder", async () => {
-		mocks.selects = [[video({ folderId: null })], [lukeFolder()]];
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				folderId: "folderbbbbbbbbb",
-				effectiveCreatedAt: "2023-09-14T16:11:20.773Z",
-			}),
-		).resolves.toMatchObject({ changes: ["folder", "date"] });
-		expect(mocks.updates[0]).toEqual({ folderId: "folderbbbbbbbbb" });
-		expect(mocks.updates).toHaveLength(2);
-	});
-
-	it("skips a date that already matches", async () => {
-		mocks.selects = [[video()], [lukeFolder("folderaaaaaaaaa")]];
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				effectiveCreatedAt: "2026-09-23T10:00:00.000Z",
-			}),
-		).resolves.toMatchObject({ status: "unchanged" });
-	});
-
-	it("shares into the team folder once and folds duplicate shares", async () => {
-		mocks.selects = [
-			[video()],
-			[lukeFolder("teamfolderaaaaa")],
-			[lukeFolder("folderaaaaaaaaa")],
-		];
-		mocks.shares = [[]];
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				shareFolderId: "teamfolderaaaaa",
-			}),
-		).resolves.toMatchObject({ changes: ["shared"] });
-		expect(mocks.inserts[0]).toMatchObject({
-			videoId: "videoaaaaaaaaaa",
-			organizationId: org,
-			folderId: "teamfolderaaaaa",
+	it("leaves matching ownership alone", async () => {
+		expect(await invoke({ ownerEmail: team.owner.email })).toMatchObject({
+			status: "unchanged",
 		});
-		mocks.selects = [
-			[video()],
-			[lukeFolder("teamfolderaaaaa")],
-			[lukeFolder("folderaaaaaaaaa")],
-		];
-		mocks.shares = [
-			[
-				{ id: "share1", folderId: "teamfolderaaaaa" },
-				{ id: "share2", folderId: "otherfolderaaaa" },
-			],
-		];
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				shareFolderId: "teamfolderaaaaa",
-			}),
-		).resolves.toMatchObject({ changes: ["shared"] });
-		expect(mocks.deletes).toBe(1);
-		expect(mocks.inserts).toHaveLength(1);
+		expect(state.reassign).not.toHaveBeenCalled();
 	});
-
-	it.each([
-		[[], "not a Loom import here"],
-		[[video(), []], "folder not in this workspace"],
-		[
-			[video(), [{ id: "folderbbbbbbbbb", createdById: "someoneaaaaaaaa" }]],
-			"folder belongs to someone other than the owner",
-		],
-	])("refuses unsafe changes: %#", async (selects, reason) => {
-		mocks.selects = (selects as unknown[]).map((row) =>
-			Array.isArray(row) ? row : [row],
-		);
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				folderId: "folderbbbbbbbbb",
-				ownerEmail: "x@y.co",
-			}),
-		).resolves.toMatchObject({ status: "skipped", reason });
-		expect(mocks.reassign).not.toHaveBeenCalled();
+	it("updates date and folder together without replacing sibling metadata", async () => {
+		await runtime.database
+			.update(videos)
+			.set({ metadata: { summary: "Preserve me" } })
+			.where(eq(videos.id, videoId));
+		const date = "2023-09-14T16:11:20.773Z";
+		const second = nanoId() as typeof folders.$inferSelect.id;
+		await runtime.database
+			.insert(folders)
+			.values({
+				id: second,
+				name: "Second",
+				createdById: team.owner.id,
+				organizationId: team.owner.activeOrganizationId,
+			});
+		expect(
+			await invoke({ folderId: second, effectiveCreatedAt: date }),
+		).toMatchObject({ status: "updated" });
+		expect(await currentVideo()).toMatchObject({
+			folderId: second,
+			metadata: { summary: "Preserve me", customCreatedAt: date },
+		});
 	});
-
-	it("repairs a pending conversion left on the previous owner's path", async () => {
-		mocks.selects = [
-			[
-				video({
-					ownerId: "zephyaaaaaaaaaa",
-					metadata: {
-						loomDeferredProcessing: {
-							status: "pending",
-							rawFileKey: "lukeaaaaaaaaaaa/videoaaaaaaaaaa/raw-upload.webm",
-						},
-					},
-				}),
-			],
-			[lukeFolder("folderaaaaaaaaa")],
-		];
-		await expect(
-			backfillLoomImport(org, { videoId: "videoaaaaaaaaaa" }),
-		).resolves.toMatchObject({ status: "updated", changes: ["original"] });
-		expect(mocks.updates).toHaveLength(1);
-		const query = new MySqlDialect().sqlToQuery(
-			mocks.updates[0]?.metadata as SQL,
-		);
-		expect(query.sql).toContain(
-			"JSON_SET(?, '$.loomDeferredProcessing.rawFileKey', ?)",
-		);
-		expect(query.params).toContain(
-			"zephyaaaaaaaaaa/videoaaaaaaaaaa/raw-upload.webm",
-		);
+	it("skips matching dates", async () => {
+		expect(
+			await invoke({ effectiveCreatedAt: "2026-09-23T10:00:00.000Z" }),
+		).toMatchObject({ status: "unchanged" });
 	});
-
-	it("leaves a conversion already on the owner's path alone", async () => {
-		mocks.selects = [
-			[
-				video({
-					metadata: {
-						loomDeferredProcessing: {
-							status: "pending",
-							rawFileKey: "lukeaaaaaaaaaaa/videoaaaaaaaaaa/raw-upload.webm",
-						},
-					},
-				}),
-			],
-			[lukeFolder("folderaaaaaaaaa")],
-		];
-		await expect(
-			backfillLoomImport(org, { videoId: "videoaaaaaaaaaa" }),
-		).resolves.toMatchObject({ status: "unchanged" });
+	it("shares into a team folder once and folds duplicate shares", async () => {
+		const folderId = nanoId() as typeof folders.$inferSelect.id;
+		await runtime.database
+			.insert(folders)
+			.values({
+				id: folderId,
+				name: "Shared",
+				organizationId: team.owner.activeOrganizationId,
+				spaceId: team.owner.activeOrganizationId,
+				createdById: team.owner.id,
+			});
+		await invoke({ shareFolderId: folderId });
+		await runtime.database
+			.insert(sharedVideos)
+			.values({
+				id: nanoId(),
+				videoId,
+				organizationId: team.owner.activeOrganizationId,
+				sharedByUserId: team.owner.id,
+			});
+		expect(await invoke({ shareFolderId: folderId })).toMatchObject({
+			changes: ["shared"],
+		});
+		expect(
+			await runtime.database
+				.select()
+				.from(sharedVideos)
+				.where(
+					and(
+						eq(sharedVideos.videoId, videoId),
+						eq(sharedVideos.organizationId, team.owner.activeOrganizationId),
+					),
+				),
+		).toHaveLength(1);
 	});
-
-	it("reports moves it could not make or finish cleaning up", async () => {
-		mocks.selects = [[video()], [lukeFolder("folderaaaaaaaaa")]];
-		mocks.reassign.mockResolvedValue({
+	it("skips recordings without a Loom mapping", async () => {
+		await runtime.database
+			.delete(importedVideos)
+			.where(eq(importedVideos.id, videoId));
+		expect(await invoke()).toMatchObject({
 			status: "skipped",
-			reason: "edited video",
+			reason: "not a Loom import here",
 		});
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				ownerEmail: "mdauer@greenprojecttech.com",
-			}),
-		).resolves.toMatchObject({ status: "skipped", reason: "edited video" });
-		mocks.selects = [[video()], [lukeFolder("folderaaaaaaaaa")]];
-		mocks.reassign.mockResolvedValue({
-			status: "moved",
-			copiedObjects: 3,
-			cleanup: "failed",
+	});
+	it("rejects missing and other-owner personal folders", async () => {
+		expect(await invoke({ folderId: nanoId() })).toMatchObject({
+			status: "skipped",
+			reason: "folder not in this workspace",
 		});
-		await expect(
-			backfillLoomImport(org, {
-				videoId: "videoaaaaaaaaaa",
-				ownerEmail: "mdauer@greenprojecttech.com",
-			}),
-		).resolves.toMatchObject({
+		expect(await invoke({ folderId: targetFolder })).toMatchObject({
+			status: "skipped",
+			reason: "folder belongs to someone other than the owner",
+		});
+	});
+	it("does not put a reassigned video in the organization owner's private folder", async () => {
+		expect(
+			await invoke({ ownerEmail: team.user.email, folderId: ownFolder }),
+		).toMatchObject({ status: "skipped" });
+		expect(state.reassign).not.toHaveBeenCalled();
+	});
+	it("repairs pending original keys left under the previous owner's prefix", async () => {
+		await runtime.database
+			.update(videos)
+			.set({
+				metadata: {
+					loomDeferredProcessing: {
+						status: "pending",
+						rawFileKey: `old-owner/${videoId}/raw-upload.webm`,
+					},
+				},
+			})
+			.where(eq(videos.id, videoId));
+		expect(await invoke()).toMatchObject({ changes: ["original"] });
+		expect(
+			(await currentVideo()).metadata?.loomDeferredProcessing?.rawFileKey,
+		).toBe(`${team.owner.id}/${videoId}/raw-upload.webm`);
+	});
+	it("leaves matching original keys alone", async () => {
+		await runtime.database
+			.update(videos)
+			.set({
+				metadata: {
+					loomDeferredProcessing: {
+						status: "pending",
+						rawFileKey: `${team.owner.id}/${videoId}/raw-upload.webm`,
+					},
+				},
+			})
+			.where(eq(videos.id, videoId));
+		expect(await invoke()).toMatchObject({ status: "unchanged" });
+	});
+	it("reports skipped moves and retained-copy warnings", async () => {
+		state.reassign.mockResolvedValueOnce({ status: "skipped", reason: "busy" });
+		expect(await invoke({ ownerEmail: team.user.email })).toMatchObject({
+			status: "skipped",
+			reason: "busy",
+		});
+		state.reassign.mockImplementationOnce(async (input) => {
+			await runtime.database
+				.update(videos)
+				.set({ ownerId: input.toUserId, folderId: null })
+				.where(eq(videos.id, videoId));
+			return { status: "moved", copiedObjects: 3, cleanup: "failed" };
+		});
+		expect(await invoke({ ownerEmail: team.user.email })).toMatchObject({
 			status: "updated",
-			warning: "old owner's files could not be removed",
+			warning: "old owner media copies retained for safe cleanup",
 		});
+	});
+	it("rechecks configured operator verification before committing metadata", async () => {
+		await runtime.database
+			.update(users)
+			.set({ emailVerified: null })
+			.where(eq(users.id, team.owner.id));
+		await expect(
+			invoke({ effectiveCreatedAt: "2020-01-01T00:00:00Z" }),
+		).rejects.toThrow("Unauthorized");
+		expect((await currentVideo()).metadata?.customCreatedAt).toBeUndefined();
 	});
 });

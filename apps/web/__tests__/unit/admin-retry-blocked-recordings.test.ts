@@ -1,3 +1,5 @@
+vi.mock("server-only", () => ({}));
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({

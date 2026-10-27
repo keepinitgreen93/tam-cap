@@ -12,17 +12,19 @@ import {
 	type SsoLoginIntent,
 	verifySsoLoginIntent,
 } from "@cap/database/auth/sso-state";
-import * as Db from "@cap/database/schema";
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import * as Db from "@cap/database/cloudflare/schema";
 import { Organisation, User } from "@cap/web-domain";
 import { getTableName, is, type SQL } from "drizzle-orm";
 import {
-	type AnyMySqlColumn,
-	MySqlDialect,
-	MySqlTable,
-} from "drizzle-orm/mysql-core";
-import type { MySql2Database } from "drizzle-orm/mysql2";
+	type AnySQLiteColumn,
+	SQLiteSyncDialect,
+	SQLiteTable,
+} from "drizzle-orm/sqlite-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DrizzleAdapter } from "../../../../packages/database/auth/drizzle-adapter";
+import { snapshotGuard } from "../../../../packages/database/cloudflare/concurrency-schema";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
 	db: vi.fn(),
@@ -31,11 +33,18 @@ const mocks = vi.hoisted(() => ({
 	stripe: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({
 		WORKOS_CLIENT_ID: "client_test",
 		WORKOS_API_KEY: "workos_test_secret",
+	}),
+}));
+vi.mock("@cap/database/auth/identity", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@cap/database/auth/identity")>()),
+	cloudflareAccessPolicy: () => ({
+		ownerEmail: "fixture@example.com",
+		inviteOnly: true,
 	}),
 }));
 vi.mock("@workos-inc/node", () => ({
@@ -52,176 +61,196 @@ vi.mock("@cap/utils", async (importOriginal) => ({
 
 type Row = Record<string, unknown>;
 type RowScope = Record<string, Row>;
-type Selection = Record<string, MySqlTable | AnyMySqlColumn>;
+type Selection = Record<string, SQLiteTable | AnySQLiteColumn>;
 
+type SQLInputValue = string | number | bigint | null | Uint8Array;
+const sqliteModuleSpecifier = "node:sqlite";
+const { DatabaseSync } = (await import(sqliteModuleSpecifier)) as {
+	DatabaseSync: new (
+		path: string,
+	) => {
+		prepare: (query: string) => {
+			get: (...values: SQLInputValue[]) => Record<string, unknown> | undefined;
+		};
+		close: () => void;
+	};
+};
+const predicateDatabase = new DatabaseSync(":memory:");
+const sqlValue = (value: unknown): SQLInputValue =>
+	value instanceof Date
+		? value.getTime()
+		: value === undefined || value === null
+			? null
+			: typeof value === "boolean"
+				? Number(value)
+				: typeof value === "string" ||
+						typeof value === "number" ||
+						typeof value === "bigint"
+					? value
+					: JSON.stringify(value);
 function matchesRow(condition: SQL | undefined, scope: RowScope) {
 	if (!condition) return true;
-	const query = new MySqlDialect().sqlToQuery(condition);
-	let parameterIndex = 0;
-	return query.sql
-		.replaceAll("(", "")
-		.replaceAll(")", "")
-		.split(" and ")
-		.every((clause) => {
-			const match =
-				/^`([^`]+)`\.`([^`]+)` (is null|= \?|= `([^`]+)`\.`([^`]+)`)$/.exec(
-					clause,
-				);
-			if (!match?.[1] || !match[2]) {
-				throw new Error(`Unsupported query predicate: ${clause}`);
-			}
-			const value = scope[match[1]]?.[match[2]];
-			if (match[3] === "is null") return value == null;
-			if (match[3] === "= ?") return value === query.params[parameterIndex++];
-			if (!match[4] || !match[5]) throw new Error("Invalid joined predicate");
-			return value === scope[match[4]]?.[match[5]];
+	const query = new SQLiteSyncDialect().sqlToQuery(condition);
+	const values: SQLInputValue[] = [];
+	const from = Object.entries(scope).map(([table, row]) => {
+		const columns = Object.entries({
+			...Object.fromEntries(
+				Object.values(Db)
+					.filter(
+						(value) => is(value, SQLiteTable) && getTableName(value) === table,
+					)
+					.flatMap((value) =>
+						Object.keys(value as object).map((key) => [key, null]),
+					),
+			),
+			...row,
+		}).map(([key, value]) => {
+			values.push(sqlValue(value));
+			return `? AS "${key}"`;
 		});
+		return `(SELECT ${columns.join(", ")}) AS "${table}"`;
+	});
+	const result = predicateDatabase
+		.prepare(`SELECT (${query.sql}) AS allowed FROM ${from.join(", ")}`)
+		.get(...query.params.map(sqlValue), ...values);
+	return result?.allowed === 1;
 }
 
-function createDatabase(seed: Map<MySqlTable, Row[]>) {
+function createDatabase(seed: Map<SQLiteTable, Row[]>) {
 	const tables = new Map(seed);
-	const hooks: { beforeUpdate?: (table: MySqlTable) => void } = {};
-	const rows = (table: MySqlTable) => {
-		const result = tables.get(table);
-		if (!result) throw new Error("Unexpected table");
-		return result;
+	const hooks: { beforeUpdate?: (table: SQLiteTable) => void } = {};
+	const rows = (table: SQLiteTable) => {
+		let records = tables.get(table);
+		if (!records) {
+			records = [];
+			tables.set(table, records);
+		}
+		return records;
 	};
-	class SelectQuery {
-		private table: MySqlTable | undefined;
-		private condition: SQL | undefined;
-		private rowLimit = Number.POSITIVE_INFINITY;
-		private joins: { table: MySqlTable; condition: SQL | undefined }[] = [];
-
-		constructor(
-			private selection?: Selection,
-			private distinct = false,
-		) {}
-
-		from(table: MySqlTable) {
-			this.table = table;
-			return this;
-		}
-
-		innerJoin(table: MySqlTable, condition: SQL | undefined) {
-			this.joins.push({ table, condition });
-			return this;
-		}
-
-		where(condition: SQL | undefined) {
-			this.condition = condition;
-			return this;
-		}
-
-		limit(count: number) {
-			this.rowLimit = count;
-			return Promise.resolve().then(() => this.execute());
-		}
-
-		for() {
-			return Promise.resolve().then(() => this.execute());
-		}
-
-		private execute() {
-			const table = this.table;
-			if (!table) throw new Error("Missing query table");
-			const tableName = getTableName(table);
-			let scopes: RowScope[] = rows(table).map((row) => ({ [tableName]: row }));
-			for (const join of this.joins) {
-				scopes = scopes.flatMap((scope) =>
-					rows(join.table)
-						.map((row) => ({ ...scope, [getTableName(join.table)]: row }))
-						.filter((joined) => matchesRow(join.condition, joined)),
-				);
+	const model = createRecordingD1Model({
+		read: ({ table: rawTable, fields, condition, joins }) => {
+			const table = rawTable as SQLiteTable;
+			let scopes: RowScope[] = rows(table).map((row) => ({
+				[getTableName(table)]: row,
+			}));
+			for (const rawJoin of joins) {
+				const join = rawJoin as SQLiteTable;
+				scopes = scopes
+					.flatMap((scope) =>
+						rows(join).map((row) => ({ ...scope, [getTableName(join)]: row })),
+					)
+					.filter((scope) => {
+						if (table === Db.organizationInvites && join === Db.organizations)
+							return (
+								scope.organization_invites?.organizationId ===
+								scope.organizations?.id
+							);
+						if (table === Db.organizations && join === Db.organizationSso)
+							return (
+								scope.organizations?.id ===
+								scope.organization_sso?.organizationId
+							);
+						if (table === Db.users && join === Db.accounts)
+							return scope.users?.id === scope.accounts?.userId;
+						if (table === Db.accounts && join === Db.users)
+							return scope.accounts?.userId === scope.users?.id;
+						if (
+							table === Db.organizationInvites &&
+							join === Db.organizationMembers
+						)
+							return (
+								scope.organization_invites?.organizationId ===
+								scope.organization_members?.organizationId
+							);
+						throw new Error("Unexpected fixture join");
+					});
 			}
 			const selected = scopes
-				.filter((scope) => matchesRow(this.condition, scope))
+				.filter((scope) => matchesRow(condition, scope))
 				.map((scope) =>
-					this.selection
+					fields
 						? Object.fromEntries(
-								Object.entries(this.selection).map(([key, field]) => [
+								Object.entries(fields as Selection).map(([key, field]) => [
 									key,
-									is(field, MySqlTable)
+									is(field, SQLiteTable)
 										? { ...scope[getTableName(field)] }
 										: scope[getTableName(field.table)]?.[field.name],
 								]),
 							)
-						: { ...scope[tableName] },
+						: joins.length
+							? scope
+							: { ...scope[getTableName(table)] },
 				);
-			const result = this.distinct
-				? [
-						...new Map(
-							selected.map((row) => [JSON.stringify(row), row]),
-						).values(),
-					]
-				: selected;
-			return result.slice(0, this.rowLimit);
-		}
-	}
-
-	const client = {
-		select: vi.fn((selection?: Selection) => new SelectQuery(selection)),
-		selectDistinct: vi.fn(
-			(selection?: Selection) => new SelectQuery(selection, true),
-		),
-		insert: vi.fn((table: MySqlTable) => ({
-			values: (value: Row) => {
-				const insert = (update?: Row) => {
-					const existing = rows(table).find(
-						(row) =>
-							row.id === value.id ||
-							(table === Db.users && row.email === value.email),
-					);
-					if (existing) {
-						if (!update) throw new Error("Duplicate row");
-						Object.assign(existing, update);
-					} else {
-						rows(table).push({
-							emailVerified: null,
-							defaultOrgId: null,
-							onboardingSteps: null,
-							onboarding_completed_at: null,
-							...value,
-						});
-					}
-				};
-				let update: Row | undefined;
-				const pending = Promise.resolve().then(() => insert(update));
-				return Object.assign(pending, {
-					onDuplicateKeyUpdate: ({ set }: { set: Row }) => {
-						update = set;
-						return pending;
-					},
-				});
-			},
-		})),
-		update: vi.fn((table: MySqlTable) => ({
-			set: (patch: Row) => ({
-				where: async (condition: SQL | undefined) => {
-					hooks.beforeUpdate?.(table);
-					for (const row of rows(table)) {
-						if (matchesRow(condition, { [getTableName(table)]: row })) {
-							Object.assign(row, patch);
+			return [
+				...new Map(selected.map((row) => [JSON.stringify(row), row])).values(),
+			];
+		},
+		apply: (statements) => {
+			const snapshot = new Map(
+				[...tables].map(([table, records]) => [
+					table,
+					structuredClone(records),
+				]),
+			);
+			try {
+				for (const statement of statements) {
+					const table = statement.table as SQLiteTable;
+					if (statement.operation === "update") {
+						hooks.beforeUpdate?.(table);
+						for (const row of rows(table))
+							if (
+								matchesRow(statement.condition, { [getTableName(table)]: row })
+							)
+								Object.assign(row, statement.values);
+					} else if (statement.operation === "insert") {
+						for (const value of Array.isArray(statement.values)
+							? statement.values
+							: [statement.values]) {
+							const existing = rows(table).find(
+								(row) =>
+									(row.id && row.id === value.id) ||
+									(table === Db.users && row.email === value.email),
+							);
+							if (existing && statement.conflict)
+								Object.assign(existing, statement.conflict);
+							else if (existing) throw new Error("Duplicate row");
+							else
+								rows(table).push({
+									emailVerified: null,
+									defaultOrgId: null,
+									onboardingSteps: null,
+									onboarding_completed_at: null,
+									...value,
+								});
 						}
+					} else {
+						tables.set(
+							table,
+							rows(table).filter(
+								(row) =>
+									!matchesRow(statement.condition, {
+										[getTableName(table)]: row,
+									}),
+							),
+						);
 					}
-				},
-			}),
-		})),
-		transaction: vi.fn(
-			async (callback: (database: MySql2Database) => Promise<unknown>) => {
-				const snapshot = new Map(
-					[...tables].map(([table, records]) => [
-						table,
-						structuredClone(records),
-					]),
-				);
-				try {
-					return await callback(client as unknown as MySql2Database);
-				} catch (error) {
-					for (const [table, records] of snapshot) tables.set(table, records);
-					throw error;
 				}
-			},
-		),
+			} catch (error) {
+				for (const [table, records] of snapshot) tables.set(table, records);
+				throw error;
+			}
+		},
+		signature: () =>
+			JSON.stringify(
+				[...tables].map(([table, records]) => [getTableName(table), records]),
+			),
+	});
+	const insert = vi.fn(model.insert);
+	const client = {
+		...model,
+		transaction: vi.fn(),
+		insert,
+		update: vi.fn(model.update),
 	};
 	return { client, rows, hooks };
 }
@@ -260,7 +289,7 @@ function actorContext(actorId: string): SsoAuthContext {
 
 function makeFixture() {
 	const database = createDatabase(
-		new Map<MySqlTable, Row[]>([
+		new Map<SQLiteTable, Row[]>([
 			[
 				Db.users,
 				[
@@ -354,7 +383,7 @@ function makeFixture() {
 	mocks.db.mockReturnValue(database.client);
 	mocks.getOrganization.mockResolvedValue(workosOrganization);
 	mocks.getConnection.mockResolvedValue(connection);
-	const row = (table: MySqlTable, id: string, column = "id") => {
+	const row = (table: SQLiteTable, id: string, column = "id") => {
 		const record = database.rows(table).find((record) => record[column] === id);
 		if (!record) throw new Error("Fixture row was not found");
 		return record;
@@ -407,7 +436,11 @@ describe("SSO identity validation", () => {
 		expect(mocks.getOrganization).toHaveBeenCalledWith(PROFILE.organization_id);
 		expect(mocks.getConnection).toHaveBeenCalledWith(PROFILE.connection_id);
 		expect(fixture.client.transaction).not.toHaveBeenCalled();
-		expect(fixture.client.insert).not.toHaveBeenCalled();
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(0);
 		expect(fixture.client.update).not.toHaveBeenCalled();
 	});
 
@@ -546,7 +579,11 @@ describe("SSO identity validation", () => {
 			await expect(
 				validateSsoSignIn(PROFILE, PROFILE.id, CONTEXT),
 			).rejects.toThrow("not found");
-			expect(fixture.client.insert).not.toHaveBeenCalled();
+			expect(
+				fixture.client.insert.mock.calls.filter(
+					([table]) => table !== snapshotGuard,
+				),
+			).toHaveLength(0);
 		},
 	);
 
@@ -584,7 +621,11 @@ describe("SSO identity validation", () => {
 		await expect(
 			validateSsoSignIn(PROFILE, PROFILE.id, CONTEXT),
 		).rejects.toThrow("not verified");
-		expect(fixture.client.insert).not.toHaveBeenCalled();
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(0);
 	});
 
 	it("does not grant verified parent-domain trust to subdomains", async () => {
@@ -698,7 +739,11 @@ describe("SSO membership provisioning", () => {
 			await provisionSsoMembership(USER_ID, IDENTITY);
 
 			expect(fixture.rows(Db.organizationMembers)).toEqual([member]);
-			expect(fixture.client.insert).not.toHaveBeenCalled();
+			expect(
+				fixture.client.insert.mock.calls.filter(
+					([table]) => table !== snapshotGuard,
+				),
+			).toHaveLength(0);
 		},
 	);
 
@@ -718,7 +763,11 @@ describe("SSO membership provisioning", () => {
 				hasProSeat: false,
 			}),
 		]);
-		expect(fixture.client.insert).toHaveBeenCalledTimes(1);
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(1);
 	});
 
 	it("does not mistake membership in another organization for this one", async () => {
@@ -776,7 +825,11 @@ describe("SSO membership provisioning", () => {
 		await expect(provisionSsoMembership(USER_ID, identity)).rejects.toThrow(
 			"no longer available",
 		);
-		expect(fixture.client.insert).not.toHaveBeenCalled();
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(0);
 		expect(fixture.client.update).not.toHaveBeenCalled();
 	});
 
@@ -792,7 +845,11 @@ describe("SSO membership provisioning", () => {
 			await expect(provisionSsoMembership(USER_ID, IDENTITY)).rejects.toThrow(
 				"no longer available",
 			);
-			expect(fixture.client.insert).not.toHaveBeenCalled();
+			expect(
+				fixture.client.insert.mock.calls.filter(
+					([table]) => table !== snapshotGuard,
+				),
+			).toHaveLength(0);
 		},
 	);
 
@@ -823,7 +880,11 @@ describe("SSO membership provisioning", () => {
 		await expect(provisionSsoMembership(USER_ID, IDENTITY)).rejects.toThrow(
 			"not linked",
 		);
-		expect(fixture.client.insert).not.toHaveBeenCalled();
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(0);
 		expect(fixture.client.update).not.toHaveBeenCalled();
 	});
 
@@ -850,10 +911,10 @@ describe("SSO adapter provisioning", () => {
 	it("creates, links, then joins a new user without a personal organization or Stripe bootstrap", async () => {
 		const fixture = makeFixture();
 		fixture.rows(Db.users).splice(0, 1);
-		fixture.rows(Db.organizationInvites).splice(0);
+
 		const identity = await validateSsoSignIn(PROFILE, PROFILE.id, CONTEXT);
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{
 				getSsoIdentity: () => identity,
 			},
@@ -902,7 +963,7 @@ describe("SSO adapter provisioning", () => {
 	it("refuses to create a different email from the validated SSO identity", async () => {
 		const fixture = makeFixture();
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{ getSsoIdentity: () => IDENTITY },
 		);
 		if (!adapter.createUser) throw new Error("Missing createUser");
@@ -912,12 +973,18 @@ describe("SSO adapter provisioning", () => {
 				emailVerified: null,
 			}),
 		).rejects.toThrow("does not match");
-		expect(fixture.client.insert).not.toHaveBeenCalled();
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(0);
 	});
 
 	it("requires validated context to link a WorkOS account", async () => {
 		const fixture = makeFixture();
-		const adapter = DrizzleAdapter(fixture.client as unknown as MySql2Database);
+		const adapter = DrizzleAdapter(
+			fixture.client as unknown as CloudflareDatabase,
+		);
 		if (!adapter.linkAccount) throw new Error("Missing linkAccount");
 		await expect(
 			adapter.linkAccount({
@@ -927,13 +994,17 @@ describe("SSO adapter provisioning", () => {
 				type: "oauth",
 			}),
 		).rejects.toThrow("not been verified");
-		expect(fixture.client.insert).not.toHaveBeenCalled();
+		expect(
+			fixture.client.insert.mock.calls.filter(
+				([table]) => table !== snapshotGuard,
+			),
+		).toHaveLength(0);
 	});
 
 	it("does not link the validated identity to a user with a different stored email", async () => {
 		const fixture = makeFixture();
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{ getSsoIdentity: () => IDENTITY },
 		);
 		if (!adapter.linkAccount) throw new Error("Missing linkAccount");
@@ -953,7 +1024,7 @@ describe("SSO adapter provisioning", () => {
 	it("does not link a different WorkOS profile after validation", async () => {
 		const fixture = makeFixture();
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{ getSsoIdentity: () => IDENTITY },
 		);
 		if (!adapter.linkAccount) throw new Error("Missing linkAccount");
@@ -978,7 +1049,7 @@ describe("SSO adapter provisioning", () => {
 		fixture.link();
 		fixture.link(OTHER_USER_ID);
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{ getSsoIdentity: () => identity },
 		);
 		if (!adapter.linkAccount) throw new Error("Missing linkAccount");
@@ -1006,7 +1077,7 @@ describe("SSO adapter provisioning", () => {
 		fixture.link();
 		const identity = await validateSsoSignIn(PROFILE, PROFILE.id, CONTEXT);
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{ getSsoIdentity: () => identity },
 		);
 		if (!adapter.linkAccount) throw new Error("Missing linkAccount");
@@ -1038,7 +1109,7 @@ describe("SSO adapter provisioning", () => {
 		const fixture = makeFixture();
 		const identity = await validateSsoSignIn(PROFILE, PROFILE.id, CONTEXT);
 		const adapter = DrizzleAdapter(
-			fixture.client as unknown as MySql2Database,
+			fixture.client as unknown as CloudflareDatabase,
 			{ getSsoIdentity: () => identity },
 		);
 		if (!adapter.createUser) throw new Error("Missing createUser");

@@ -11,7 +11,7 @@ const payment = vi.hoisted(() =>
 		throw new Error("Stripe must not be used");
 	}),
 );
-vi.mock("@cap/database", () => ({ db: database }));
+vi.mock("@cap/database/legacy", () => ({ db: database }));
 vi.mock("@cap/utils", () => ({
 	stripe: payment,
 	isSsoPrice: vi.fn(),

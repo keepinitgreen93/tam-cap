@@ -6,24 +6,40 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	rows: [] as Record<string, unknown>[],
 	allowed: true,
+	configured: false,
+	aiConfigured: false,
 	read: vi.fn(),
 	transcribe: vi.fn(),
 	generate: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: () => ({
-				where: async () => {
-					mocks.read();
-					return mocks.rows;
-				},
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const schema = await import("@cap/database/cloudflare/schema");
+	return {
+		db: () => ({
+			select: () => ({
+				from: (table: unknown) => ({
+					where: () => {
+						const result = Promise.resolve(
+							table === schema.videoUploads
+								? []
+								: table === schema.users
+									? [{ email: "fixture@example.com" }]
+									: mocks.rows,
+						);
+						mocks.read();
+						return Object.assign(result, { limit: () => result });
+					},
+				}),
 			}),
 		}),
+	};
+});
+vi.mock("@cap/env", () => ({
+	serverEnv: () => ({
+		ASSEMBLY_API_KEY: mocks.configured ? "synthetic" : undefined,
 	}),
 }));
-vi.mock("@cap/env", () => ({ serverEnv: () => ({}) }));
 vi.mock("@cap/web-backend", async () => {
 	const { Effect } = await import("effect");
 	const { Policy } = await import("@cap/web-domain");
@@ -41,14 +57,16 @@ vi.mock("@cap/web-backend", async () => {
 	};
 });
 vi.mock("@/lib/server", () => ({ runPromiseExit: Effect.runPromiseExit }));
-vi.mock("@/lib/ai/provider", () => ({ isAiConfigured: () => false }));
+vi.mock("@/lib/ai/provider", () => ({
+	isAiConfigured: () => mocks.aiConfigured,
+}));
 vi.mock("@/lib/desktop-segments-finalization", () => ({
 	isRetryableDesktopSegmentsFinalizationError: () => false,
 	queueDesktopSegmentsFinalization: vi.fn(),
 }));
 vi.mock("@/lib/generate-ai", () => ({ startAiGeneration: mocks.generate }));
 vi.mock("@/lib/transcribe", () => ({ transcribeVideo: mocks.transcribe }));
-vi.mock("@/utils/flags", () => ({ isAiGenerationEnabled: () => false }));
+vi.mock("@/utils/flags", () => ({ isAiGenerationEnabled: () => true }));
 
 const { getVideoStatus } = await import("@/actions/videos/get-status");
 const { videoStatusQueryOptions, VideoStatusNotFoundError } = await import(
@@ -59,6 +77,10 @@ const videoId = Video.VideoId.make("missing-video");
 beforeEach(() => {
 	mocks.rows = [];
 	mocks.allowed = true;
+	mocks.configured = false;
+	mocks.aiConfigured = false;
+	mocks.transcribe.mockReset().mockResolvedValue({ success: true });
+	mocks.generate.mockReset().mockResolvedValue({ success: true });
 });
 
 describe("video status", () => {
@@ -83,6 +105,56 @@ describe("video status", () => {
 			name: "Recording",
 			transcriptionStatus: "COMPLETE",
 		});
+	});
+
+	it("waits for durable transcription dispatch before reporting processing", async () => {
+		mocks.configured = true;
+		mocks.rows = [
+			{ ownerId: "owner", name: "Recording", transcriptionStatus: null },
+		];
+		let release: (() => void) | undefined;
+		let settled = false;
+		mocks.transcribe.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					release = () => resolve({ success: true });
+				}),
+		);
+		const result = getVideoStatus(videoId).then((value) => {
+			settled = true;
+			return value;
+		});
+		await vi.waitFor(() => expect(mocks.transcribe).toHaveBeenCalledTimes(1));
+		expect(settled).toBe(false);
+		release?.();
+		expect(await result).toMatchObject({ transcriptionStatus: "PROCESSING" });
+	});
+	it("resumes uncertain transcription and AI receipts through the dispatcher", async () => {
+		mocks.configured = true;
+		mocks.rows = [
+			{
+				ownerId: "owner",
+				name: "Recording",
+				transcriptionStatus: "PROCESSING",
+				metadata: { transcriptionRun: { dispatch: "uncertain" } },
+			},
+		];
+		await getVideoStatus(videoId);
+		expect(mocks.transcribe).toHaveBeenCalledTimes(1);
+		mocks.aiConfigured = true;
+		mocks.rows = [
+			{
+				ownerId: "owner",
+				name: "Recording",
+				transcriptionStatus: "COMPLETE",
+				metadata: {
+					aiGenerationStatus: "QUEUED",
+					aiGenerationRun: { dispatch: "uncertain" },
+				},
+			},
+		];
+		await getVideoStatus(videoId);
+		expect(mocks.generate).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not retry missing videos even when initial data is cached", async () => {

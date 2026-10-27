@@ -1,5 +1,5 @@
 import type { Extension, Video } from "@cap/web-domain";
-
+import { normalizeApiBaseUrl } from "./instance";
 import type {
 	BootstrapData,
 	ExtensionAuth,
@@ -43,11 +43,7 @@ const extensionApiPath = (path: string) => `${EXTENSION_API_PREFIX}${path}`;
 const apiUrl = (settings: ExtensionSettings, path: string) =>
 	new URL(path, settings.apiBaseUrl).toString();
 
-const checkAuthStartRoute = async (
-	settings: ExtensionSettings,
-	url: URL,
-	redirectUri: string,
-) => {
+const checkAuthStartRoute = async (url: URL, redirectUri: string) => {
 	try {
 		const response = await fetch(url, {
 			redirect: "manual",
@@ -59,7 +55,7 @@ const checkAuthStartRoute = async (
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		throw new Error(
-			`Could not reach Cap extension auth at ${url.origin}. Start the local web server with bun run dev:extension and make sure the extension Options Cap URL is ${settings.apiBaseUrl}. Redirect URI: ${redirectUri}. ${message}`,
+			`Could not reach extension sign-in at ${url.origin}. Check the Cap URL in extension Options and ask the instance administrator to verify the extension is enabled. Redirect URI: ${redirectUri}. ${message}`,
 		);
 	}
 };
@@ -90,6 +86,8 @@ const requestJson = async <TResponse>({
 	method: "GET" | "POST" | "DELETE";
 	body?: unknown;
 }) => {
+	if (normalizeApiBaseUrl(settings.apiBaseUrl) !== auth.apiOrigin)
+		throw new Error("Sign in to this instance before making requests");
 	const response = await fetch(apiUrl(settings, path), {
 		method,
 		headers: {
@@ -116,12 +114,16 @@ export const createAuthStart = async (settings: ExtensionSettings) => {
 	url.searchParams.set("redirectUri", redirectUri);
 	url.searchParams.set("state", state);
 
-	await checkAuthStartRoute(settings, url, redirectUri);
+	await checkAuthStartRoute(url, redirectUri);
 
 	return { redirectUri, state, url: url.toString() };
 };
 
-export const parseAuthResponse = (responseUrl: string, state: string) => {
+export const parseAuthResponse = (
+	responseUrl: string,
+	state: string,
+	apiBaseUrl: string,
+) => {
 	const hash = new URL(responseUrl).hash.slice(1);
 	const params = new URLSearchParams(hash);
 	if (params.get("state") !== state) {
@@ -145,7 +147,7 @@ export const parseAuthResponse = (responseUrl: string, state: string) => {
 		throw new Error("Auth response did not include a token");
 	}
 
-	return { authApiKey, userId };
+	return { authApiKey, userId, apiOrigin: normalizeApiBaseUrl(apiBaseUrl) };
 };
 
 export const revokeAuth = (settings: ExtensionSettings, auth: ExtensionAuth) =>

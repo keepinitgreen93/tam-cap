@@ -1,9 +1,10 @@
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import type { Storage } from "@cap/web-backend/src/Storage/index";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { Effect } from "effect";
+import { getLoomImportArtifactKeys } from "@/lib/loom-import-artifacts";
 import {
 	LOOM_IMPORT_MAX_BYTES,
 	LOOM_IMPORT_PART_BYTES,
@@ -63,7 +64,11 @@ export async function prepareLoomMultipartUploads({
 		throw new Error("Loom import workflow ownership changed");
 	}
 	const previous = video.metadata?.loomImportUpload;
-	const outputKey = `${video.ownerId}/${video.id}/result.mp4`;
+	const { outputKey } = getLoomImportArtifactKeys(
+		video.ownerId,
+		video.id,
+		attemptId,
+	);
 	if (
 		previous?.ownerId === video.ownerId &&
 		previous.organizationId === video.orgId &&
@@ -107,6 +112,8 @@ export async function prepareLoomMultipartUploads({
 		previous.output.key === outputKey &&
 		(!sourceKey || previous.source?.key === sourceKey);
 	let receipt = reusable ? previous : undefined;
+	let receiptAttempted = false;
+	let receiptRejected = false;
 	const created: Array<{ key: string; uploadId: string }> = [];
 	const create = async (key: string) => {
 		const { UploadId: uploadId } = await bucket.multipart
@@ -129,6 +136,7 @@ export async function prepareLoomMultipartUploads({
 				source: sourceKey ? await create(sourceKey) : undefined,
 				output: await create(outputKey),
 			};
+			receiptAttempted = true;
 			const result = await db()
 				.update(videos)
 				.set({
@@ -140,30 +148,46 @@ export async function prepareLoomMultipartUploads({
 						eq(videos.ownerId, video.ownerId),
 						video.orgId ? eq(videos.orgId, video.orgId) : isNull(videos.orgId),
 						run
-							? sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId')) = ${run.runId}`
+							? sql`json_extract(${videos.metadata}, '$.loomImportRun.runId') = ${run.runId}`
 							: sql`JSON_EXTRACT(${videos.metadata}, '$.loomImportRun') IS NULL`,
 						previous
-							? sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomImportUpload.attemptId')) = ${previous.attemptId}`
+							? sql`json_extract(${videos.metadata}, '$.loomImportUpload.attemptId') = ${previous.attemptId}`
 							: sql`JSON_EXTRACT(${videos.metadata}, '$.loomImportUpload') IS NULL`,
 					),
 				);
-			const affectedRows = Array.isArray(result)
-				? (result[0] as { affectedRows?: number } | undefined)?.affectedRows
-				: (result as { affectedRows?: number }).affectedRows;
-			if (affectedRows !== 1)
+			if (result.meta.changes !== 1) {
+				receiptRejected = true;
 				throw new Error("Loom import upload ownership changed");
+			}
 		}
 	} catch (error) {
-		await Promise.all(
-			created.map(({ key, uploadId }) =>
-				bucket.multipart.abort(key, uploadId).pipe(
-					Effect.catchAll(() => Effect.void),
-					runWorkflowPromise,
+		if (receiptAttempted && !receiptRejected) {
+			const [current] = await db()
+				.select()
+				.from(videos)
+				.where(eq(videos.id, video.id))
+				.limit(1);
+			if (
+				!current ||
+				current.ownerId !== video.ownerId ||
+				current.orgId !== video.orgId ||
+				JSON.stringify(current.metadata?.loomImportUpload) !==
+					JSON.stringify(receipt)
+			)
+				throw error;
+		} else {
+			await Promise.all(
+				created.map(({ key, uploadId }) =>
+					bucket.multipart.abort(key, uploadId).pipe(
+						Effect.catchAll(() => Effect.void),
+						runWorkflowPromise,
+					),
 				),
-			),
-		);
-		throw error;
+			);
+			throw error;
+		}
 	}
+	if (!receipt) throw new Error("Loom upload receipt is unavailable");
 	const target = (
 		upload: UploadReceipt["output"],
 	): LoomMultipartUploadTarget => {

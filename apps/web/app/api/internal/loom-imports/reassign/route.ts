@@ -9,6 +9,7 @@ import {
 	HttpServerRequest,
 } from "@effect/platform";
 import { Effect, Layer, Schema } from "effect";
+import { resolveTrustedMigrationOperator } from "@/lib/loom-concierge";
 import {
 	type LoomReassignOutcome,
 	reassignLoomImport,
@@ -40,12 +41,14 @@ class Api extends HttpApi.make("LoomImportReassignApi").add(
 							status: Schema.Literal("moved", "skipped", "failed"),
 							copiedObjects: Schema.optional(Schema.Number),
 							cleanup: Schema.optional(Schema.Literal("done", "failed")),
+							cleanupReason: Schema.optional(Schema.String),
 							reason: Schema.optional(Schema.String),
 						}),
 					),
 				}),
 			)
-			.addError(HttpApiError.Unauthorized),
+			.addError(HttpApiError.Unauthorized)
+			.addError(HttpApiError.Forbidden),
 	),
 ) {}
 
@@ -67,6 +70,10 @@ const ApiLive = HttpApiBuilder.api(Api).pipe(
 						!timingSafeEqual(digest(header), digest(secret))
 					)
 						return yield* new HttpApiError.Unauthorized();
+					const operator = yield* Effect.tryPromise({
+						try: resolveTrustedMigrationOperator,
+						catch: () => new HttpApiError.Forbidden(),
+					});
 					const results = yield* Effect.forEach(
 						[...new Set(payload.videoIds)],
 						(videoId) =>
@@ -76,6 +83,7 @@ const ApiLive = HttpApiBuilder.api(Api).pipe(
 										organizationId: payload.organizationId,
 										videoId,
 										fromUserId: payload.fromUserId,
+										operatorId: operator.id,
 										toUserId: payload.toUserId,
 									}).catch((error) => ({
 										videoId,

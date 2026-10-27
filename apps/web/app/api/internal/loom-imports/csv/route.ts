@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { db } from "@cap/database";
-import { organizations } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import type { Organisation } from "@cap/web-domain";
 import {

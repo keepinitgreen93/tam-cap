@@ -1,12 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { getCurrentUser } from "@cap/database/auth/session";
 import {
 	organizationMembers,
 	organizations,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/legacy/schema";
 import { isProSubscription, stripe } from "@cap/utils";
 import type { Organisation } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -16,6 +16,10 @@ import { calculateProSeats } from "@/utils/organization";
 async function getOwnerSubscription(
 	organizationId: Organisation.OrganisationId,
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor billing is unavailable on this self-hosted instance",
+		);
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 

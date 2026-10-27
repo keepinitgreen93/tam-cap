@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
 	access: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({
 			from: () => ({ where: () => Promise.resolve(mocks.rows.shift() ?? []) }),

@@ -1,9 +1,13 @@
 "use server";
 
 import { createHash } from "node:crypto";
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoId } from "@cap/database/helpers";
+import {
+	requireOrganizationManager,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic, type SnapshotReader } from "@cap/database/cloudflare/atomic";
 import {
 	agentApiOperations,
 	folders,
@@ -17,7 +21,8 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import { Folder, Space, User } from "@cap/web-domain";
 import { and, asc, count, desc, eq, inArray, isNull } from "drizzle-orm";
 import { start } from "workflow/api";
@@ -37,6 +42,8 @@ import {
 	MAX_CONTENT_TRANSFER_VIDEOS,
 	planPersonalFolderDestinations,
 } from "@/lib/content-transfer";
+import { encodeContentTransferPayload } from "@/lib/content-transfer-payload";
+import { inJsonArray } from "@/utils/sql";
 import { transferOrganizationContentWorkflow } from "@/workflows/transfer-organization-content";
 
 type ContentManager = NonNullable<Awaited<ReturnType<typeof getCurrentUser>>>;
@@ -78,11 +85,12 @@ async function requireContentManager() {
 async function requireSourceAccess(
 	user: ContentManager,
 	source: ContentTransferSource,
+	reader: SnapshotReader = db(),
 ) {
 	requireValidSource(source);
 	if (source.type === "organization") return;
 
-	const [space] = await db()
+	const [space] = await reader
 		.select({ id: spaces.id })
 		.from(spaces)
 		.where(
@@ -113,9 +121,10 @@ function getSourceFolderScope(
 async function getSourceFolders(
 	user: ContentManager,
 	source: ContentTransferSource,
+	reader: SnapshotReader = db(),
 ) {
-	await requireSourceAccess(user, source);
-	const rows = await db()
+	await requireSourceAccess(user, source, reader);
+	const rows = await reader
 		.select({
 			id: folders.id,
 			name: folders.name,
@@ -135,19 +144,23 @@ async function getSourceFolders(
 	return rows;
 }
 
-async function requireTargetMember(user: ContentManager, targetUserId: string) {
+async function requireTargetMember(
+	user: ContentManager,
+	targetUserId: string,
+	reader: SnapshotReader = db(),
+) {
 	const [[organization], [target], [membership]] = await Promise.all([
-		db()
+		reader
 			.select({ ownerId: organizations.ownerId })
 			.from(organizations)
 			.where(eq(organizations.id, user.activeOrganizationId))
 			.limit(1),
-		db()
+		reader
 			.select({ id: users.id, name: users.name, email: users.email })
 			.from(users)
 			.where(eq(users.id, User.UserId.make(targetUserId)))
 			.limit(1),
-		db()
+		reader
 			.select({ id: organizationMembers.id })
 			.from(organizationMembers)
 			.where(
@@ -170,6 +183,7 @@ async function getSourceMemberships(
 	user: ContentManager,
 	source: ContentTransferSource,
 	folderIds: string[],
+	reader: SnapshotReader = db(),
 ): Promise<SourceMembership[]> {
 	const brandedFolderIds = folderIds.map((id) => Folder.FolderId.make(id));
 	const selection = {
@@ -197,7 +211,7 @@ async function getSourceMemberships(
 	};
 
 	if (source.type === "organization") {
-		return db()
+		return reader
 			.select(selection)
 			.from(sharedVideos)
 			.innerJoin(videos, eq(sharedVideos.videoId, videos.id))
@@ -211,13 +225,13 @@ async function getSourceMemberships(
 			.where(
 				and(
 					eq(sharedVideos.organizationId, user.activeOrganizationId),
-					inArray(sharedVideos.folderId, brandedFolderIds),
+					inJsonArray(sharedVideos.folderId, brandedFolderIds),
 				),
 			)
 			.limit(MAX_CONTENT_TRANSFER_VIDEOS + 1);
 	}
 
-	return db()
+	return reader
 		.select(selection)
 		.from(spaceVideos)
 		.innerJoin(videos, eq(spaceVideos.videoId, videos.id))
@@ -231,7 +245,7 @@ async function getSourceMemberships(
 		.where(
 			and(
 				eq(spaceVideos.spaceId, Space.SpaceId.make(source.spaceId)),
-				inArray(spaceVideos.folderId, brandedFolderIds),
+				inJsonArray(spaceVideos.folderId, brandedFolderIds),
 			),
 		)
 		.limit(MAX_CONTENT_TRANSFER_VIDEOS + 1);
@@ -241,6 +255,7 @@ async function getSourceFolderVideoCounts(
 	user: ContentManager,
 	source: ContentTransferSource,
 	folderIds: string[],
+	reader: SnapshotReader = db(),
 ) {
 	const brandedFolderIds = folderIds.map((id) => Folder.FolderId.make(id));
 	const rows: Array<{ folderId: string | null; count: number }> = [];
@@ -248,23 +263,23 @@ async function getSourceFolderVideoCounts(
 		const folderIdChunk = brandedFolderIds.slice(index, index + 1_000);
 		const chunkRows =
 			source.type === "organization"
-				? await db()
+				? await reader
 						.select({ folderId: sharedVideos.folderId, count: count() })
 						.from(sharedVideos)
 						.where(
 							and(
 								eq(sharedVideos.organizationId, user.activeOrganizationId),
-								inArray(sharedVideos.folderId, folderIdChunk),
+								inJsonArray(sharedVideos.folderId, folderIdChunk),
 							),
 						)
 						.groupBy(sharedVideos.folderId)
-				: await db()
+				: await reader
 						.select({ folderId: spaceVideos.folderId, count: count() })
 						.from(spaceVideos)
 						.where(
 							and(
 								eq(spaceVideos.spaceId, Space.SpaceId.make(source.spaceId)),
-								inArray(spaceVideos.folderId, folderIdChunk),
+								inJsonArray(spaceVideos.folderId, folderIdChunk),
 							),
 						)
 						.groupBy(spaceVideos.folderId);
@@ -286,15 +301,17 @@ async function buildTransferState({
 	source,
 	sourceRootFolderId,
 	targetUserId,
+	reader = db(),
 }: {
 	user: ContentManager;
 	source: ContentTransferSource;
 	sourceRootFolderId: string;
 	targetUserId: string;
+	reader?: SnapshotReader;
 }) {
 	const [sourceFolders, target] = await Promise.all([
-		getSourceFolders(user, source),
-		requireTargetMember(user, targetUserId),
+		getSourceFolders(user, source, reader),
+		requireTargetMember(user, targetUserId, reader),
 	]);
 	const sourceRows = buildContentTransferFolderRows(sourceFolders);
 	const sourceRoot = sourceRows.find(
@@ -313,8 +330,8 @@ async function buildTransferState({
 	}
 
 	const [memberships, targetFolders] = await Promise.all([
-		getSourceMemberships(user, source, sourceFolderIds),
-		db()
+		getSourceMemberships(user, source, sourceFolderIds, reader),
+		reader
 			.select({
 				id: folders.id,
 				name: folders.name,
@@ -621,39 +638,57 @@ export async function startContentTransfer(input: {
 		cleanupWarnings: [],
 	};
 
-	await db().transaction(async (tx) => {
-		const [organization] = await tx
-			.select({ id: organizations.id })
-			.from(organizations)
-			.where(eq(organizations.id, user.activeOrganizationId))
-			.limit(1)
-			.for("update");
-		if (!organization) throw new Error("Organization not found");
-
-		const [activeOperation] = await tx
-			.select({ id: agentApiOperations.id })
-			.from(agentApiOperations)
-			.where(
-				and(
-					eq(agentApiOperations.kind, CONTENT_TRANSFER_KIND),
-					eq(agentApiOperations.resourceId, user.activeOrganizationId),
-					inArray(agentApiOperations.state, ["queued", "running"]),
-				),
-			)
-			.limit(1);
-		if (activeOperation) {
-			throw new Error("Another content transfer is already running");
-		}
-
-		await tx.insert(agentApiOperations).values({
-			id: operationId,
-			userId: user.id,
-			kind: CONTENT_TRANSFER_KIND,
-			resourceId: user.activeOrganizationId,
-			payload,
-			result: initialProgress,
-			state: "queued",
-		});
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(
+			snapshot,
+			user.activeOrganizationId,
+			user.id,
+		);
+		await requireOrganizationMember(
+			snapshot,
+			user.activeOrganizationId,
+			state.target.id,
+		);
+		const currentState = await snapshot.read((reader) =>
+			buildTransferState({ user, ...input, reader }),
+		);
+		if (currentState.previewToken !== input.previewToken)
+			throw Error("The folder contents changed. Review the transfer again.");
+		if (currentState.blockedReasons.length)
+			throw Error(currentState.blockedReasons[0]);
+		const [activeOperation] = await snapshot.read((reader) =>
+			reader
+				.select({ id: agentApiOperations.id })
+				.from(agentApiOperations)
+				.where(
+					and(
+						eq(agentApiOperations.kind, CONTENT_TRANSFER_KIND),
+						eq(agentApiOperations.resourceId, user.activeOrganizationId),
+						inArray(agentApiOperations.state, ["queued", "running"]),
+					),
+				)
+				.limit(1),
+		);
+		if (activeOperation)
+			throw Error("Another content transfer is already running");
+		return {
+			statements: [
+				database.insert(agentApiOperations).values({
+					id: operationId,
+					userId: user.id,
+					kind: CONTENT_TRANSFER_KIND,
+					resourceId: user.activeOrganizationId,
+					payload: encodeContentTransferPayload({
+						...payload,
+						targetEmail: currentState.target.email,
+					}),
+					result: initialProgress,
+					state: "queued",
+				}),
+			],
+			result: undefined,
+		};
 	});
 
 	try {
@@ -668,7 +703,12 @@ export async function startContentTransfer(input: {
 					error instanceof Error ? error.message : "Unable to start transfer",
 				completedAt: new Date(),
 			})
-			.where(eq(agentApiOperations.id, operationId));
+			.where(
+				and(
+					eq(agentApiOperations.id, operationId),
+					eq(agentApiOperations.state, "queued"),
+				),
+			);
 		throw error;
 	}
 

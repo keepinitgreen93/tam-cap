@@ -7,7 +7,7 @@ const databaseState = vi.hoisted(() => ({
 	selectCount: 0,
 }));
 const runPromise = vi.hoisted(() => vi.fn());
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => {
 			const rows = databaseState.results[databaseState.selectCount++] ?? [];

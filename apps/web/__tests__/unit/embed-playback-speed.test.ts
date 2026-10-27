@@ -4,7 +4,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ select: vi.fn(), ownerIsPro: true }));
 
-vi.mock("@cap/database", () => ({ db: () => ({ select: mocks.select }) }));
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => ({ select: mocks.select }),
+}));
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => null,
 }));

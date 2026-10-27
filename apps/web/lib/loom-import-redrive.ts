@@ -1,5 +1,9 @@
-import { db } from "@cap/database";
-import { importedVideos, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	importedVideos,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import {
@@ -16,11 +20,6 @@ const STALE_PROCESSING_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export type LoomRedriveOutcome =
 	| { videoId: string; status: "restarted" }
 	| { videoId: string; status: "skipped" | "failed"; reason: string };
-
-function getAffectedRows(result: unknown) {
-	const header = Array.isArray(result) ? result[0] : result;
-	return (header as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-}
 
 export async function redriveLoomImport(
 	videoId: string,
@@ -90,7 +89,7 @@ export async function redriveLoomImport(
 				eq(videoUploads.updatedAt, row.uploadUpdatedAt),
 			),
 		);
-	if (getAffectedRows(claim) !== 1)
+	if (claim.meta.changes !== 1)
 		return { videoId, status: "skipped", reason: "already restarting" };
 
 	try {

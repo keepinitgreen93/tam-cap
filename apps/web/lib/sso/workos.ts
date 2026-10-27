@@ -1,6 +1,6 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { getWorkOS, normalizeSsoDomain } from "@cap/database/auth/sso";
-import { organizations } from "@cap/database/schema";
+import { organizations } from "@cap/database/legacy/schema";
 import type { Organisation } from "@cap/web-domain";
 import { DomainDataState } from "@workos-inc/node";
 import { and, eq, isNull } from "drizzle-orm";
@@ -8,6 +8,7 @@ import { and, eq, isNull } from "drizzle-orm";
 type CapOrganization = typeof organizations.$inferSelect;
 
 export async function getSsoConfiguration(organization: CapOrganization) {
+	if (process.env.CAP_RUNTIME === "cloudflare") return null;
 	if (!organization.workosOrganizationId) return null;
 	const workos = getWorkOS();
 	const [remote, connections] = await Promise.all([
@@ -54,6 +55,10 @@ export async function ensureWorkosOrganization(
 	organizationId: Organisation.OrganisationId,
 	domainInput?: string,
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor SSO provisioning is unavailable on this self-hosted instance",
+		);
 	const [organization] = await db()
 		.select()
 		.from(organizations)

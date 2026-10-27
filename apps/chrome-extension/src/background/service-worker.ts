@@ -646,6 +646,7 @@ const showOverlayInTab = async (
 		type: "overlay-settings",
 		settings: settings.webcam,
 		recording,
+		recorderOpen,
 	});
 	if (!delivered) return false;
 
@@ -1402,7 +1403,14 @@ const beginAuthFlow = async (settings: ExtensionSettings) => {
 	// co-installed extensions can observe.
 	void launchWebAuthFlow(authStart.url)
 		.then(async (responseUrl) => {
-			const auth = parseAuthResponse(responseUrl, authStart.state);
+			const auth = parseAuthResponse(
+				responseUrl,
+				authStart.state,
+				settings.apiBaseUrl,
+			);
+			const currentSettings = await loadSettings();
+			if (new URL(currentSettings.apiBaseUrl).origin !== auth.apiOrigin)
+				throw new Error("Instance changed during sign-in; try again");
 			// Server-minted keys never expire, so a re-auth would otherwise leave
 			// the previous key live in auth_api_keys forever; revoke it
 			// best-effort before it is forgotten locally.
@@ -1673,6 +1681,8 @@ const handleRequest = async (
 
 	if (message.type === "settings-updated") {
 		await saveSettings(message.settings);
+		bootstrapCache = null;
+		await clearCachedBootstrap();
 		if (isWebcamPreviewEnabled(message.settings)) {
 			await saveWebcamPreviewDismissed(false);
 			await showOverlayInActiveTab(

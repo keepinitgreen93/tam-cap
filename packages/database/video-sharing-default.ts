@@ -1,8 +1,8 @@
 import { serverEnv } from "@cap/env";
 import type { Organisation } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { db } from "./index.ts";
-import { organizations } from "./schema.ts";
+import { db } from "./cloudflare/application.ts";
+import { organizations } from "./cloudflare/schema.ts";
 
 export async function getNewVideoPublic(
 	organizationId: Organisation.OrganisationId,

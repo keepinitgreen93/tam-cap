@@ -96,6 +96,10 @@
 	],
 	"r2_buckets": [
 		{
+			"binding": "DOWNLOADS",
+			"bucket_name": "tam-cap-downloads"
+		},
+		{
 			"binding": "VIDEOS",
 			"bucket_name": "tam-cap-videos"
 		}

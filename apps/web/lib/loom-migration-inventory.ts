@@ -1,12 +1,18 @@
-import { db } from "@cap/database";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	loomMigrationImports,
 	loomMigrationRequests,
 	videos,
-} from "@cap/database/schema";
-import { and, eq, inArray, isNull, notExists } from "drizzle-orm";
-import { requireMigrationOperator } from "@/lib/loom-concierge";
+} from "@cap/database/cloudflare/schema";
+import { and, eq, isNull, notExists } from "drizzle-orm";
+import {
+	assertMigrationOperator,
+	requireMigrationOperator,
+} from "@/lib/loom-concierge";
 import { LoomMigrationError } from "@/lib/loom-migration-state";
+import { inJsonArray } from "@/utils/sql";
 
 const RECONCILE_BATCH_SIZE = 100;
 
@@ -24,13 +30,16 @@ export async function reconcileMissingLoomMigrationImports({
 		throw new LoomMigrationError(
 			"Reconcile deleted recordings against the source list first.",
 		);
-	return db().transaction(async (tx) => {
-		const [request] = await tx
-			.select()
-			.from(loomMigrationRequests)
-			.where(eq(loomMigrationRequests.id, requestId))
-			.limit(1)
-			.for("update");
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		await assertMigrationOperator(snapshot, operator.id);
+		const [request] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(loomMigrationRequests)
+				.where(eq(loomMigrationRequests.id, requestId))
+				.limit(1),
+		);
 		if (
 			!request ||
 			request.status === "completed" ||
@@ -38,53 +47,55 @@ export async function reconcileMissingLoomMigrationImports({
 			(request.activeImportCount > 0 &&
 				(!request.activeImportLeaseUntil ||
 					request.activeImportLeaseUntil > new Date()))
-		) {
+		)
 			throw new LoomMigrationError(
 				"The migration is inactive or imports are starting. Refresh and try again.",
 			);
-		}
-		const missing = await tx
-			.select({ videoId: loomMigrationImports.videoId })
-			.from(loomMigrationImports)
-			.leftJoin(videos, eq(videos.id, loomMigrationImports.videoId))
-			.where(
-				and(eq(loomMigrationImports.requestId, requestId), isNull(videos.id)),
-			)
-			.limit(RECONCILE_BATCH_SIZE + 1)
-			.for("update");
-		if (missing.length === 0) return { removedCount: 0, hasMore: false };
-		const result = await tx.delete(loomMigrationImports).where(
-			and(
-				eq(loomMigrationImports.requestId, requestId),
-				inArray(
-					loomMigrationImports.videoId,
-					missing.slice(0, RECONCILE_BATCH_SIZE).map((row) => row.videoId),
-				),
-				notExists(
-					tx
-						.select({ id: videos.id })
-						.from(videos)
-						.where(eq(videos.id, loomMigrationImports.videoId)),
-				),
-			),
+		await requireActiveOrganization(snapshot, request.organizationId);
+		const missing = await snapshot.read((reader) =>
+			reader
+				.select({ videoId: loomMigrationImports.videoId })
+				.from(loomMigrationImports)
+				.leftJoin(videos, eq(videos.id, loomMigrationImports.videoId))
+				.where(
+					and(eq(loomMigrationImports.requestId, requestId), isNull(videos.id)),
+				)
+				.limit(RECONCILE_BATCH_SIZE + 1),
 		);
-		const removedCount = (Array.isArray(result) ? result[0] : result) as {
-			affectedRows?: number;
-		};
-		if (typeof removedCount.affectedRows !== "number")
-			throw new Error("Could not verify inventory reconciliation");
+		if (missing.length === 0)
+			return { statements: [], result: { removedCount: 0, hasMore: false } };
+		const selected = missing.slice(0, RECONCILE_BATCH_SIZE);
 		const now = new Date();
-		await tx
-			.update(loomMigrationRequests)
-			.set({
-				lastOperatorUserId: operator.id,
-				lastOperatorAt: now,
-				updatedAt: now,
-			})
-			.where(eq(loomMigrationRequests.id, requestId));
 		return {
-			removedCount: removedCount.affectedRows,
-			hasMore: missing.length > RECONCILE_BATCH_SIZE,
+			statements: [
+				database.delete(loomMigrationImports).where(
+					and(
+						eq(loomMigrationImports.requestId, requestId),
+						inJsonArray(
+							loomMigrationImports.videoId,
+							selected.map((row) => row.videoId),
+						),
+						notExists(
+							database
+								.select({ id: videos.id })
+								.from(videos)
+								.where(eq(videos.id, loomMigrationImports.videoId)),
+						),
+					),
+				),
+				database
+					.update(loomMigrationRequests)
+					.set({
+						lastOperatorUserId: operator.id,
+						lastOperatorAt: now,
+						updatedAt: now,
+					})
+					.where(eq(loomMigrationRequests.id, requestId)),
+			],
+			result: {
+				removedCount: selected.length,
+				hasMore: missing.length > RECONCILE_BATCH_SIZE,
+			},
 		};
 	});
 }

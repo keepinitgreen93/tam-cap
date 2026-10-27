@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { User, Video } from "@cap/web-domain";
 import { and, eq, or, sql } from "drizzle-orm";
@@ -35,7 +35,7 @@ export async function recordLoomMediaDispatch({
 	const result = await db()
 		.update(videos)
 		.set({
-			metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.loomImportRun', JSON_MERGE_PATCH(COALESCE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun'), JSON_OBJECT()), JSON_EXTRACT(${JSON.stringify(receipt)}, '$')))`,
+			metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.loomImportRun', json_patch(COALESCE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun'), JSON_OBJECT()), JSON_EXTRACT(${JSON.stringify(receipt)}, '$')))`,
 		})
 		.where(
 			and(
@@ -43,14 +43,11 @@ export async function recordLoomMediaDispatch({
 				eq(videos.ownerId, User.UserId.make(userId)),
 				or(
 					sql`JSON_EXTRACT(${videos.metadata}, '$.loomImportRun') IS NULL`,
-					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId')) = ${runId}`,
+					sql`json_extract(${videos.metadata}, '$.loomImportRun.runId') = ${runId}`,
 				),
 			),
 		);
-	const affectedRows = Array.isArray(result)
-		? (result[0] as { affectedRows?: number } | undefined)?.affectedRows
-		: (result as { affectedRows?: number }).affectedRows;
-	if (affectedRows !== 1)
+	if (result.meta.changes !== 1)
 		throw new Error("Loom media dispatch ownership changed");
 }
 

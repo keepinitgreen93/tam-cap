@@ -7,7 +7,7 @@ const lookup = vi.hoisted(() => ({
 	serverDefaultPublic: true,
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({
 			from: () => ({

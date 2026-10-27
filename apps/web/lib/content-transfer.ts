@@ -264,7 +264,6 @@ export function getContentTransferStorageBlockReason({
 	bucketOrganizationId,
 	storageIntegrationId,
 	storageIntegrationOwnerId,
-	storageIntegrationOrganizationId,
 }: {
 	sourceOwnerId: string;
 	targetUserId: string;
@@ -282,13 +281,7 @@ export function getContentTransferStorageBlockReason({
 	}
 	if (storageIntegrationId) {
 		if (!storageIntegrationOwnerId) return "The storage integration is missing";
-		if (
-			storageIntegrationOrganizationId === organizationId ||
-			storageIntegrationOwnerId === targetUserId
-		) {
-			return null;
-		}
-		return "The Cap uses a personal storage integration owned by another user";
+		return "Ownership transfer for linked Drive storage is not supported";
 	}
 	if (bucketId) {
 		if (!bucketOwnerId) return "The storage bucket is missing";

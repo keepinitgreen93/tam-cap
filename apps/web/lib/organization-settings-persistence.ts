@@ -9,7 +9,11 @@ import {
 } from "@cap/database/cloudflare/schema";
 import type { Space, User } from "@cap/web-domain";
 import { and, eq, sql } from "drizzle-orm";
-import { canManageSpace, getEffectiveSpaceRole } from "@/lib/permissions/roles";
+import {
+	canManageSpace,
+	getEffectiveOrganizationRole,
+	getEffectiveSpaceRole,
+} from "@/lib/permissions/roles";
 
 export async function requireManagedSpace(
 	snapshot: AtomicSnapshot,
@@ -36,7 +40,11 @@ export async function requireManagedSpace(
 	);
 	if (
 		!canManageSpace({
-			organizationRole: access.role,
+			organizationRole: getEffectiveOrganizationRole({
+				userId,
+				ownerId: access.organization.ownerId,
+				memberRole: access.role,
+			}),
 			spaceRole: getEffectiveSpaceRole({
 				userId,
 				createdById: space.createdById,
@@ -71,6 +79,7 @@ export async function requireSpaceRoster(
 	]);
 	if (userIds.some((id) => !allowed.has(id)))
 		throw new Error("All space members must belong to the organization");
+	return allowed;
 }
 
 export function insertSpaceMembers(
@@ -90,12 +99,12 @@ export function insertSpaceMembers(
 	return database.insert(spaceMembers).select(
 		database
 			.select({
-				id: sql<string>`json_extract(value, '$.id')`,
-				spaceId: sql<Space.SpaceIdOrOrganisationId>`${spaceId}`,
-				userId: sql<User.UserId>`json_extract(value, '$.userId')`,
-				role: sql<"admin" | "member">`json_extract(value, '$.role')`,
-				createdAt: sql<Date>`${now.getTime()}`,
-				updatedAt: sql<Date>`${now.getTime()}`,
+				id: sql<string>`json_extract(value, '$.id')`.as("id"),
+				spaceId: sql<Space.SpaceIdOrOrganisationId>`${spaceId}`.as("spaceId"),
+				userId: sql<User.UserId>`json_extract(value, '$.userId')`.as("userId"),
+				role: sql<"admin" | "member">`json_extract(value, '$.role')`.as("role"),
+				createdAt: sql<Date>`${now.getTime()}`.as("createdAt"),
+				updatedAt: sql<Date>`${now.getTime()}`.as("updatedAt"),
 			})
 			.from(sql`json_each(${JSON.stringify(rows)})`),
 	);

@@ -90,7 +90,10 @@ export async function addSpaceMembers(
 						insertSpaceMembers(
 							database,
 							spaceId,
-							added.map((userId) => ({ userId, role })),
+							added.map((userId) => ({
+								userId,
+								role: userId === access.createdById ? "admin" : role,
+							})),
 							operationId,
 							now,
 						),
@@ -152,8 +155,12 @@ export async function setSpaceMembers(
 				normalizeSpaceRole(member.role) ?? "member",
 			]),
 		);
-		roles.set(access.createdById, "admin");
-		await requireSpaceRoster(snapshot, access, Array.from(roles.keys()));
+		const allowed = await requireSpaceRoster(
+			snapshot,
+			access,
+			Array.from(roles.keys()),
+		);
+		if (allowed.has(access.createdById)) roles.set(access.createdById, "admin");
 		const values = Array.from(roles, ([userId, role]) => ({ userId, role }));
 		return {
 			statements: [

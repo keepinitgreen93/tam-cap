@@ -92,6 +92,7 @@ type ChunkingMode = "manual" | "timeslice";
 type RecordingSound = "start-recording" | "stop-recording";
 
 type ActiveRecording = {
+	apiOrigin: string;
 	recorder: MediaRecorder;
 	stopPromise: Promise<void>;
 	streams: MediaStream[];
@@ -997,6 +998,7 @@ const startRecording = async (request: StartRecordingRequest) => {
 				: null;
 
 		const recording: ActiveRecording = {
+			apiOrigin: new URL(request.settings.apiBaseUrl).origin,
 			recorder,
 			stopPromise: Promise.resolve(),
 			streams,
@@ -1271,6 +1273,7 @@ const rememberFailedRecording = async (
 	}
 
 	const saved = await upsertFailedRecording({
+		apiOrigin: recording.apiOrigin,
 		sessionId,
 		videoId: recording.videoId,
 		shareUrl: recording.shareUrl,
@@ -1515,6 +1518,14 @@ const runFailedUploadRetry = async (
 	const [settings, auth] = await Promise.all([loadSettings(), loadAuth()]);
 	if (!auth) {
 		throw new Error("Sign in to Cap to retry this upload.");
+	}
+	const recordingOrigin =
+		failed.apiOrigin ??
+		(failed.shareUrl ? new URL(failed.shareUrl).origin : null);
+	if (recordingOrigin !== new URL(settings.apiBaseUrl).origin) {
+		throw new Error(
+			"Switch back to the recording's original instance to retry, or download its local copy.",
+		);
 	}
 
 	const typedVideoId = failed.videoId as VideoId;

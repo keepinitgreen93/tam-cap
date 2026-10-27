@@ -337,6 +337,7 @@ function App() {
 		try {
 			new URL(settings.apiBaseUrl);
 			await saveSettings(settings);
+			setAuth(await loadAuth());
 			await sendServiceWorkerMessage({
 				target: "service-worker",
 				type: "settings-updated",

@@ -8,7 +8,7 @@ import type {
 } from "@cap/database/auth/sso";
 import { Organisation } from "@cap/web-domain";
 import type { SQL } from "drizzle-orm";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import type { Account, NextAuthOptions } from "next-auth";
 import type { Adapter } from "next-auth/adapters";
 import type { EmailConfig } from "next-auth/providers/email";
@@ -66,8 +66,19 @@ vi.mock("@cap/env", () => ({
 	},
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({ select: mocks.select }),
+}));
+
+vi.mock("@cap/database/cloudflare/team", () => ({
+	canSignInCloudflare: async () => true,
+}));
+vi.mock("@cap/database/auth/identity", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@cap/database/auth/identity")>()),
+	cloudflareAccessPolicy: () => ({
+		ownerEmail: "fixture@example.com",
+		inviteOnly: true,
+	}),
 }));
 
 vi.mock("@cap/database/auth/sso", () => ({
@@ -159,8 +170,8 @@ describe("authOptions", () => {
 		}));
 		mocks.where.mockReset().mockImplementation((condition: SQL) => ({
 			limit: async () => {
-				const query = new MySqlDialect().sqlToQuery(condition);
-				const match = /^`users`\.`(id|email)` = \?$/.exec(query.sql);
+				const query = new SQLiteSyncDialect().sqlToQuery(condition);
+				const match = /^"users"\."(id|email)" = \?$/.exec(query.sql);
 				if (!match?.[1]) throw new Error("Unexpected auth-user predicate");
 				const column = match[1] as "id" | "email";
 				return mocks.users.filter((user) => user[column] === query.params[0]);

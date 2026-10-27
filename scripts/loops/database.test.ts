@@ -11,7 +11,7 @@ import {
 	deferJob,
 } from "../../packages/database/loops/jobs";
 import { enqueueLoopsSync } from "../../packages/database/loops/queue";
-import { loopsSyncJobs } from "../../packages/database/schema";
+import { loopsSyncJobs } from "../../packages/database/legacy/schema";
 
 const url = process.env.LOOPS_TEST_DATABASE_URL;
 const claimJob = async (

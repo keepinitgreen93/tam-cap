@@ -18,6 +18,7 @@ export async function cleanupLoomFileSource({
 	rawFileKey: string;
 }): Promise<void> {
 	"use step";
+	if (process.env.CAP_RUNTIME === "cloudflare") return;
 
 	const outputKey = `${userId}/${videoId}/result.mp4`;
 	if (

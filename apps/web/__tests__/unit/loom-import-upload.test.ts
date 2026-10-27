@@ -10,10 +10,10 @@ const mocks = vi.hoisted(() => ({
 	get: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({ update: () => ({ set: mocks.set }) }),
 }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	videos: {
 		id: "id",
 		ownerId: "ownerId",
@@ -61,7 +61,7 @@ describe("Loom multipart upload preparation", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
 		mocks.set.mockReturnValue({ where: mocks.where });
-		mocks.where.mockResolvedValue([{ affectedRows: 1 }]);
+		mocks.where.mockResolvedValue({ meta: { changes: 1 } });
 		mocks.create.mockImplementation((key: string) =>
 			Effect.succeed({ UploadId: `upload:${key}` }),
 		);
@@ -153,7 +153,7 @@ describe("Loom multipart upload preparation", () => {
 	});
 
 	it("aborts only newly reserved uploads when recording ownership changes", async () => {
-		mocks.where.mockResolvedValue([{ affectedRows: 0 }]);
+		mocks.where.mockResolvedValue({ meta: { changes: 0 } });
 		await expect(prepareLoomMultipartUploads(input())).rejects.toThrow(
 			"ownership changed",
 		);

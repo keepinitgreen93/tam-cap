@@ -1,4 +1,4 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { sendEmail } from "@cap/database/emails/config";
 import { PaymentFailed } from "@cap/database/emails/payment-failed";
 import { nanoId } from "@cap/database/helpers";
@@ -7,7 +7,7 @@ import {
 	developerCreditTransactions,
 	signedBaas,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/legacy/schema";
 import { serverEnv } from "@cap/env";
 import { isProSubscription, isSsoSubscription, stripe } from "@cap/utils";
 import { Organisation, User } from "@cap/web-domain";
@@ -380,6 +380,7 @@ async function findUserWithRetry(
 }
 
 export const POST = async (req: Request) => {
+	if (process.env.CAP_RUNTIME === "cloudflare") return new Response("Not Found", { status: 404 });
 	console.log("Webhook received");
 	const buf = await req.text();
 	const sig = req.headers.get("Stripe-Signature") as string;

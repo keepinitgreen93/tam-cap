@@ -123,8 +123,13 @@ export async function updateSpace(formData: FormData) {
 	const now = new Date();
 	const oldIcon = await atomic(database, async (snapshot) => {
 		const current = await requireManagedSpace(snapshot, user.id, id);
-		const memberIds = Array.from(new Set([...members, current.createdById]));
-		await requireSpaceRoster(snapshot, current, memberIds);
+		const allowed = await requireSpaceRoster(snapshot, current, members);
+		const memberIds = Array.from(
+			new Set([
+				...members,
+				...(allowed.has(current.createdById) ? [current.createdById] : []),
+			]),
+		);
 		const existing = await snapshot.read((reader) =>
 			reader.select().from(spaceMembers).where(eq(spaceMembers.spaceId, id)),
 		);

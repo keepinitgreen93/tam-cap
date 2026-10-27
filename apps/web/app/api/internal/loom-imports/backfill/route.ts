@@ -9,6 +9,7 @@ import {
 	HttpServerRequest,
 } from "@effect/platform";
 import { Effect, Layer, Schema } from "effect";
+import { resolveTrustedMigrationOperator } from "@/lib/loom-concierge";
 import {
 	backfillLoomImport,
 	type LoomBackfillOutcome,
@@ -57,7 +58,8 @@ class Api extends HttpApi.make("LoomImportBackfillApi").add(
 					),
 				}),
 			)
-			.addError(HttpApiError.Unauthorized),
+			.addError(HttpApiError.Unauthorized)
+			.addError(HttpApiError.Forbidden),
 	),
 ) {}
 
@@ -79,20 +81,26 @@ const ApiLive = HttpApiBuilder.api(Api).pipe(
 						!timingSafeEqual(digest(header), digest(secret))
 					)
 						return yield* new HttpApiError.Unauthorized();
+					const operator = yield* Effect.tryPromise({
+						try: resolveTrustedMigrationOperator,
+						catch: () => new HttpApiError.Forbidden(),
+					});
 					const results = yield* Effect.forEach(
 						payload.items,
 						(item) =>
 							Effect.promise(
 								(): Promise<LoomBackfillOutcome> =>
-									backfillLoomImport(payload.organizationId, item).catch(
-										(error) => ({
-											videoId: item.videoId,
-											status: "failed",
-											changes: [],
-											reason:
-												error instanceof Error ? error.message : String(error),
-										}),
-									),
+									backfillLoomImport(
+										payload.organizationId,
+										item,
+										operator.id,
+									).catch((error) => ({
+										videoId: item.videoId,
+										status: "failed",
+										changes: [],
+										reason:
+											error instanceof Error ? error.message : String(error),
+									})),
 							),
 						{ concurrency: 1 },
 					);

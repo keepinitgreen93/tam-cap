@@ -47,7 +47,7 @@ vi.mock("@/lib/media-processing-budget", () => ({
 		}
 	},
 }));
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({
 			from: () => ({
@@ -56,8 +56,6 @@ vi.mock("@cap/database", () => ({
 		}),
 	}),
 }));
-vi.mock("@cap/database/schema", () => ({ users: {}, videos: {} }));
-vi.mock("drizzle-orm", () => ({ and: vi.fn(), eq: vi.fn() }));
 vi.mock("@cap/env", () => ({ serverEnv: mocks.env }));
 vi.mock("workflow", () => ({
 	sleep: mocks.sleep,

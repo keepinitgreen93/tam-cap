@@ -17,8 +17,8 @@ const schemaMocks = vi.hoisted(() => ({
 	},
 }));
 
-vi.mock("@cap/database", () => ({ db: mockDb }));
-vi.mock("@cap/database/schema", () => schemaMocks);
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mockDb }));
+vi.mock("@cap/database/cloudflare/schema", () => schemaMocks);
 vi.mock("drizzle-orm", () => ({
 	eq: vi.fn((field, value) => ({ field, value })),
 }));

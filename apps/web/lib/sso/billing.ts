@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { db } from "@cap/database";
-import { organizationSso, organizations, users } from "@cap/database/schema";
+import { db } from "@cap/database/legacy";
+import { organizationSso, organizations, users } from "@cap/database/legacy/schema";
 import { serverEnv } from "@cap/env";
 import {
 	isSsoPrice,

@@ -4,7 +4,10 @@ export function normalizeEmail(value: string): string {
 	const parts = value.trim().normalize("NFC").split("@");
 	if (parts.length !== 2) throw new Error("Invalid email address");
 	const local = parts[0]?.toLowerCase().normalize("NFC") ?? "";
-	const domain = domainToASCII(parts[1]?.toLowerCase() ?? "");
+	const rawDomain = parts[1]?.toLowerCase() ?? "";
+	if (/[\p{Cc}\p{Cf}\s/@:#?\\<>()[\],;"]/u.test(rawDomain))
+		throw new Error("Invalid email address");
+	const domain = domainToASCII(rawDomain);
 	if (
 		!local ||
 		new TextEncoder().encode(local).byteLength > 64 ||

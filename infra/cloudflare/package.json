@@ -3,7 +3,7 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "node --test worker.test.mjs runtime.test.mjs workflow-store.test.mjs request-headers.test.mjs maintenance.test.mjs",
+		"test": "node --test worker.test.mjs runtime.test.mjs workflow-store.test.mjs request-headers.test.mjs maintenance.test.mjs downloads.test.mjs",
 		"typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.runtime.json"
 	},
 	"dependencies": {

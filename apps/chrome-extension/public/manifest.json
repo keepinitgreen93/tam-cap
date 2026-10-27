@@ -1,10 +1,10 @@
 {
 	"manifest_version": 3,
-	"name": "Cap - Screen Recorder & Screen Capture",
-	"short_name": "Cap",
+	"name": "TAM Cap - Screen Recorder",
+	"short_name": "TAM Cap",
 	"description": "Free, open source screen recorder. Capture your screen, tab, camera & mic in Chrome and share a video link the moment you stop.",
 	"version": "1.0.4",
-	"homepage_url": "https://cap.so",
+	"homepage_url": "https://videos.trulyauthenticmarketing.com",
 	"minimum_chrome_version": "116",
 	"icons": {
 		"16": "icons/icon-16.png",

@@ -55,7 +55,8 @@ type ChromeGlobal = typeof globalThis & {
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const extensionPath = path.resolve(__dirname, "../dist");
+const extensionPath =
+	process.env.CAP_EXTENSION_DIST ?? path.resolve(__dirname, "../dist");
 const SETTINGS_KEY = "cap-extension-settings";
 const AUTH_KEY = "cap-extension-auth";
 const BOOTSTRAP_CACHE_KEY = "cap-extension-bootstrap-cache";
@@ -406,6 +407,7 @@ const configureExtension = async (
 				chromeApi.storage.local.set(
 					{
 						[authKey]: {
+							apiOrigin: new URL(apiBaseUrl).origin,
 							authApiKey: "auth-e2e",
 							userId: "user-e2e",
 						},

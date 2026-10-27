@@ -125,6 +125,7 @@ import {
 } from "@/lib/agent-write";
 import { hashKey } from "@/lib/developer-key-hash";
 import { startAiGeneration } from "@/lib/generate-ai";
+import { startLoomImportWorkflow } from "@/lib/loom-import-start";
 import { probeVideoViaMediaServer } from "@/lib/media-client";
 import { provisionOrganizationInvitee } from "@/lib/organization-provisioning";
 import {
@@ -157,7 +158,6 @@ import {
 	selectProSeatProvider,
 } from "@/utils/organization";
 import { agentCapOperationWorkflow } from "@/workflows/agent-cap-operation";
-import { importLoomVideoWorkflow } from "@/workflows/import-loom-video";
 
 export const dynamic = "force-dynamic";
 
@@ -2649,16 +2649,14 @@ const queueAgentLoomImport = Effect.fn("Agent.queueLoomImport")(
 						});
 					}
 					yield* Effect.tryPromise(() =>
-						start(importLoomVideoWorkflow, [
-							{
-								videoId,
-								userId: ownerId,
-								rawFileKey,
-								bucketId: Option.getOrNull(writable.bucketId),
-								loomVideoId,
-								agentOperationId: operationId,
-							},
-						]),
+						startLoomImportWorkflow({
+							videoId,
+							userId: ownerId,
+							rawFileKey,
+							bucketId: Option.getOrNull(writable.bucketId),
+							loomVideoId,
+							agentOperationId: operationId,
+						}),
 					).pipe(Effect.asVoid);
 					return { operationId, requestId: input.requestId };
 				}),

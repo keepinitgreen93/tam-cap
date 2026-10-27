@@ -7,6 +7,14 @@ import type { NextRequest } from "next/server";
 import { generateSignedBaaPdf } from "@/lib/baa/generate-signed-baa-pdf";
 
 export async function GET(request: NextRequest) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return Response.json(
+			{
+				error:
+					"Vendor BAA contracts are unavailable on this self-hosted instance",
+			},
+			{ status: 403 },
+		);
 	const user = await getCurrentUser();
 	if (!user) {
 		return Response.json({ error: "Unauthorized" }, { status: 401 });

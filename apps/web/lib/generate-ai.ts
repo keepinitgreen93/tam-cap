@@ -1,130 +1,96 @@
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
-import type { VideoMetadata } from "@cap/database/types";
+import {
+	claimAiGeneration,
+	updateAiGenerationRun,
+} from "@cap/database/cloudflare/ai-generation";
+import { db } from "@cap/database/cloudflare/application";
 import type { Video } from "@cap/web-domain";
-import { and, eq, sql } from "drizzle-orm";
-import { start } from "workflow/api";
+import { getRun, start } from "workflow/api";
+import { getWorld } from "workflow/runtime";
 import { isAiConfigured } from "@/lib/ai/provider";
 import { generateAiWorkflow } from "@/workflows/generate-ai";
 
-type GenerateAiResult = {
-	success: boolean;
-	message: string;
-};
-
-const LEGACY_AI_SUMMARY_FALLBACK =
-	"The AI was unable to generate a proper summary for this content.";
-
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
+type GenerateAiResult = { success: boolean; message: string };
 
 export async function startAiGeneration(
 	videoId: Video.VideoId,
 	userId: string,
 ): Promise<GenerateAiResult> {
-	if (!isAiConfigured()) {
-		return {
-			success: false,
-			message: "No AI provider configured",
-		};
-	}
-
-	if (!userId || !videoId) {
-		return {
-			success: false,
-			message: "userId or videoId not supplied",
-		};
-	}
-
-	const query = await db()
-		.select({ video: videos })
-		.from(videos)
-		.where(eq(videos.id, videoId));
-
-	if (query.length === 0 || !query[0]?.video) {
+	if (!isAiConfigured())
+		return { success: false, message: "No AI provider configured" };
+	if (!userId || !videoId)
+		return { success: false, message: "userId or videoId not supplied" };
+	const claim = await claimAiGeneration(db(), videoId, userId);
+	if (claim.state === "missing")
 		return { success: false, message: "Video does not exist" };
-	}
-
-	const { video } = query[0];
-
-	if (video.transcriptionStatus !== "COMPLETE") {
-		return {
-			success: false,
-			message: "Transcription not complete",
-		};
-	}
-
-	const metadata = (video.metadata as VideoMetadata) || {};
-
-	if (
-		metadata.aiGenerationStatus === "PROCESSING" ||
-		metadata.aiGenerationStatus === "QUEUED"
-	) {
-		return {
-			success: true,
-			message: "AI generation already in progress",
-		};
-	}
-
-	if (
-		metadata.aiGenerationStatus === "COMPLETE" &&
-		metadata.summary &&
-		metadata.summary !== LEGACY_AI_SUMMARY_FALLBACK &&
-		metadata.chapters
-	) {
-		return {
-			success: true,
-			message: "AI metadata already generated",
-		};
-	}
-
+	if (claim.state === "not-ready")
+		return { success: false, message: "Transcription not complete" };
+	if (claim.state === "complete")
+		return { success: true, message: "AI metadata already generated" };
+	const { run } = claim;
+	const world = getWorld();
+	let attempted = false;
 	try {
-		const transitionResult = await db()
-			.update(videos)
-			.set({
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.aiGenerationStatus', 'QUEUED')`,
-			})
-			.where(
-				and(
-					eq(videos.id, videoId),
-					eq(videos.updatedAt, video.updatedAt),
-					eq(videos.transcriptionStatus, "COMPLETE"),
-				),
-			);
-
-		if (getAffectedRows(transitionResult) === 0) {
-			return {
-				success: true,
-				message: "AI generation already in progress",
-			};
+		if (claim.state === "in-progress") {
+			if (run.workflowRunId && run.workflowQueue) {
+				const workflow = getRun(run.workflowRunId);
+				if (await workflow.exists) {
+					const status = await workflow.status;
+					if (status === "pending")
+						await world.queue(
+							run.workflowQueue,
+							{ runId: run.workflowRunId },
+							{ deploymentId: run.deploymentId },
+						);
+					if (status !== "pending" && status !== "running") {
+						await updateAiGenerationRun(db(), videoId, run.id, {
+							status: "ERROR",
+						});
+						return {
+							success: false,
+							message: "AI generation stopped; retry generation",
+						};
+					}
+				}
+			}
+			return { success: true, message: "AI generation already in progress" };
 		}
-
-		await start(generateAiWorkflow, [{ videoId, userId }]);
-
-		return {
-			success: true,
-			message: "AI generation workflow started",
+		const observedWorld: ReturnType<typeof getWorld> = {
+			...world,
+			queue: async (name, message, options) => {
+				if (!("runId" in message))
+					throw new Error("AI workflow identity missing");
+				const current = await updateAiGenerationRun(db(), videoId, run.id, {
+					run: {
+						workflowRunId: message.runId,
+						workflowQueue: name,
+						deploymentId: options?.deploymentId,
+					},
+				});
+				if (!current)
+					throw new Error("AI generation superseded before dispatch");
+				attempted = true;
+				return world.queue(name, message, options);
+			},
 		};
+		const started = await start(
+			generateAiWorkflow,
+			[{ videoId, userId, runId: run.id }],
+			{ world: observedWorld },
+		);
+		await updateAiGenerationRun(db(), videoId, run.id, {
+			run: { dispatch: "accepted", workflowRunId: started.runId },
+		});
+		return { success: true, message: "AI generation workflow started" };
 	} catch {
-		await db()
-			.update(videos)
-			.set({
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.aiGenerationStatus', 'ERROR')`,
-			})
-			.where(
-				and(
-					eq(videos.id, videoId),
-					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.aiGenerationStatus')) = 'QUEUED'`,
-				),
-			);
-
+		if (claim.state === "in-progress")
+			return {
+				success: false,
+				message: "Failed to resume AI generation workflow",
+			};
+		await updateAiGenerationRun(db(), videoId, run.id, {
+			...(attempted ? {} : { status: "ERROR" as const }),
+			run: { dispatch: attempted ? "uncertain" : "rejected" },
+		});
 		return {
 			success: false,
 			message: "Failed to start AI generation workflow",

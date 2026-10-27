@@ -24,6 +24,13 @@ app.get(
 	zValidator("query", desktopSessionRequestQuerySchema),
 	async (c) => {
 		const { port, platform, type } = c.req.valid("query");
+		if (
+			process.env.CAP_RUNTIME === "cloudflare" &&
+			platform === "web" &&
+			port === undefined
+		) {
+			return c.json({ error: "loopback_port_required" }, 400);
+		}
 
 		const secret = serverEnv().NEXTAUTH_SECRET;
 

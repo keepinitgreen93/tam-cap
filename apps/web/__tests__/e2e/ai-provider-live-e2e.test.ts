@@ -24,9 +24,15 @@ import {
 	PutObjectCommand,
 	S3Client,
 } from "@aws-sdk/client-s3";
-import { db } from "@cap/database";
+import { claimAiGeneration } from "@cap/database/cloudflare/ai-generation";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations, videos } from "@cap/database/cloudflare/schema";
+import { getTranscriptObjectKey } from "@cap/database/cloudflare/transcript-publication";
+import {
+	claimTranscriptionRun,
+	transcriptionAudioFilename,
+} from "@cap/database/cloudflare/transcription-state";
 import { nanoId as generateNanoId } from "@cap/database/helpers";
-import { organizations, videos } from "@cap/database/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -96,6 +102,7 @@ async function seedVideo(options: {
 		ownerId,
 		orgId,
 		name: `ai-e2e-${videoId}`,
+		source: { type: "desktopMP4" },
 		public: false,
 		transcriptionStatus: options.transcriptionStatus ?? null,
 	} as unknown as typeof videos.$inferInsert;
@@ -109,6 +116,27 @@ async function seedVideo(options: {
 		);
 	}
 	return videoId;
+}
+
+async function runGeneration(videoId: Video.VideoId) {
+	const claim = await claimAiGeneration(db(), videoId, ownerId);
+	if (claim.state !== "claimed")
+		throw new Error(`AI fixture claim failed: ${claim.state}`);
+	return generateAiWorkflow({ videoId, userId: ownerId, runId: claim.run.id });
+}
+async function runTranscription(videoId: Video.VideoId) {
+	const claim = await claimTranscriptionRun(
+		db(),
+		videoId,
+		ownerId as typeof videos.$inferSelect.ownerId,
+	);
+	if (!claim) throw new Error("Transcription fixture claim failed");
+	return transcribeVideoWorkflow({
+		videoId,
+		userId: ownerId,
+		runId: claim.video.metadata.transcriptionRun.id,
+		aiGenerationEnabled: false,
+	});
 }
 
 async function fetchVideoRow(videoId: Video.VideoId) {
@@ -177,10 +205,10 @@ function buildLongVtt(): string {
 
 describe.skipIf(!enabled)("ai provider live e2e", () => {
 	beforeAll(async () => {
-		const dbUrl = process.env.DATABASE_URL ?? "";
+		const dbUrl = process.env.D1_BRIDGE_URL ?? "";
 		const s3Url = process.env.CAP_AWS_ENDPOINT ?? "";
 		if (!/localhost|127\.0\.0\.1/.test(dbUrl)) {
-			throw new Error("refusing to run: DATABASE_URL is not local");
+			throw new Error("refusing to run: D1_BRIDGE_URL is not local");
 		}
 		if (!/localhost|127\.0\.0\.1/.test(s3Url)) {
 			throw new Error("refusing to run: CAP_AWS_ENDPOINT is not local");
@@ -193,6 +221,16 @@ describe.skipIf(!enabled)("ai provider live e2e", () => {
 
 	afterAll(async () => {
 		for (const videoId of createdVideoIds) {
+			const { row } = await fetchVideoRow(videoId);
+			for (const key of [
+				getTranscriptObjectKey(row, "vtt"),
+				getTranscriptObjectKey(row, "edit"),
+				...(row.metadata?.transcriptionRun
+					? [`${ownerId}/${videoId}/${transcriptionAudioFilename(row)}`]
+					: []),
+			]) {
+				if (key) createdObjectKeys.push(key);
+			}
 			await db().delete(videos).where(eq(videos.id, videoId));
 			for (const suffix of [
 				"transcription.vtt",
@@ -206,14 +244,9 @@ describe.skipIf(!enabled)("ai provider live e2e", () => {
 					.catch(() => undefined);
 			}
 		}
-		try {
-			const client = db().$client as unknown as {
-				end?: () => Promise<void>;
-			};
-			await client.end?.();
-		} catch {
-			// best-effort pool shutdown
-		}
+
+		for (const key of new Set(createdObjectKeys))
+			await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }));
 	});
 
 	it("resolves the expected provider chains for this environment", () => {
@@ -244,7 +277,7 @@ describe.skipIf(!enabled)("ai provider live e2e", () => {
 			vtt: SHORT_VTT,
 			transcriptionStatus: "COMPLETE",
 		});
-		await generateAiWorkflow({ videoId, userId: ownerId });
+		await runGeneration(videoId);
 
 		const { row, metadata } = await fetchVideoRow(videoId);
 		console.log("[e2e] short title:", metadata.aiTitle);
@@ -266,7 +299,7 @@ describe.skipIf(!enabled)("ai provider live e2e", () => {
 			vtt: longVtt,
 			transcriptionStatus: "COMPLETE",
 		});
-		await generateAiWorkflow({ videoId, userId: ownerId });
+		await runGeneration(videoId);
 
 		const { metadata } = await fetchVideoRow(videoId);
 		console.log("[e2e] long title:", metadata.aiTitle);
@@ -295,22 +328,18 @@ describe.skipIf(!enabled)("ai provider live e2e", () => {
 				"video/mp4",
 			);
 
-			await transcribeVideoWorkflow({
-				videoId,
-				userId: ownerId,
-				aiGenerationEnabled: false,
-			});
+			await runTranscription(videoId);
 
 			const { row } = await fetchVideoRow(videoId);
 			expect(row.transcriptionStatus).toBe("COMPLETE");
 			const vtt = await getObjectText(
-				`${ownerId}/${videoId}/transcription.vtt`,
+				getTranscriptObjectKey(row, "vtt") ?? "missing-publication",
 			);
 			console.log("[e2e] fresh transcript first 300 chars:", vtt.slice(0, 300));
 			expect(vtt).toContain("WEBVTT");
 			expect(vtt.toLowerCase()).toContain("aurora");
 
-			await generateAiWorkflow({ videoId, userId: ownerId });
+			await runGeneration(videoId);
 			const { metadata } = await fetchVideoRow(videoId);
 			console.log("[e2e] fresh title:", metadata.aiTitle);
 			console.log("[e2e] fresh summary:", metadata.summary);

@@ -21,6 +21,7 @@ Source: docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md and docs/supe
 | AC13 | Loom inventory, sample import and batch reconciliation with exceptions | DEFERRED BY USER | User explicitly chose to handle existing-library migration after the replacement is live; not a launch blocker |
 | AC14 | Security review then QA, no material findings, relevant tests green | OPEN | Final independent reviews |
 | AC15 | View and engagement analytics operate on Cloudflare without Tinybird | OPEN | API agent implementing separate analytics store/provider; zero-value fallback is not acceptance |
+| AC16 | Desktop installation path and Chrome extension connect to the self-hosted instance, with clear licensing and verified capture/upload compatibility | IN PROGRESS | User explicitly requested both clients; extension package and native build/distribution audit assigned to sol_api; operating systems requested |
 
 ## Waves and dependencies
 
@@ -69,4 +70,4 @@ No placeholder portal or health endpoint counts as the app. No dropping transact
 - Root found Vercel-only cron configuration would not run on Cloudflare. Added gated Cloudflare quarter-hour scheduler feeding durable queue messages for stale-recording/failed-processing recovery; daily03:00UTC credential/analytics/developer-storage cleanup. Private authenticated requests, bounded retries, public cron paths denied. Nine runtime/maintenance tests passed; live maintenance remains disabled until coherent application deploy.
 - Added explicit Cloudflare production source typechecking and compiled workflow-manifest verification to Docker build. Source typecheck passed after notification/Loops fixes. Linux manifest omission was an obsolete admin wrapper after admin reprocessing moved to the guarded generic dispatcher; removed the unused wrapper rather than adding a dummy import. No existing staging admin jobs need compatibility with it.
 - Broad web unit regression run in progress. Separate runtime/platform/workflow suite passed all26 tests. The real-member invitation target was requested; no team address has been guessed or emailed.
-- User supplied tonimarie@productchamp.io as the first teammate invitation recipient, with authorization to invite after owner recording/editing acceptance. Do not send before that prerequisite passes. No display name or elevated administrator role was supplied; use an ordinary member invitation.
+- User supplied the first teammate invitation recipient privately, with authorization to invite after owner recording/editing acceptance. Do not send before that prerequisite passes. No display name or elevated administrator role was supplied; use an ordinary member invitation.

@@ -32,7 +32,14 @@ export async function updateOrganizationMemberRole(
 			organizationId,
 			user.id,
 		);
-		const actor = { role: access.role, ownerId: access.organization.ownerId };
+		const actor = {
+			role: getEffectiveOrganizationRole({
+				userId: user.id,
+				ownerId: access.organization.ownerId,
+				memberRole: access.role,
+			}),
+			ownerId: access.organization.ownerId,
+		};
 
 		const [member] = await snapshot.read((reader) =>
 			reader

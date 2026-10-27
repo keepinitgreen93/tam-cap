@@ -5,15 +5,21 @@ import { videos } from "@cap/database/cloudflare/schema";
 import { provideOptionalAuth, Storage, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { Effect, Exit } from "effect";
+import { Effect, Exit, Option } from "effect";
 import * as EffectRuntime from "@/lib/server";
 import { runPromise } from "@/lib/server";
+import { readTranscriptVtt } from "@/lib/transcript-publication";
+import {
+	isSameTranscriptSource,
+	translationCachePrefix,
+} from "@/lib/translation-cache";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import {
 	isLanguageCode,
 	type LanguageCode,
 	SUPPORTED_LANGUAGES,
 } from "./translation-languages";
+import { readCachedTranslation } from "./translation-vtt";
 
 interface AvailableTranslation {
 	code: LanguageCode;
@@ -68,45 +74,53 @@ export async function getAvailableTranslations(
 	}
 
 	const { video } = query[0];
-	const prefix = `${video.ownerId}/${videoId}/transcription`;
 
 	try {
-		const result = await Effect.gen(function* () {
-			const [bucket] = yield* Storage.getAccessForVideo(
-				decodeStorageVideo(video),
-			);
-
-			const listResult = yield* bucket.listObjects({
-				prefix,
-				maxKeys: 50,
-			});
-
-			return listResult;
-		}).pipe(runPromise);
-
-		const contents = result.Contents || [];
-
-		let hasOriginal = false;
+		const [bucket] = await Storage.getAccessForVideo(
+			decodeStorageVideo(video),
+		).pipe(runPromise);
+		const original =
+			video.transcriptionStatus === "COMPLETE"
+				? await readTranscriptVtt(video, {
+						getText: async (key) =>
+							Option.getOrNull(await bucket.getObject(key).pipe(runPromise)),
+					})
+				: null;
+		if (original === null)
+			return { success: true, hasOriginal: false, translations: [] };
+		const prefix = translationCachePrefix(video, original);
+		const result = await bucket
+			.listObjects({ prefix, maxKeys: 1000 })
+			.pipe(runPromise);
 		const translations: AvailableTranslation[] = [];
-
-		for (const obj of contents) {
-			const key = obj.Key;
-			if (!key) continue;
-
-			if (key.endsWith("/transcription.vtt")) {
-				hasOriginal = true;
+		for (const object of result.Contents ?? []) {
+			const key = object.Key;
+			if (!key?.startsWith(prefix)) continue;
+			const match = key.slice(prefix.length).match(/^([a-zA-Z-]+)\.vtt$/);
+			if (!match || !isLanguageCode(match[1])) continue;
+			const cached = Option.getOrNull(
+				await bucket.getObject(key).pipe(runPromise),
+			);
+			if (cached === null || readCachedTranslation(original, cached) === null)
 				continue;
-			}
-
-			const match = key.match(/transcription\.([a-zA-Z-]+)\.vtt$/);
-			if (match && isLanguageCode(match[1])) {
-				const langCode = match[1];
-				translations.push({
-					code: langCode,
-					name: SUPPORTED_LANGUAGES[langCode],
-				});
-			}
+			translations.push({
+				code: match[1],
+				name: SUPPORTED_LANGUAGES[match[1]],
+			});
 		}
+		const [current] = await db()
+			.select()
+			.from(videos)
+			.where(eq(videos.id, videoId))
+			.limit(1);
+		if (!isSameTranscriptSource(video, current))
+			return {
+				success: false,
+				hasOriginal: false,
+				translations: [],
+				message: "Transcript changed; retry listing translations",
+			};
+		const hasOriginal = true;
 
 		return {
 			success: true,

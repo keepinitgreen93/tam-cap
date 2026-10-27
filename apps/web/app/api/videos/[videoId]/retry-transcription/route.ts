@@ -1,7 +1,9 @@
-import { db } from "@cap/database";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -23,29 +25,36 @@ export async function POST(
 			return Response.json({ error: "Video ID is required" }, { status: 400 });
 		}
 
-		// Verify user owns the video
-		const videoQuery = await db()
-			.select()
-			.from(videos)
-			.where(eq(videos.id, videoId))
-			.limit(1);
+		const database = db();
+		const status = await atomic(database, async (snapshot) => {
+			const [video] = await snapshot.read((reader) =>
+				reader.select().from(videos).where(eq(videos.id, videoId)).limit(1),
+			);
+			if (!video) return { statements: [], result: 404 };
+			if (video.ownerId !== user.id) return { statements: [], result: 403 };
+			if (video.orgId) await requireActiveOrganization(snapshot, video.orgId);
+			const metadata = { ...video.metadata };
+			delete metadata.transcriptionRun;
+			delete metadata.liveTranscript;
+			delete metadata.editTranscriptBackfill;
+			delete metadata.aiGenerationRun;
+			delete metadata.aiGenerationStatus;
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({ transcriptionStatus: null, metadata })
+						.where(eq(videos.id, videoId)),
+				],
+				result: 200,
+			};
+		});
+		if (status !== 200)
+			return Response.json(
+				{ error: status === 404 ? "Video not found" : "Unauthorized" },
+				{ status },
+			);
 
-		if (videoQuery.length === 0) {
-			return Response.json({ error: "Video not found" }, { status: 404 });
-		}
-
-		const video = videoQuery[0];
-		if (!video || video.ownerId !== user.id) {
-			return Response.json({ error: "Unauthorized" }, { status: 403 });
-		}
-
-		// Reset status to null - this will trigger automatic retry via get-status.ts
-		await db()
-			.update(videos)
-			.set({ transcriptionStatus: null })
-			.where(eq(videos.id, videoId));
-
-		// Revalidate the video page to ensure UI updates with fresh data
 		revalidatePath(`/s/${videoId}`);
 
 		return Response.json({

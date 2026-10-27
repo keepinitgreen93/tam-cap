@@ -21,6 +21,7 @@ export function createRecordingD1Model(options: {
 		fields?: unknown;
 		condition?: SQL;
 		joins: unknown[];
+		maximum: number;
 	}) => ModelRow[] | Promise<ModelRow[]>;
 	apply: (
 		statements: readonly ModelMutation[],
@@ -79,6 +80,7 @@ export function createRecordingD1Model(options: {
 					fields: this.fields,
 					condition: this.condition,
 					joins: this.joins,
+					maximum: this.maximum,
 				})
 			).slice(0, this.maximum);
 		}

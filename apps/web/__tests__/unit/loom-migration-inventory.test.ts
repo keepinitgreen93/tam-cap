@@ -1,161 +1,174 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	loomMigrationImports,
+	loomMigrationRequests,
+	videos,
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { eq } from "drizzle-orm";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
-const mocks = vi.hoisted(() => ({
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
 	operator: vi.fn(),
-	transaction: vi.fn(),
-	rows: [] as unknown[][],
-	select: vi.fn(),
-	delete: vi.fn(),
-	deleteWhere: vi.fn(),
-	update: vi.fn(),
-	set: vi.fn(),
 }));
-
-vi.mock("@cap/database", () => ({
-	db: () => ({ transaction: mocks.transaction }),
+vi.mock("server-only", () => ({}));
+vi.mock("@cap/env", () => ({
+	serverEnv: () => ({}),
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "false" },
 }));
-vi.mock("@cap/database/schema", () => ({
-	loomMigrationRequests: { id: "request.id" },
-	loomMigrationImports: {
-		requestId: "inventory.requestId",
-		videoId: "inventory.videoId",
-	},
-	videos: { id: "video.id" },
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
 }));
-vi.mock("drizzle-orm", () => ({
-	and: (...conditions: unknown[]) => ({ and: conditions }),
-	eq: (left: unknown, right: unknown) => ({ eq: [left, right] }),
-	inArray: (column: unknown, values: unknown[]) => ({
-		inArray: [column, values],
-	}),
-	isNull: (column: unknown) => ({ isNull: column }),
-	notExists: (query: unknown) => ({ notExists: query }),
-}));
-vi.mock("@/lib/loom-concierge", () => ({
-	requireMigrationOperator: mocks.operator,
+vi.mock("@/lib/loom-concierge", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@/lib/loom-concierge")>()),
+	requireMigrationOperator: state.operator,
 }));
 
 import { reconcileMissingLoomMigrationImports } from "@/lib/loom-migration-inventory";
 
-const input = { requestId: "request12345678", verified: true };
-const request = {
-	status: "in_progress",
-	organizationId: "destination",
-	activeOrganizationId: "destination",
-	activeImportCount: 0,
-};
-
-describe("operator migration inventory reconciliation", () => {
-	beforeEach(() => {
-		vi.resetAllMocks();
-		mocks.rows = [[request], []];
-		mocks.operator.mockResolvedValue({ id: "operator" });
-		mocks.select.mockImplementation(() => {
-			const builder = {
-				from: vi.fn().mockReturnThis(),
-				leftJoin: vi.fn().mockReturnThis(),
-				where: vi.fn().mockReturnThis(),
-				limit: vi.fn().mockReturnThis(),
-				for: vi.fn(async () => mocks.rows.shift() ?? []),
-			};
-			return builder;
-		});
-		mocks.delete.mockReturnValue({ where: mocks.deleteWhere });
-		mocks.deleteWhere.mockResolvedValue([{ affectedRows: 1 }]);
-		mocks.set.mockReturnValue({ where: vi.fn().mockResolvedValue(undefined) });
-		mocks.update.mockReturnValue({ set: mocks.set });
-		mocks.transaction.mockImplementation(async (fn: (tx: unknown) => unknown) =>
-			fn({ select: mocks.select, delete: mocks.delete, update: mocks.update }),
-		);
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let owner: Awaited<ReturnType<typeof createTestOwner>>;
+let requestId: string;
+const input = () => ({ requestId, verified: true });
+async function inventory() {
+	return fixture.database
+		.select()
+		.from(loomMigrationImports)
+		.where(eq(loomMigrationImports.requestId, requestId));
+}
+describe("operator inventory reconciliation on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
 	});
-
-	it("requires operator access before reading migration state", async () => {
-		mocks.operator.mockRejectedValue(new Error("Forbidden"));
-		await expect(reconcileMissingLoomMigrationImports(input)).rejects.toThrow(
+	afterAll(async () => fixture.dispose());
+	afterEach(() => vi.unstubAllEnvs());
+	beforeEach(async () => {
+		owner = await createTestOwner(fixture.database);
+		requestId = nanoId();
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		vi.stubEnv("CAP_OWNER_EMAIL", owner.email);
+		state.operator.mockReset().mockResolvedValue(owner);
+		await fixture.database.insert(loomMigrationRequests).values({
+			id: requestId,
+			organizationId: owner.activeOrganizationId,
+			activeOrganizationId: owner.activeOrganizationId,
+			requestedByUserId: owner.id,
+			status: "in_progress",
+		});
+	});
+	it("requires operator access before looking at the migration", async () => {
+		state.operator.mockRejectedValueOnce(new Error("Forbidden"));
+		await expect(reconcileMissingLoomMigrationImports(input())).rejects.toThrow(
 			"Forbidden",
 		);
-		expect(mocks.transaction).not.toHaveBeenCalled();
 	});
-
-	it("requires an explicit source-list reconciliation confirmation", async () => {
+	it("requires explicit source-list confirmation", async () => {
 		await expect(
-			reconcileMissingLoomMigrationImports({ ...input, verified: false }),
+			reconcileMissingLoomMigrationImports({ requestId, verified: false }),
 		).rejects.toThrow("source list first");
-		expect(mocks.transaction).not.toHaveBeenCalled();
 	});
-
-	it.each([
-		undefined,
-		{ ...request, status: "completed" },
-		{ ...request, activeOrganizationId: null },
-		{ ...request, activeOrganizationId: "other" },
-		{ ...request, activeImportCount: 1 },
-		{
-			...request,
-			activeImportCount: 1,
-			activeImportLeaseUntil: new Date(Date.now() + 60_000),
+	it.each(["missing", "completed", "inactive", "other", "active", "unbounded"])(
+		"holds %s requests",
+		async (state) => {
+			if (state === "missing")
+				await fixture.database
+					.delete(loomMigrationRequests)
+					.where(eq(loomMigrationRequests.id, requestId));
+			else
+				await fixture.database
+					.update(loomMigrationRequests)
+					.set({
+						...(state === "completed" ? { status: "completed" as const } : {}),
+						...(state === "inactive" ? { activeOrganizationId: null } : {}),
+						...(state === "other"
+							? {
+									activeOrganizationId:
+										nanoId() as typeof loomMigrationRequests.$inferInsert.activeOrganizationId,
+								}
+							: {}),
+						...(["active", "unbounded"].includes(state)
+							? {
+									activeImportCount: 1,
+									activeImportLeaseUntil:
+										state === "active" ? new Date(Date.now() + 60_000) : null,
+								}
+							: {}),
+					})
+					.where(eq(loomMigrationRequests.id, requestId));
+			await expect(
+				reconcileMissingLoomMigrationImports(input()),
+			).rejects.toThrow("inactive or imports");
 		},
-	])("holds inactive requests and concurrent imports: %j", async (row) => {
-		mocks.rows = [row ? [row] : []];
-		await expect(reconcileMissingLoomMigrationImports(input)).rejects.toThrow(
-			"inactive or imports",
-		);
-		expect(mocks.delete).not.toHaveBeenCalled();
-	});
-
-	it("does not mutate requests without missing recordings", async () => {
-		await expect(reconcileMissingLoomMigrationImports(input)).resolves.toEqual({
+	);
+	it("leaves an empty inventory and request counters unchanged", async () => {
+		expect(await reconcileMissingLoomMigrationImports(input())).toEqual({
 			removedCount: 0,
 			hasMore: false,
 		});
-		expect(mocks.delete).not.toHaveBeenCalled();
-		expect(mocks.update).not.toHaveBeenCalled();
 	});
-
-	it("permits inventory-only reconciliation after an import reservation expires", async () => {
-		mocks.rows = [
-			[
-				{
-					...request,
-					activeImportCount: 1,
-					activeImportLeaseUntil: new Date(0),
-				},
-			],
-			[],
-		];
-		await expect(reconcileMissingLoomMigrationImports(input)).resolves.toEqual({
+	it("permits reconciliation after the import lease expires", async () => {
+		await fixture.database
+			.update(loomMigrationRequests)
+			.set({ activeImportCount: 1, activeImportLeaseUntil: new Date(0) })
+			.where(eq(loomMigrationRequests.id, requestId));
+		expect(await reconcileMissingLoomMigrationImports(input())).toEqual({
 			removedCount: 0,
 			hasMore: false,
 		});
-		expect(mocks.delete).not.toHaveBeenCalled();
 	});
-
-	it("bounds cleanup, rechecks absent videos and never changes completion or counts", async () => {
-		mocks.rows = [
-			[request],
-			Array.from({ length: 101 }, (_, i) => ({ videoId: `deleted-${i}` })),
+	it("bounds deletion at 100 while preserving live videos and completion counters", async () => {
+		const liveId = nanoId() as typeof videos.$inferSelect.id;
+		await fixture.database.insert(videos).values({
+			id: liveId,
+			ownerId: owner.id,
+			orgId: owner.activeOrganizationId,
+			name: "Live inventory",
+			source: { type: "webMP4" },
+		});
+		const ids = [
+			...Array.from(
+				{ length: 101 },
+				() => nanoId() as typeof videos.$inferSelect.id,
+			),
+			liveId,
 		];
-		mocks.deleteWhere.mockResolvedValue([{ affectedRows: 100 }]);
-		await expect(reconcileMissingLoomMigrationImports(input)).resolves.toEqual({
+		for (const videoId of ids)
+			await fixture.database
+				.insert(loomMigrationImports)
+				.values({ videoId, requestId });
+		expect(await reconcileMissingLoomMigrationImports(input())).toEqual({
 			removedCount: 100,
 			hasMore: true,
 		});
-		expect(mocks.delete).toHaveBeenCalledWith({
-			requestId: "inventory.requestId",
-			videoId: "inventory.videoId",
+		expect(await inventory()).toHaveLength(2);
+		expect(await reconcileMissingLoomMigrationImports(input())).toEqual({
+			removedCount: 1,
+			hasMore: false,
 		});
-		const conditions = mocks.deleteWhere.mock.calls[0]?.[0].and;
-		expect(conditions[0]).toEqual({
-			eq: ["inventory.requestId", input.requestId],
-		});
-		expect(conditions[1].inArray[1]).toHaveLength(100);
-		expect(conditions[2].notExists.where).toHaveBeenCalledWith({
-			eq: ["video.id", "inventory.videoId"],
-		});
-		expect(mocks.set).toHaveBeenCalledWith({
-			lastOperatorUserId: "operator",
-			lastOperatorAt: expect.any(Date),
-			updatedAt: expect.any(Date),
+		expect(await inventory()).toMatchObject([{ videoId: liveId }]);
+		const [request] = await fixture.database
+			.select()
+			.from(loomMigrationRequests)
+			.where(eq(loomMigrationRequests.id, requestId));
+		expect(request).toMatchObject({
+			status: "in_progress",
+			importedVideoCount: 0,
+			queuedVideoCount: 0,
+			lastOperatorUserId: owner.id,
 		});
 	});
 });

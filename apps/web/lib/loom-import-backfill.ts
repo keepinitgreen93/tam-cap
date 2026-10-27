@@ -1,16 +1,25 @@
 import "server-only";
 
-import { db } from "@cap/database";
-import { nanoId } from "@cap/database/helpers";
+import {
+	requireActiveOrganization,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	folders,
 	importedVideos,
 	organizations,
 	sharedVideos,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import { Folder, Organisation, User, Video } from "@cap/web-domain";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, ne } from "drizzle-orm";
+import {
+	assertMigrationOperator,
+	requireMigrationOperator,
+} from "@/lib/loom-concierge";
 import {
 	getOrganizationMemberByEmail,
 	isValidImportEmail,
@@ -41,7 +50,9 @@ type FolderRow = { id: Folder.FolderId; createdById: User.UserId };
 export async function backfillLoomImport(
 	organizationId: string,
 	item: LoomBackfillItem,
+	operatorId?: User.UserId,
 ): Promise<LoomBackfillOutcome> {
+	const operator = operatorId ?? (await requireMigrationOperator()).id;
 	const orgId = Organisation.OrganisationId.make(organizationId);
 	const id = Video.VideoId.make(item.videoId);
 	const changes: string[] = [];
@@ -120,7 +131,7 @@ export async function backfillLoomImport(
 	}
 
 	const canUseFolder = (folder: FolderRow) =>
-		folder.createdById === ownerId || folder.createdById === video.orgOwnerId;
+		folder.createdById === ownerId;
 	if (personalFolder && !canUseFolder(personalFolder))
 		return result("skipped", {
 			reason: "folder belongs to someone other than the owner",
@@ -139,94 +150,153 @@ export async function backfillLoomImport(
 			videoId: item.videoId,
 			fromUserId: video.ownerId,
 			toUserId: ownerId,
+			operatorId: operator,
 			options: { keepSharing: true, folderId: targetFolderId },
 		});
 		if (moved.status !== "moved")
 			return result(moved.status, { reason: moved.reason });
 		if (moved.cleanup === "failed")
-			warning = "old owner's files could not be removed";
+			warning = "old owner media copies retained for safe cleanup";
 		changes.push("owner");
 		if (targetFolderId !== video.folderId) changes.push("folder");
-	} else if (targetFolderId !== video.folderId) {
-		await db()
-			.update(videos)
-			.set({ folderId: targetFolderId })
-			.where(and(eq(videos.id, id), eq(videos.ownerId, ownerId)));
-		changes.push("folder");
 	}
-
-	const deferredKey = video.metadata?.loomDeferredProcessing?.rawFileKey;
-	const repairedKey = getOwnerOriginalKey(deferredKey, ownerId, item.videoId);
-	if (
-		ownerId === video.ownerId &&
-		video.metadata?.loomDeferredProcessing?.status === "pending" &&
-		repairedKey &&
-		repairedKey !== deferredKey
-	) {
-		await db()
-			.update(videos)
-			.set({
-				metadata: sql`JSON_SET(${videos.metadata}, '$.loomDeferredProcessing.rawFileKey', ${repairedKey})`,
-			})
-			.where(
-				and(
-					eq(videos.id, id),
-					eq(videos.ownerId, ownerId),
-					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomDeferredProcessing.rawFileKey')) = ${deferredKey}`,
-				),
+	const database = db();
+	const shareId = nanoId();
+	const applied = await atomic(database, async (snapshot) => {
+		await assertMigrationOperator(snapshot, operator);
+		await requireActiveOrganization(snapshot, orgId);
+		await requireOrganizationMember(snapshot, orgId, ownerId);
+		const [current] = await snapshot.read((reader) =>
+			reader.select().from(videos).where(eq(videos.id, id)).limit(1),
+		);
+		const [mapping] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(importedVideos)
+				.where(eq(importedVideos.id, id))
+				.limit(1),
+		);
+		if (
+			!current ||
+			current.ownerId !== ownerId ||
+			current.orgId !== orgId ||
+			!mapping ||
+			mapping.orgId !== orgId ||
+			mapping.source !== "loom"
+		)
+			throw new Error("Video changed during backfill");
+		const nextChanges: string[] = [];
+		const statements: AtomicStatement[] = [];
+		if (targetFolderId) {
+			const [folder] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(folders)
+					.where(eq(folders.id, targetFolderId))
+					.limit(1),
 			);
-		changes.push("original");
-	}
-
-	if (date && video.effectiveCreatedAt?.getTime() !== date.getTime()) {
-		await db()
-			.update(videos)
-			.set({
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.customCreatedAt', ${date.toISOString()})`,
-			})
-			.where(eq(videos.id, id));
-		changes.push("date");
-	}
-
-	if (sharedFolder) {
-		const shared = await db().transaction(async (tx) => {
-			await tx
-				.select({ id: videos.id })
-				.from(videos)
-				.where(eq(videos.id, id))
-				.for("update");
-			const shares = await tx
-				.select({ id: sharedVideos.id, folderId: sharedVideos.folderId })
-				.from(sharedVideos)
-				.where(
-					and(
-						eq(sharedVideos.videoId, id),
-						eq(sharedVideos.organizationId, orgId),
+			if (
+				!folder ||
+				folder.organizationId !== orgId ||
+				folder.spaceId !== null ||
+				folder.createdById !== ownerId
+			)
+				throw new Error("Folder changed during backfill");
+		}
+		const metadata = { ...current.metadata };
+		let metadataChanged = false;
+		const deferredKey = metadata.loomDeferredProcessing?.rawFileKey;
+		const repairedKey = getOwnerOriginalKey(deferredKey, ownerId, item.videoId);
+		if (
+			metadata.loomDeferredProcessing?.status === "pending" &&
+			repairedKey &&
+			repairedKey !== deferredKey
+		) {
+			metadata.loomDeferredProcessing = {
+				...metadata.loomDeferredProcessing,
+				rawFileKey: repairedKey,
+			};
+			metadataChanged = true;
+			nextChanges.push("original");
+		}
+		if (date && current.effectiveCreatedAt?.getTime() !== date.getTime()) {
+			metadata.customCreatedAt = date.toISOString();
+			metadataChanged = true;
+			nextChanges.push("date");
+		}
+		if (current.folderId !== targetFolderId) nextChanges.push("folder");
+		if (metadataChanged || current.folderId !== targetFolderId)
+			statements.push(
+				database
+					.update(videos)
+					.set({
+						...(metadataChanged ? { metadata } : {}),
+						folderId: targetFolderId,
+					})
+					.where(eq(videos.id, id)),
+			);
+		if (sharedFolder) {
+			const [folder] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(folders)
+					.where(eq(folders.id, sharedFolder.id))
+					.limit(1),
+			);
+			if (
+				!folder ||
+				folder.organizationId !== orgId ||
+				folder.spaceId !== orgId
+			)
+				throw new Error("Shared folder changed during backfill");
+			const shares = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(sharedVideos)
+					.where(
+						and(
+							eq(sharedVideos.videoId, id),
+							eq(sharedVideos.organizationId, orgId),
+						),
 					),
-				);
+			);
 			const [keep, ...duplicates] = shares;
-			for (const duplicate of duplicates)
-				await tx.delete(sharedVideos).where(eq(sharedVideos.id, duplicate.id));
-			if (!keep) {
-				await tx.insert(sharedVideos).values({
-					id: nanoId(),
-					videoId: id,
-					organizationId: orgId,
-					folderId: sharedFolder.id,
-					sharedByUserId: ownerId,
-				});
-				return true;
-			}
-			if (keep.folderId === sharedFolder.id && duplicates.length === 0)
-				return false;
-			await tx
-				.update(sharedVideos)
-				.set({ folderId: sharedFolder.id })
-				.where(eq(sharedVideos.id, keep.id));
-			return true;
-		});
-		if (shared) changes.push("shared");
-	}
+			if (duplicates.length && keep)
+				statements.push(
+					database
+						.delete(sharedVideos)
+						.where(
+							and(
+								eq(sharedVideos.videoId, id),
+								eq(sharedVideos.organizationId, orgId),
+								ne(sharedVideos.id, keep.id),
+							),
+						),
+				);
+			if (!keep)
+				statements.push(
+					database.insert(sharedVideos).values({
+						id: shareId,
+						videoId: id,
+						organizationId: orgId,
+						folderId: folder.id,
+						sharedByUserId: ownerId,
+					}),
+				);
+			else if (keep.folderId !== folder.id)
+				statements.push(
+					database
+						.update(sharedVideos)
+						.set({ folderId: folder.id })
+						.where(eq(sharedVideos.id, keep.id)),
+				);
+			if (!keep || keep.folderId !== folder.id || duplicates.length)
+				nextChanges.push("shared");
+		}
+		return { statements, result: nextChanges };
+	});
+	for (const change of applied)
+		if (!changes.includes(change)) changes.push(change);
 
 	return result(changes.length > 0 ? "updated" : "unchanged", { warning });
 }

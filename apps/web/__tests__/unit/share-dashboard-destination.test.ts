@@ -13,7 +13,7 @@ const table = (name: string) =>
 			column === "__table" ? target.__table : { table: name, column },
 	});
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	folders: table("folders"),
 	organizationMembers: table("organizationMembers"),
 	organizations: table("organizations"),
@@ -39,7 +39,7 @@ type Query = {
 const queries: Query[] = [];
 let rowsFor: Record<string, unknown[]> = {};
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => {
 			const query: Query = { from: "", joins: [] };

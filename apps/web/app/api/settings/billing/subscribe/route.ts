@@ -1,7 +1,7 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { users } from "@cap/database/schema";
+import { users } from "@cap/database/legacy/schema";
 import { serverEnv } from "@cap/env";
 import { isValidStripePlanPriceId, stripe, userIsPro } from "@cap/utils";
 import { eq } from "drizzle-orm";
@@ -11,6 +11,14 @@ import { parseCheckoutQuantity } from "@/lib/checkout-quantity";
 import { trackServerEvent } from "@/lib/server-analytics";
 
 export async function POST(request: NextRequest) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return Response.json(
+			{
+				error: true,
+				message: "Vendor billing is unavailable on this self-hosted instance",
+			},
+			{ status: 403 },
+		);
 	const user = isCrossSiteCookieWrite(request) ? null : await getCurrentUser();
 	let customerId = user?.stripeCustomerId;
 	const { priceId, quantity, isOnBoarding } = await request.json();

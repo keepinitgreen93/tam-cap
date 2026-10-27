@@ -1,3 +1,8 @@
+import {
+	defaultApiBaseUrl,
+	normalizeApiBaseUrl,
+	productionApiBaseUrl,
+} from "./instance";
 import { RECORDING_STATE_KEY, SHARED_UI_STATE_KEY } from "./storage-keys";
 import type {
 	BootstrapData,
@@ -27,11 +32,8 @@ export const MEDIA_ACCESS_KEY = "cap-extension-media-access";
 export const FAILED_RECORDINGS_KEY = "cap-extension-failed-recordings";
 const OVERLAY_TOKENS_KEY = "cap-extension-overlay-tokens";
 const LAST_WEBCAM_PREVIEW_FRAME_KEY = "cap-extension-last-webcam-preview-frame";
-const PRODUCTION_API_BASE_URL = "https://cap.so";
-const DEFAULT_API_BASE_URL =
-	import.meta.env.MODE === "development"
-		? "http://localhost:3000"
-		: PRODUCTION_API_BASE_URL;
+const PRODUCTION_API_BASE_URL = productionApiBaseUrl;
+const DEFAULT_API_BASE_URL = defaultApiBaseUrl;
 
 export type MediaAccessState = {
 	camera: boolean;
@@ -43,6 +45,7 @@ export type MediaAccessState = {
 // stay in the IndexedDB recording spool under sessionId until the upload is
 // retried successfully or the entry is pruned.
 export type FailedRecording = {
+	apiOrigin?: string;
 	sessionId: string;
 	videoId: string | null;
 	shareUrl: string | null;
@@ -177,12 +180,21 @@ export const loadSettings = async () => {
 };
 
 export const saveSettings = (settings: ExtensionSettings) =>
-	setLocal({ [SETTINGS_KEY]: settings });
+	withKeyLock(SETTINGS_KEY, async () => {
+		const current = await loadSettings();
+		const apiBaseUrl = normalizeApiBaseUrl(settings.apiBaseUrl);
+		if (new URL(current.apiBaseUrl).origin !== apiBaseUrl) {
+			await removeLocal([AUTH_KEY, PENDING_AUTH_KEY, BOOTSTRAP_CACHE_KEY]);
+		}
+		await setLocal({ [SETTINGS_KEY]: { ...settings, apiBaseUrl } });
+	});
 
 export const loadAuth = async () => {
 	const result = await getLocal([AUTH_KEY]);
 	const saved = result[AUTH_KEY];
-	return isAuth(saved) ? saved : null;
+	if (!isAuth(saved)) return null;
+	const settings = await loadSettings();
+	return saved.apiOrigin === new URL(settings.apiBaseUrl).origin ? saved : null;
 };
 
 export const saveAuth = (auth: ExtensionAuth) => setLocal({ [AUTH_KEY]: auth });
@@ -825,6 +837,7 @@ const isAuth = (value: unknown): value is ExtensionAuth => {
 	if (!value || typeof value !== "object") return false;
 	const candidate = value as Partial<ExtensionAuth>;
 	return (
+		typeof candidate.apiOrigin === "string" &&
 		typeof candidate.authApiKey === "string" &&
 		typeof candidate.userId === "string"
 	);

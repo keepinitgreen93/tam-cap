@@ -47,6 +47,17 @@ export interface TranscriptPublication {
 }
 
 export interface VideoMetadata {
+	loomReassignClaim?: { token: string; at: string };
+	aiGenerationRun?: {
+		id: string;
+		requestedAt: string;
+		mediaRevision: string;
+		transcriptId: string | null;
+		dispatch: "pending" | "accepted" | "uncertain" | "rejected";
+		workflowRunId?: string;
+		workflowQueue?: string;
+		deploymentId?: string;
+	};
 	editTranscriptBackfill?: {
 		status: "processing" | "error";
 		requestId: string;
@@ -57,6 +68,15 @@ export interface VideoMetadata {
 	processingRun?: VideoProcessingRun;
 	loomImportRun?: {
 		runId: string;
+		sourceRevision?: string;
+		sourceIdentity?: {
+			ownerId: string;
+			organizationId: string;
+			bucketId: string | null;
+			storageIntegrationId: string | null;
+		};
+		workflowQueue?: string;
+		deploymentId?: string;
 		dispatch: "pending" | "accepted" | "rejected" | "uncertain";
 		importPriority?: "customer" | "bulk";
 		mediaDispatch?: {

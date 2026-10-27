@@ -26,7 +26,7 @@ function resetDbChain() {
 	mockDbChain.values.mockReturnValue(Promise.resolve());
 }
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/legacy", () => ({
 	db: () => mockDbChain,
 }));
 
@@ -34,7 +34,7 @@ vi.mock("@cap/database/helpers", () => ({
 	nanoId: vi.fn(() => "test-nano-id"),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/legacy/schema", () => ({
 	developerCreditTransactions: {
 		id: "id",
 		accountId: "accountId",

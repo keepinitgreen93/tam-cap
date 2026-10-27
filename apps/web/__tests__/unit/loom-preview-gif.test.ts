@@ -12,19 +12,19 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		update: () => ({
 			set: (values: unknown) => ({
 				where: async () => {
 					mocks.updates.push(values);
-					return [{ affectedRows: mocks.affectedRows.shift() ?? 1 }];
+					return { meta: { changes: mocks.affectedRows.shift() ?? 1 } };
 				},
 			}),
 		}),
 	}),
 }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	videos: { id: "v.id", metadata: "v.metadata" },
 }));
 vi.mock("@cap/env", () => ({ serverEnv: () => mocks.env }));

@@ -1,3 +1,5 @@
+vi.mock("server-only", () => ({}));
+
 import { randomUUID } from "node:crypto";
 import { createCloudflareDb } from "@cap/database/cloudflare";
 import {
@@ -112,59 +114,51 @@ async function fixture(withWords = true) {
 		startedAt: new Date().toISOString(),
 	};
 	const sourceKey = `${ownerId}/${videoId}/source/original.mp4`;
-	await runtime.database
-		.insert(Db.users)
-		.values({
-			id: ownerId,
-			email: `${suffix}@edit.test`,
-			activeOrganizationId: orgId,
-		});
+	await runtime.database.insert(Db.users).values({
+		id: ownerId,
+		email: `${suffix}@edit.test`,
+		activeOrganizationId: orgId,
+	});
 	await runtime.database
 		.insert(Db.organizations)
 		.values({ id: orgId, ownerId, name: "Edit team" });
-	await runtime.database
-		.insert(Db.videos)
-		.values({
-			id: videoId,
-			ownerId,
-			orgId,
-			source: { type: "webMP4" },
-			duration: 10,
-			width: 320,
-			height: 180,
-			transcriptionStatus: "COMPLETE",
-			metadata: {
-				sourceName: "Preserved",
-				editProcessing: {
-					...operation,
-					sourceKey,
-					ownerId,
-					bucket: null,
-					storageIntegrationId: null,
-					source: JSON.stringify({ type: "webMP4" }),
-					dispatch: "accepted",
-					jobId: "edit-worker",
-				},
+	await runtime.database.insert(Db.videos).values({
+		id: videoId,
+		ownerId,
+		orgId,
+		source: { type: "webMP4" },
+		duration: 10,
+		width: 320,
+		height: 180,
+		transcriptionStatus: "COMPLETE",
+		metadata: {
+			sourceName: "Preserved",
+			editProcessing: {
+				...operation,
+				sourceKey,
+				ownerId,
+				bucket: null,
+				storageIntegrationId: null,
+				source: JSON.stringify({ type: "webMP4" }),
+				dispatch: "accepted",
+				jobId: "edit-worker",
 			},
-		});
-	await runtime.database
-		.insert(Db.videoUploads)
-		.values({
-			videoId,
-			rawFileKey: sourceKey,
-			startedAt: new Date(operation.startedAt),
-			phase: "complete",
-		});
-	await runtime.database
-		.insert(Db.comments)
-		.values({
-			id: Comment.CommentId.make(`ecomment${suffix}`),
-			videoId,
-			authorId: ownerId,
-			type: "text",
-			content: "Retained",
-			timestamp: 7,
-		});
+		},
+	});
+	await runtime.database.insert(Db.videoUploads).values({
+		videoId,
+		rawFileKey: sourceKey,
+		startedAt: new Date(operation.startedAt),
+		phase: "complete",
+	});
+	await runtime.database.insert(Db.comments).values({
+		id: Comment.CommentId.make(`ecomment${suffix}`),
+		videoId,
+		authorId: ownerId,
+		type: "text",
+		content: "Retained",
+		timestamp: 7,
+	});
 	const words = createEditTranscript(
 		{ words: [{ text: "retained", start: 6000, end: 6500 }] },
 		10000,

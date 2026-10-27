@@ -17,7 +17,7 @@ const mockStripe = {
 	},
 };
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/legacy", () => ({
 	db: () => mockDb,
 }));
 
@@ -25,7 +25,7 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: vi.fn(),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/legacy/schema", () => ({
 	organizationMembers: {
 		id: "memberId",
 		userId: "memberUserId",

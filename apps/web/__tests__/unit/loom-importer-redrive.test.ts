@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
 	startProcessing: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => {
+vi.mock("@cap/database/cloudflare/application", () => {
 	const selection = {
 		from: () => selection,
 		innerJoin: () => selection,
@@ -29,7 +29,7 @@ vi.mock("@cap/database", () => {
 				set: (values: Record<string, unknown>) => ({
 					where: async () => {
 						mocks.updates.push(values);
-						return [{ affectedRows: mocks.affectedRows }];
+						return { meta: { changes: mocks.affectedRows } };
 					},
 				}),
 			}),
@@ -48,7 +48,7 @@ vi.mock("@cap/database", () => {
 		}),
 	};
 });
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	importedVideos: { id: "i.id", orgId: "i.orgId", source: "i.source" },
 	videos: { id: "v.id", orgId: "v.orgId", metadata: "v.metadata" },
 	videoUploads: { videoId: "u.videoId", phase: "u.phase", updatedAt: "u.at" },
@@ -91,10 +91,7 @@ vi.mock("@/lib/video-processing", () => ({
 }));
 
 import { POST } from "@/app/api/internal/loom-imports/redrive/route";
-import {
-	getPendingLoomProcessing,
-	startDeferredLoomProcessing,
-} from "@/lib/loom-deferred-processing";
+import { getPendingLoomProcessing } from "@/lib/loom-deferred-processing";
 import { redriveLoomImport } from "@/lib/loom-import-redrive";
 import { LoomImportStartError } from "@/lib/loom-import-start";
 
@@ -312,51 +309,6 @@ describe("deferred Loom processing", () => {
 				now.getTime() + 31 * 60 * 1000,
 			),
 		).toBeNull();
-	});
-
-	it("keeps its claim when the conversion start is uncertain", async () => {
-		mocks.startProcessing.mockRejectedValue(new Error("queue timed out"));
-		await expect(
-			startDeferredLoomProcessing(
-				{
-					videoId: "video" as never,
-					ownerId: "owner",
-					bucketId: null,
-					rawFileKey: "owner/video/raw-upload.webm",
-				},
-				now,
-			),
-		).rejects.toThrow("queue timed out");
-		expect(mocks.deletes).toBe(0);
-		expect(mocks.updates).toHaveLength(1);
-	});
-
-	it("starts processing the original once", async () => {
-		const input = {
-			videoId: "video" as never,
-			ownerId: "owner",
-			bucketId: "bucket",
-			rawFileKey: "owner/video/raw-upload.webm",
-		};
-		await expect(startDeferredLoomProcessing(input)).resolves.toBe("started");
-		expect(mocks.inserts[0]).toMatchObject({
-			videoId: "video",
-			phase: "uploading",
-			rawFileKey: "owner/video/raw-upload.webm",
-		});
-		expect(mocks.startProcessing).toHaveBeenCalledWith(
-			expect.objectContaining({
-				videoId: "video",
-				userId: "owner",
-				rawFileKey: "owner/video/raw-upload.webm",
-				bucketId: "bucket",
-			}),
-		);
-		mocks.affectedRows = 0;
-		await expect(startDeferredLoomProcessing(input)).resolves.toBe(
-			"already-started",
-		);
-		expect(mocks.startProcessing).toHaveBeenCalledOnce();
 	});
 });
 

@@ -1,4 +1,4 @@
-import { Database } from "@cap/web-backend";
+import { CloudflareDatabase as Database } from "@cap/web-backend";
 import {
 	CurrentUser,
 	Folder,
@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({ query: vi.fn() }));
 
 vi.mock("server-only", () => ({}));
 vi.mock("@cap/web-backend", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const { Effect } = await import("effect");
 	const client = drizzle(mocks.query);
 	class Database extends Effect.Service<Database>()("Database", {
@@ -23,7 +23,7 @@ vi.mock("@cap/web-backend", async () => {
 				Effect.promise(() => callback(client)),
 		},
 	}) {}
-	return { Database };
+	return { CloudflareDatabase: Database };
 });
 
 const orgId = Organisation.OrganisationId.make("org-1");
@@ -66,9 +66,9 @@ describe("subfolder video counts", () => {
 		async ({ root, table, scope }) => {
 			await getChildren(root);
 			const [query, params] = mocks.query.mock.calls[0] ?? [];
-			expect(query).toContain(`\`${table}\`.\`folderId\` = \`folders\`.\`id\``);
+			expect(query).toContain(`"${table}"."folderId" = "folders"."id"`);
 			if (scope) {
-				expect(query).toContain(`\`${table}\`.\`${scope}\` = ?`);
+				expect(query).toContain(`"${table}"."${scope}" = ?`);
 			}
 			expect(params).toContain(parentId);
 		},
@@ -84,7 +84,7 @@ describe("subfolder video counts", () => {
 					0,
 					parentId,
 					orgId,
-					"2026-09-09 00:00:00",
+					new Date("2026-09-09T00:00:00Z").getTime(),
 					"2",
 				],
 			],

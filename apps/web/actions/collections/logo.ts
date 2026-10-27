@@ -1,7 +1,12 @@
 "use server";
 
 import { getCurrentUser } from "@cap/database/auth/session";
+import {
+	requireOrganizationManager,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
 import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import { folders, spaces } from "@cap/database/cloudflare/schema";
 import { ImageUploads } from "@cap/web-backend";
 import {
@@ -14,6 +19,7 @@ import { eq, sql } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { revalidatePath } from "next/cache";
 import { isOrganizationOwnerPro } from "@/lib/org-pro";
+import { requireManagedSpace } from "@/lib/organization-settings-persistence";
 import { canManageSpace } from "@/lib/permissions/roles";
 import { sanitizeFile } from "@/lib/sanitizeFile";
 import { runPromise } from "@/lib/server";
@@ -123,21 +129,35 @@ async function setSpaceLogo(
 			existing: Option.fromNullable(logoKey(existing.publicPage?.logoUrl)),
 			keyPrefix: `organizations/${space.organizationId}/collections/${id}/logo`,
 			update: (database, key) =>
-				database
-					.update(spaces)
-					.set({
-						// Atomic merge (a JSON null deletes the key per RFC 7396) so
-						// concurrent settings patches can't overwrite the logo write.
-						settings: sql`json_patch(COALESCE(${spaces.settings}, '{}'), ${JSON.stringify(
-							{
-								publicPage: {
-									logoUrl: key ?? null,
-									logoMode: key ? "custom" : "cap",
-								},
-							},
-						)})`,
-					})
-					.where(eq(spaces.id, id)),
+				atomic(database, async (snapshot) => {
+					const current = await requireManagedSpace(snapshot, userId, id);
+					if (
+						current.organizationId !== space.organizationId ||
+						current.settings?.publicPage?.logoUrl !==
+							existing.publicPage?.logoUrl
+					)
+						throw new Error("Collection logo changed; refresh and retry");
+					return {
+						statements: [
+							database
+								.update(spaces)
+								.set({
+									// Atomic merge (a JSON null deletes the key per RFC 7396) so
+									// concurrent settings patches can't overwrite the logo write.
+									settings: sql`json_patch(COALESCE(${spaces.settings}, '{}'), ${JSON.stringify(
+										{
+											publicPage: {
+												logoUrl: key ?? null,
+												logoMode: key ? "custom" : "cap",
+											},
+										},
+									)})`,
+								})
+								.where(eq(spaces.id, id)),
+						],
+						result: undefined,
+					};
+				}),
 		});
 	}).pipe(runPromise);
 
@@ -195,21 +215,54 @@ async function setFolderLogo(
 			existing: Option.fromNullable(logoKey(existing.publicPage?.logoUrl)),
 			keyPrefix: `organizations/${folder.organizationId}/collections/${id}/logo`,
 			update: (database, key) =>
-				database
-					.update(folders)
-					.set({
-						// Atomic merge (a JSON null deletes the key per RFC 7396) so
-						// concurrent settings patches can't overwrite the logo write.
-						settings: sql`json_patch(COALESCE(${folders.settings}, '{}'), ${JSON.stringify(
-							{
-								publicPage: {
-									logoUrl: key ?? null,
-									logoMode: key ? "custom" : "cap",
-								},
-							},
-						)})`,
-					})
-					.where(eq(folders.id, id)),
+				atomic(database, async (snapshot) => {
+					const [current] = await snapshot.read((reader) =>
+						reader.select().from(folders).where(eq(folders.id, id)).limit(1),
+					);
+					if (!current) throw new Error("Folder not found");
+					await requireOrganizationMember(
+						snapshot,
+						current.organizationId,
+						userId,
+					);
+					if (!current.spaceId) {
+						if (current.createdById !== userId) throw new Error("Unauthorized");
+					} else if (current.spaceId === current.organizationId) {
+						await requireOrganizationManager(
+							snapshot,
+							current.organizationId,
+							userId,
+						);
+					} else {
+						await requireManagedSpace(snapshot, userId, current.spaceId);
+					}
+					if (
+						current.organizationId !== folder.organizationId ||
+						current.settings?.publicPage?.logoUrl !==
+							existing.publicPage?.logoUrl
+					)
+						throw new Error("Collection logo changed; refresh and retry");
+					return {
+						statements: [
+							database
+								.update(folders)
+								.set({
+									// Atomic merge (a JSON null deletes the key per RFC 7396) so
+									// concurrent settings patches can't overwrite the logo write.
+									settings: sql`json_patch(COALESCE(${folders.settings}, '{}'), ${JSON.stringify(
+										{
+											publicPage: {
+												logoUrl: key ?? null,
+												logoMode: key ? "custom" : "cap",
+											},
+										},
+									)})`,
+								})
+								.where(eq(folders.id, id)),
+						],
+						result: undefined,
+					};
+				}),
 		});
 	}).pipe(runPromise);
 

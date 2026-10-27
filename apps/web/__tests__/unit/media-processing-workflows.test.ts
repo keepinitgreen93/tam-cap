@@ -1,7 +1,20 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import type {
+	AtomicPlan,
+	AtomicSnapshot,
+} from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { Effect } from "effect";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	createRecordingD1Model,
+	type ModelRow,
+} from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
+	currentVideo: undefined as ModelRow | undefined,
+	currentUpload: undefined as ModelRow | undefined,
 	createHook: vi.fn(),
 	hookDispose: vi.fn(),
 	rows: [] as unknown[][],
@@ -21,45 +34,90 @@ const mocks = vi.hoisted(() => ({
 	loomSourceUrl: "https://cdn.loom.com/original.mp4",
 }));
 
-vi.mock("@cap/database/cloudflare/application", () => ({
-	db: () => ({
-		select: () => ({
-			from: () => ({
-				where: mocks.where,
-				innerJoin: () => ({ where: mocks.where }),
-			}),
-		}),
-	}),
-}));
-vi.mock("@cap/database/cloudflare/schema", () => ({
-	videos: { id: "id", ownerId: "ownerId" },
-	users: {},
-	videoUploads: { videoId: "videoId" },
-}));
+const plannerContext = new AsyncLocalStorage<boolean>();
+vi.mock("@cap/database/cloudflare/atomic", async (importOriginal) => {
+	const original =
+		await importOriginal<typeof import("@cap/database/cloudflare/atomic")>();
+	return {
+		...original,
+		atomic: <T>(
+			database: CloudflareDatabase,
+			planner: (snapshot: AtomicSnapshot) => Promise<AtomicPlan<T>>,
+			options?: { maxAttempts?: number },
+		) =>
+			original.atomic(
+				database,
+				(snapshot) => plannerContext.run(true, () => planner(snapshot)),
+				options,
+			),
+	};
+});
+vi.mock("@cap/database/cloudflare/application", () => ({ db: () => client }));
+const currentVideo = () => {
+	if (!mocks.currentVideo)
+		mocks.currentVideo = {
+			id: "video",
+			ownerId: "owner",
+			orgId: "org",
+			bucket: null,
+			storageIntegrationId: null,
+			isScreenshot: false,
+			source: { type: "webMP4" },
+			createdAt: new Date(),
+			updatedAt: new Date(),
+			metadata: null,
+			...((mocks.rows[0]?.[0] as ModelRow | undefined) ?? {}),
+		};
+	return mocks.currentVideo;
+};
+const client = createRecordingD1Model({
+	read: async ({ table, maximum }) => {
+		if (plannerContext.getStore() || maximum === 1) {
+			if (table === Db.videos) return [structuredClone(currentVideo())];
+			if (table === Db.organizations)
+				return [{ id: "org", ownerId: "owner", tombstoneAt: null }];
+			if (table === Db.videoUploads)
+				return mocks.currentUpload
+					? [structuredClone(mocks.currentUpload)]
+					: [];
+			return [];
+		}
+		const rows = await mocks.where();
+		return rows.map((row: ModelRow) =>
+			table === Db.videos && row.id
+				? {
+						...mocks.currentVideo,
+						...row,
+						metadata: {
+							...(mocks.currentVideo?.metadata as ModelRow),
+							...(row.metadata as ModelRow),
+						},
+					}
+				: row,
+		);
+	},
+	apply: (statements) => {
+		for (const statement of statements) {
+			if (Array.isArray(statement.values))
+				throw Error("Unexpected array mutation");
+			mocks.write(statement.values);
+			if (statement.table === Db.videos)
+				Object.assign(currentVideo(), statement.values);
+			if (statement.table === Db.videoUploads) {
+				if (statement.operation === "delete") mocks.currentUpload = undefined;
+				else
+					mocks.currentUpload = { ...mocks.currentUpload, ...statement.values };
+			}
+		}
+	},
+	signature: () => JSON.stringify([mocks.currentVideo, mocks.currentUpload]),
+});
 vi.mock("@/lib/video-processing-state", () => ({
 	matchesProcessingRun: (video: { metadata?: { processingRun?: unknown } }) =>
 		Boolean(video.metadata?.processingRun),
 	claimProcessingAttempt: async () => processingRun,
 	applyVideoProcessingProgress: async () => true,
 	ProcessingRunSupersededError: class extends Error {},
-}));
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: () => ({
-				where: mocks.where,
-				innerJoin: () => ({ where: mocks.where }),
-			}),
-		}),
-		update: () => ({ set: () => ({ where: mocks.write }) }),
-		delete: () => ({ where: mocks.write }),
-	}),
-}));
-vi.mock("@cap/database/schema", () => ({
-	videos: { id: "id" },
-	videoUploads: { videoId: "videoId" },
-	users: {},
-	agentApiOperations: {},
 }));
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({
@@ -158,16 +216,21 @@ function s3Error(name: string, httpStatusCode: number) {
 	});
 }
 
+afterEach(() => vi.unstubAllGlobals());
 describe("media processing workflows", () => {
 	beforeEach(() => {
+		mocks.currentVideo = undefined;
+		mocks.currentUpload = {
+			videoId: "video",
+			rawFileKey: payload.rawFileKey,
+			phase: "processing",
+		};
 		mocks.hookDispose.mockReset();
-		mocks.createHook
-			.mockReset()
-			.mockImplementation(() =>
-				Object.assign(Promise.resolve({ phase: "complete" }), {
-					dispose: mocks.hookDispose,
-				}),
-			);
+		mocks.createHook.mockReset().mockImplementation(() =>
+			Object.assign(Promise.resolve({ phase: "complete" }), {
+				dispose: mocks.hookDispose,
+			}),
+		);
 		mocks.rows = [];
 		mocks.env = {};
 		mocks.loomSourceUrl = "https://cdn.loom.com/original.mp4";
@@ -421,7 +484,7 @@ describe("media processing workflows", () => {
 			expect(mocks.put).toHaveBeenCalledWith("owner/video/raw-upload.webm", {
 				ContentType: "video/webm",
 			});
-			expect(mocks.remove).toHaveBeenCalledWith("owner/video/raw-upload.webm");
+			expect(mocks.remove).not.toHaveBeenCalled();
 		});
 
 		it("does not keep a second copy of progressive MP4 downloads", async () => {

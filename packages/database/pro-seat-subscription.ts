@@ -1,7 +1,7 @@
 import type { User } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
-import type { db } from "./index.ts";
-import { organizationMembers, organizations, users } from "./schema.ts";
+import type { db } from "./legacy/index.ts";
+import { organizationMembers, organizations, users } from "./legacy/schema.ts";
 
 type Transaction = Parameters<
 	Parameters<ReturnType<typeof db>["transaction"]>[0]

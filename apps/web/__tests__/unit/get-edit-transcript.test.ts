@@ -1,7 +1,32 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import type {
+	AtomicPlan,
+	AtomicSnapshot,
+} from "@cap/database/cloudflare/atomic";
+import * as schema from "@cap/database/cloudflare/schema";
 import { Option } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
+const planningContext = new AsyncLocalStorage<boolean>();
+vi.mock("@cap/database/cloudflare/atomic", async (importOriginal) => {
+	const original =
+		await importOriginal<typeof import("@cap/database/cloudflare/atomic")>();
+	return {
+		...original,
+		atomic: <T>(
+			database: CloudflareDatabase,
+			planner: (snapshot: AtomicSnapshot) => Promise<AtomicPlan<T>>,
+			options?: { maxAttempts?: number },
+		) =>
+			original.atomic(
+				database,
+				(snapshot) => planningContext.run(true, () => planner(snapshot)),
+				options,
+			),
+	};
+});
 const mocks = vi.hoisted(() => ({
 	db: vi.fn(),
 	decodeStorageVideo: vi.fn(),
@@ -11,27 +36,13 @@ const mocks = vi.hoisted(() => ({
 	start: vi.fn(),
 }));
 
-const schema = vi.hoisted(() => ({
-	videos: {
-		id: "videos.id",
-		metadata: "videos.metadata",
-		updatedAt: "videos.updatedAt",
-	},
-	videoEdits: {
-		videoId: "videoEdits.videoId",
-		editSpec: "videoEdits.editSpec",
-	},
-}));
-
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: mocks.db,
 }));
 
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.getCurrentUser,
 }));
-
-vi.mock("@cap/database/schema", () => schema);
 
 vi.mock("@cap/utils", () => ({
 	userIsPro: () => true,
@@ -43,15 +54,6 @@ vi.mock("@cap/web-backend", () => ({
 	},
 }));
 
-vi.mock("drizzle-orm", () => ({
-	and: vi.fn((...conditions: unknown[]) => ({ conditions })),
-	eq: vi.fn((left: unknown, right: unknown) => ({ left, right })),
-	sql: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
-		strings,
-		values,
-	})),
-}));
-
 vi.mock("workflow/api", () => ({
 	start: mocks.start,
 }));
@@ -60,7 +62,7 @@ vi.mock("@/lib/server", () => ({
 	runPromise: mocks.runPromise,
 }));
 
-vi.mock("@/lib/edit-transcript-storage", () => ({
+vi.mock("@cap/database/transcript-encryption", () => ({
 	decryptEditTranscriptObject: (value: string) => value,
 }));
 
@@ -93,87 +95,31 @@ function createDatabase(
 		updatedAt: new Date("2026-07-30T00:00:00.000Z"),
 		...video,
 	};
-	const transactionContext = new AsyncLocalStorage<boolean>();
-	const lockedSelect = {
-		select: vi.fn(),
-		from: vi.fn(),
-		where: vi.fn(),
-		for: vi.fn(),
-	};
-	lockedSelect.select.mockReturnValue(lockedSelect);
-	lockedSelect.from.mockReturnValue(lockedSelect);
-	lockedSelect.where.mockReturnValue(lockedSelect);
-	lockedSelect.for.mockImplementation(async () => [currentVideo]);
-
-	const transactionUpdate = {
-		set: vi.fn(),
-		where: vi.fn(),
-	};
-	transactionUpdate.set.mockImplementation(
-		(values: Record<string, unknown>) => {
-			if (
-				typeof values.metadata === "object" &&
-				values.metadata !== null &&
-				"values" in values.metadata &&
-				Array.isArray(values.metadata.values)
-			) {
-				const encodedStatus = values.metadata.values.find(
-					(value) =>
-						typeof value === "string" && value.startsWith('{"status":'),
-				);
-				if (typeof encodedStatus === "string") {
-					currentVideo.metadata = {
-						editTranscriptBackfill: JSON.parse(encodedStatus),
-					};
+	const applied = vi.fn();
+	const database = createRecordingD1Model({
+		read: async ({ table }) => {
+			if (table === schema.videos) return [structuredClone(currentVideo)];
+			if (table === schema.videoEdits)
+				return edit ? [structuredClone(edit)] : [];
+			return [];
+		},
+		apply: (statements) => {
+			for (const statement of statements) {
+				if (
+					statement.table === schema.videos &&
+					statement.operation === "update"
+				) {
+					applied(statement.values);
+					Object.assign(currentVideo, statement.values);
 				}
 			}
-			return transactionUpdate;
 		},
-	);
-	transactionUpdate.where.mockResolvedValue([{ affectedRows: 1 }]);
-
-	const select = vi.fn(() => ({
-		from: vi.fn((table: unknown) => ({
-			where: vi
-				.fn()
-				.mockResolvedValue(
-					table === schema.videoEdits ? (edit ? [edit] : []) : [currentVideo],
-				),
-		})),
-	}));
-	const update = vi.fn(() => ({
-		set: vi.fn(() => ({
-			where: vi.fn().mockResolvedValue([{ affectedRows: 1 }]),
-		})),
-	}));
-
-	let transactionTail = Promise.resolve();
-	const transaction = vi.fn(
-		<T>(
-			callback: (
-				tx: typeof lockedSelect & { update: typeof update },
-			) => Promise<T>,
-		): Promise<T> => {
-			const result = transactionTail.then(() =>
-				transactionContext.run(true, () =>
-					callback({
-						...lockedSelect,
-						update: vi.fn(() => transactionUpdate),
-					}),
-				),
-			);
-			transactionTail = result.then(
-				() => undefined,
-				() => undefined,
-			);
-			return result;
-		},
-	);
-
+		signature: () => JSON.stringify(currentVideo),
+	});
 	return {
-		database: { select, transaction, update },
-		isTransactionActive: () => transactionContext.getStore() === true,
-		lockedSelect,
+		database,
+		isTransactionActive: () => planningContext.getStore() === true,
+		applied,
 	};
 }
 
@@ -251,8 +197,7 @@ beforeEach(() => {
 describe("requestEditTranscript", () => {
 	it("serializes concurrent requests and starts one paid transcript job", async () => {
 		const objects = new Map<string, string>();
-		const { database, isTransactionActive, lockedSelect } =
-			createDatabase(video);
+		const { database, isTransactionActive, applied } = createDatabase(video);
 		const bucket = createBucket(objects, isTransactionActive);
 		mocks.db.mockReturnValue(database);
 		mocks.getAccessForVideo.mockReturnValue(pipeValue([bucket]));
@@ -276,8 +221,10 @@ describe("requestEditTranscript", () => {
 		expect(first).toEqual({ status: "processing" });
 		expect(second).toEqual({ status: "processing" });
 		expect(mocks.start).toHaveBeenCalledTimes(1);
-		expect(lockedSelect.for).toHaveBeenCalledTimes(2);
-		expect(lockedSelect.for).toHaveBeenCalledWith("update");
+		expect(applied).toHaveBeenCalledTimes(1);
+		expect(applied.mock.calls[0]?.[0]).toMatchObject({
+			metadata: { editTranscriptBackfill: { status: "processing" } },
+		});
 		expect(mocks.start.mock.calls[0]?.[1]?.[0]).toMatchObject({
 			videoId: "video-1",
 			userId: "user-1",
@@ -376,6 +323,72 @@ describe("requestEditTranscript", () => {
 });
 
 describe("getEditTranscript", () => {
+	it.each([true, false])(
+		"uses only the current transcript publication (edit=%s)",
+		async (edit) => {
+			const pointer = {
+				version: 1,
+				id: "e8dc5891-8475-4e31-a56c-327fd3f08656",
+				vtt: false,
+				edit,
+				revision: null,
+			};
+			const key = `user-1/video-1/.transcripts/${pointer.id}/transcription.edit.v3.json`;
+			const bucket = createBucket(
+				new Map([
+					[TRANSCRIPT_KEY, storedOriginalTranscript(18000)],
+					[key, storedOriginalTranscript()],
+				]),
+			);
+			const { database } = createDatabase({
+				...video,
+				metadata: { transcriptPublication: pointer },
+			});
+			mocks.db.mockReturnValue(database);
+			mocks.getAccessForVideo.mockReturnValue(pipeValue([bucket]));
+			const { getEditTranscript } = await import(
+				"@/actions/videos/get-edit-transcript"
+			);
+			expect((await getEditTranscript("video-1" as never)).status).toBe(
+				edit ? "ready" : "missing",
+			);
+			if (edit) expect(bucket.getObject).toHaveBeenCalledWith(key);
+			else expect(bucket.getObject).not.toHaveBeenCalled();
+			expect(bucket.getObject).not.toHaveBeenCalledWith(TRANSCRIPT_KEY);
+		},
+	);
+
+	it("does not fall back to a historical sidecar when a published artifact is missing", async () => {
+		const pointer = {
+			version: 1,
+			id: "e8dc5891-8475-4e31-a56c-327fd3f08656",
+			vtt: false,
+			edit: true,
+			revision: null,
+		};
+		const bucket = createBucket(
+			new Map([[TRANSCRIPT_KEY, storedOriginalTranscript()]]),
+		);
+		const { database } = createDatabase({
+			...video,
+			metadata: { transcriptPublication: pointer },
+		});
+		mocks.db.mockReturnValue(database);
+		mocks.getAccessForVideo.mockReturnValue(pipeValue([bucket]));
+		const consoleError = vi
+			.spyOn(console, "error")
+			.mockImplementation(() => undefined);
+		const { getEditTranscript } = await import(
+			"@/actions/videos/get-edit-transcript"
+		);
+		expect(await getEditTranscript("video-1" as never)).toEqual({
+			status: "error",
+			message: "Transcript unavailable",
+		});
+		expect(bucket.getObject).not.toHaveBeenCalledWith(TRANSCRIPT_KEY);
+		consoleError.mockRestore();
+	});
+
 	it("remaps stored words instead of reporting them as stale", async () => {
 		const objects = new Map<string, string>([
 			[TRANSCRIPT_KEY, storedOriginalTranscript()],

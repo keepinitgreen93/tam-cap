@@ -4,7 +4,10 @@ import {
 	videos,
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
-import { claimTranscriptionRun } from "@cap/database/cloudflare/transcription-state";
+import {
+	claimTranscriptionRun,
+	releaseTranscriptionRun,
+} from "@cap/database/cloudflare/transcription-state";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -85,36 +88,20 @@ export async function transcribeVideo(
 		video.transcriptionStatus === "PROCESSING" &&
 		video.metadata?.transcriptionRun &&
 		video.metadata.transcriptionRun.dispatch !== "accepted"
-	)
-		await resumeTranscriptionDispatch(videoId, video.metadata.transcriptionRun);
-
-	if (!video) {
-		return { success: false, message: "Video information is missing" };
-	}
-
-	if (
-		video.settings?.disableTranscript ??
-		result.orgSettings?.disableTranscript
 	) {
-		console.log(
-			`[transcribeVideo] Transcription disabled for video ${videoId}`,
-		);
-		try {
-			await db()
-				.update(videos)
-				.set({ transcriptionStatus: "SKIPPED" })
-				.where(eq(videos.id, videoId));
-		} catch (err) {
-			console.error(`[transcribeVideo] Failed to mark as skipped:`, err);
-			return {
-				success: false,
-				message: "Transcription disabled, but failed to update status",
-			};
-		}
-		return {
-			success: true,
-			message: "Transcription disabled for video — skipping transcription",
-		};
+		const run = video.metadata.transcriptionRun;
+		const resumed = await resumeTranscriptionDispatch(videoId, run);
+		if (
+			!resumed &&
+			!run.workflowRunId &&
+			Date.now() - Date.parse(run.requestedAt) > 5 * 60 * 1000 &&
+			(await releaseTranscriptionRun(db(), {
+				videoId,
+				ownerId: video.ownerId,
+				runId: run.id,
+			}))
+		)
+			return transcribeVideo(videoId, userId, aiGenerationEnabled, options);
 	}
 
 	if (
@@ -178,7 +165,14 @@ export async function transcribeVideo(
 			options,
 		);
 		if (!claimed)
-			return { success: true, message: TRANSCRIPTION_ALREADY_HANDLED_MESSAGE };
+			return {
+				success: true,
+				message:
+					(video.settings?.disableTranscript ??
+					result.orgSettings?.disableTranscript)
+						? "Transcription disabled for video — skipping transcription"
+						: TRANSCRIPTION_ALREADY_HANDLED_MESSAGE,
+			};
 		await dispatchTranscriptionRun(
 			transcribeVideoWorkflow,
 			claimed.video,

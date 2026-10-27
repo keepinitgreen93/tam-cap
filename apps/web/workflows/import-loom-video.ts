@@ -1,9 +1,18 @@
-import { db } from "@cap/database";
-import { agentApiOperations, videos, videoUploads } from "@cap/database/schema";
+import {
+	requireOrganizationManager,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import {
+	agentApiOperations,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend/src/Storage/index";
 import { Video } from "@cap/web-domain";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Effect } from "effect";
 import {
 	createHook,
@@ -18,7 +27,16 @@ import {
 	LoomDownloadTemporaryError,
 } from "@/lib/loom-download-url";
 import { cleanupLoomFileSource } from "@/lib/loom-file-cleanup";
+import {
+	getLoomImportArtifactKeys,
+	loomImportSourcePublication,
+} from "@/lib/loom-import-artifacts";
 import { getLoomImportSignalToken } from "@/lib/loom-import-signal-token";
+import {
+	ensureLoomImportWorkflow,
+	ownsLoomImportSource,
+	readLoomImportVideo,
+} from "@/lib/loom-import-state";
 import {
 	LOOM_IMPORT_MAX_BYTES,
 	type LoomMultipartUploadTarget,
@@ -162,29 +180,45 @@ async function requireLoomWorkerCapabilities(workerUrl: string) {
 	}
 }
 
-async function claimAgentImport(operationId: string | undefined) {
+async function initializeImport(payload: ImportLoomPayload, runId: string) {
 	"use step";
+	return ensureLoomImportWorkflow(db(), payload, runId);
+}
 
-	if (!operationId) return true;
-	return db().transaction(async (tx) => {
-		const [operation] = await tx
-			.select({
-				kind: agentApiOperations.kind,
-				state: agentApiOperations.state,
-			})
-			.from(agentApiOperations)
-			.where(eq(agentApiOperations.id, operationId))
-			.limit(1)
-			.for("update");
-		if (!operation || operation.kind !== "import_loom") {
+async function claimAgentImport(payload: ImportLoomPayload) {
+	"use step";
+	if (!payload.agentOperationId) return true;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const video = await readLoomImportVideo(snapshot, payload);
+		const [operation] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(agentApiOperations)
+				.where(eq(agentApiOperations.id, payload.agentOperationId as string))
+				.limit(1),
+		);
+		if (
+			!operation ||
+			operation.kind !== "import_loom" ||
+			operation.resultResourceId !== payload.videoId ||
+			operation.resourceId !== video.orgId
+		)
 			throw new FatalError("Agent Loom import operation not found");
-		}
-		if (operation.state !== "queued") return false;
-		await tx
-			.update(agentApiOperations)
-			.set({ state: "running", updatedAt: new Date() })
-			.where(eq(agentApiOperations.id, operationId));
-		return true;
+		if (operation.state !== "queued") return { statements: [], result: false };
+		if (operation.userId === video.ownerId)
+			await requireOrganizationMember(snapshot, video.orgId, operation.userId);
+		else
+			await requireOrganizationManager(snapshot, video.orgId, operation.userId);
+		return {
+			statements: [
+				database
+					.update(agentApiOperations)
+					.set({ state: "running", updatedAt: new Date() })
+					.where(eq(agentApiOperations.id, operation.id)),
+			],
+			result: true,
+		};
 	});
 }
 
@@ -204,7 +238,12 @@ async function completeAgentImport(
 			updatedAt: now,
 			completedAt: now,
 		})
-		.where(eq(agentApiOperations.id, operationId));
+		.where(
+			and(
+				eq(agentApiOperations.id, operationId),
+				eq(agentApiOperations.state, "running"),
+			),
+		);
 }
 
 async function failAgentImport(
@@ -224,7 +263,12 @@ async function failAgentImport(
 			updatedAt: now,
 			completedAt: now,
 		})
-		.where(eq(agentApiOperations.id, operationId));
+		.where(
+			and(
+				eq(agentApiOperations.id, operationId),
+				eq(agentApiOperations.state, "running"),
+			),
+		);
 }
 
 export async function importLoomVideoWorkflow(
@@ -233,12 +277,14 @@ export async function importLoomVideoWorkflow(
 	"use workflow";
 
 	const { workflowRunId } = getWorkflowMetadata();
-	if (!(await claimAgentImport(payload.agentOperationId))) {
+	if (!(await claimAgentImport(payload))) {
 		return { success: true, message: "Loom import is already running" };
 	}
 	try {
+		await initializeImport(payload, workflowRunId);
 		const reuseExistingRawUpload =
-			payload.reuseExistingRawUpload && (await hasExistingLoomUpload(payload));
+			payload.reuseExistingRawUpload &&
+			(await hasExistingLoomUpload(payload, workflowRunId));
 		let processingInput: LoomProcessingInput = reuseExistingRawUpload
 			? {}
 			: { importFromLoom: true };
@@ -275,7 +321,7 @@ export async function importLoomVideoWorkflow(
 						break;
 					} catch (error) {
 						if (!isMediaServerCapacityError(error)) throw error;
-						await markLoomImportWaitingForCapacity(payload.videoId);
+						await markLoomImportWaitingForCapacity(payload, workflowRunId);
 						await sleep(`${Math.min(180, 30 + capacityRetryCount * 15)}s`);
 						capacityRetryCount++;
 					}
@@ -304,15 +350,16 @@ export async function importLoomVideoWorkflow(
 							"The previous Loom worker must be reconciled before retrying",
 						);
 					}
-					await markLoomImportWaitingForCapacity(payload.videoId);
-					if (await hasExistingLoomUpload(payload)) processingInput = {};
+					await markLoomImportWaitingForCapacity(payload, workflowRunId);
+					if (await hasExistingLoomUpload(payload, workflowRunId))
+						processingInput = {};
 					await sleep(15_000 * (processingAttempt + 1));
 				}
 			} finally {
 				finished.dispose();
 			}
 		}
-		await saveMetadataAndComplete(payload.videoId, metadata);
+		await saveMetadataAndComplete(payload, workflowRunId, metadata);
 		await completeAgentImport(payload.agentOperationId, payload.videoId);
 		if (payload.cleanupRawUpload) await cleanupLoomFileSource(payload);
 
@@ -323,7 +370,7 @@ export async function importLoomVideoWorkflow(
 		};
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : String(error);
-		await setProcessingError(payload.videoId, errorMessage);
+		await setProcessingError(payload, workflowRunId, errorMessage);
 		await failAgentImport(payload.agentOperationId, errorMessage);
 		throw new FatalError(errorMessage);
 	}
@@ -359,6 +406,7 @@ async function confirmLoomMediaJobFailure(
 
 async function hasExistingLoomUpload(
 	payload: ImportLoomPayload,
+	runId: string,
 ): Promise<boolean> {
 	"use step";
 
@@ -369,7 +417,12 @@ async function hasExistingLoomUpload(
 				.from(videos)
 				.where(eq(videos.id, Video.VideoId.make(payload.videoId))),
 		);
-		if (!video) return false;
+		if (
+			!video ||
+			video.ownerId !== payload.userId ||
+			!ownsLoomImportSource(video, runId)
+		)
+			return false;
 		const videoDomain = Video.Video.decodeSync({
 			...video,
 			bucketId: video.bucket,
@@ -383,7 +436,7 @@ async function hasExistingLoomUpload(
 		if (
 			previous?.ownerId === video.ownerId &&
 			previous.organizationId === video.orgId &&
-			previous.output.key === `${video.ownerId}/${video.id}/result.mp4`
+			previous.output.key.startsWith(`${video.ownerId}/${video.id}/`)
 		) {
 			const savedOutput = yield* bucket.headObject(previous.output.key).pipe(
 				Effect.map(
@@ -524,9 +577,10 @@ async function processVideoOnMediaServer(
 	if (!mediaServerUrl) {
 		throw new FatalError("MEDIA_SERVER_URL is not configured");
 	}
+	const artifactKeys = getLoomImportArtifactKeys(userId, videoId, attemptId);
 	const originalKey =
 		worker === "importer" && loomSourceUrl && !isMp4Url(loomSourceUrl)
-			? `${userId}/${videoId}/raw-upload.webm`
+			? artifactKeys.originalKey
 			: undefined;
 
 	const webhookBaseUrl =
@@ -553,7 +607,7 @@ async function processVideoOnMediaServer(
 		if (!video) {
 			return yield* Effect.fail(new FatalError("Video does not exist"));
 		}
-		if (video.ownerId !== userId) {
+		if (video.ownerId !== userId || !ownsLoomImportSource(video, runId)) {
 			return yield* Effect.fail(new FatalError("Loom import owner changed"));
 		}
 		const videoDomain = Video.Video.decodeSync({
@@ -565,9 +619,7 @@ async function processVideoOnMediaServer(
 			metadata: video.metadata,
 		});
 		const [bucket] = yield* Storage.getAccessForVideo(videoDomain);
-		const outputKey = `${userId}/${videoId}/result.mp4`;
-		const thumbnailKey = `${userId}/${videoId}/screenshot/screen-capture.jpg`;
-		const previewGifKey = `${userId}/${videoId}/preview/animated-preview.gif`;
+		const { outputKey, thumbnailKey, previewKey: previewGifKey } = artifactKeys;
 
 		const rawVideoUrl = loomSourceUrl
 			? loomSourceUrl
@@ -605,10 +657,6 @@ async function processVideoOnMediaServer(
 			},
 			{ expiresIn: MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS },
 		);
-		if (originalKey)
-			yield* bucket
-				.deleteObject(originalKey)
-				.pipe(Effect.catchAll(() => Effect.void));
 		const originalPutUrl =
 			originalKey && bucket.provider !== "s3"
 				? yield* bucket.getInternalPresignedPutUrl(originalKey, {
@@ -674,21 +722,47 @@ async function processVideoOnMediaServer(
 	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress?retryable=true&signal=${encodeURIComponent(getLoomImportSignalToken(videoId, attemptId))}${worker === "importer" ? "&transcription=on-view&preview=on-view" : ""}`;
 	const webhookSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
 
-	try {
-		await db()
-			.update(videoUploads)
-			.set({
-				phase: "processing",
-				processingProgress: 0,
-				processingMessage: "Starting video processing...",
-				processingError: null,
-				updatedAt: new Date(),
-			})
-			.where(eq(videoUploads.videoId, videoId as Video.VideoId));
-	} catch (error) {
-		await abortUploads();
-		throw error;
-	}
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const video = await readLoomImportVideo(snapshot, payload);
+		const receipt = video.metadata?.loomImportUpload;
+		const currentAttempt =
+			video.metadata?.loomImportRun?.mediaDispatch?.attemptId;
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, video.id))
+				.limit(1),
+		);
+		if (
+			!ownsLoomImportSource(video, runId) ||
+			(receipt && receipt.attemptId !== attemptId) ||
+			!upload ||
+			(upload.rawFileKey && upload.rawFileKey !== rawFileKey) ||
+			(currentAttempt &&
+				(!currentAttempt.startsWith(`${runId}:`) ||
+					Number(currentAttempt.slice(runId.length + 1)) >
+						Number(attemptId.slice(runId.length + 1))))
+		)
+			throw new FatalError("Loom import was superseded before media dispatch");
+		return {
+			statements: [
+				database
+					.update(videoUploads)
+					.set({
+						phase: "processing",
+						processingProgress: 0,
+						processingMessage: "Starting video processing...",
+						processingError: null,
+						rawFileKey,
+						updatedAt: new Date(),
+					})
+					.where(eq(videoUploads.videoId, video.id)),
+			],
+			result: undefined,
+		};
+	});
 
 	try {
 		const jobId = await startMediaServerProcessJob(
@@ -738,62 +812,114 @@ async function processVideoOnMediaServer(
 processVideoOnMediaServer.maxRetries = 0;
 
 async function saveMetadataAndComplete(
-	videoId: string,
+	payload: ImportLoomPayload,
+	runId: string,
 	metadata: { duration: number; width: number; height: number; fps: number },
 ): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({
-			width: metadata.width,
-			height: metadata.height,
-			fps: metadata.fps,
-			...(getValidDuration(metadata.duration) === undefined
-				? {}
-				: { duration: metadata.duration }),
-		})
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	await db()
-		.delete(videoUploads)
-		.where(
-			and(
-				eq(videoUploads.videoId, videoId as Video.VideoId),
-				sql`NOT EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${videoId} AND JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomDeferredProcessing.status')) = 'started')`,
-			),
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const video = await readLoomImportVideo(snapshot, payload);
+		if (!ownsLoomImportSource(video, runId))
+			throw new FatalError("Loom import was superseded before publication");
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, video.id))
+				.limit(1),
 		);
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({
+						width: metadata.width,
+						height: metadata.height,
+						fps: metadata.fps,
+						...(getValidDuration(metadata.duration) === undefined
+							? {}
+							: { duration: metadata.duration }),
+						...loomImportSourcePublication(video),
+					})
+					.where(eq(videos.id, video.id)),
+				...(upload &&
+				video.metadata?.loomDeferredProcessing?.status !== "started"
+					? [
+							database
+								.delete(videoUploads)
+								.where(eq(videoUploads.videoId, video.id)),
+						]
+					: []),
+			],
+			result: undefined,
+		};
+	});
 }
 
 async function setProcessingError(
-	videoId: string,
+	payload: ImportLoomPayload,
+	runId: string,
 	errorMessage: string,
 ): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videoUploads)
-		.set({
-			phase: "error",
-			processingProgress: 0,
-			processingMessage: "Loom import failed",
-			processingError: errorMessage,
-			updatedAt: new Date(),
-		})
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const [video] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(eq(videos.id, Video.VideoId.make(payload.videoId)))
+				.limit(1),
+		);
+		if (
+			!video ||
+			video.ownerId !== payload.userId ||
+			!ownsLoomImportSource(video, runId) ||
+			video.metadata?.processingRun ||
+			video.metadata?.editProcessing
+		)
+			return { statements: [], result: undefined };
+		return {
+			statements: [
+				database
+					.update(videoUploads)
+					.set({
+						phase: "error",
+						processingProgress: 0,
+						processingMessage: "Loom import failed",
+						processingError: errorMessage,
+						updatedAt: new Date(),
+					})
+					.where(eq(videoUploads.videoId, video.id)),
+			],
+			result: undefined,
+		};
+	});
 }
 
 async function markLoomImportWaitingForCapacity(
-	videoId: string,
+	payload: ImportLoomPayload,
+	runId: string,
 ): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videoUploads)
-		.set({
-			processingMessage: "Queued for Loom import processing...",
-			processingError: null,
-			updatedAt: new Date(),
-		})
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const video = await readLoomImportVideo(snapshot, payload);
+		if (!ownsLoomImportSource(video, runId))
+			throw new FatalError("Loom import was superseded");
+		return {
+			statements: [
+				database
+					.update(videoUploads)
+					.set({
+						processingMessage: "Queued for Loom import processing...",
+						processingError: null,
+						updatedAt: new Date(),
+					})
+					.where(eq(videoUploads.videoId, video.id)),
+			],
+			result: undefined,
+		};
+	});
 }

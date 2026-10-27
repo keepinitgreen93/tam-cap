@@ -18,7 +18,7 @@ export const AI_ENTITLED_SUBSCRIPTION_STATUSES = [
 export const isAiGenerationEnabledForUser = (
 	user?: AiGenerationEntitlementUser | null,
 ) => {
-	if (!buildEnv.NEXT_PUBLIC_IS_CAP) return true;
+	if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true") return true;
 	if (!user) return false;
 	if (user.thirdPartyStripeSubscriptionId) return true;
 	return AI_ENTITLED_SUBSCRIPTION_STATUSES.includes(

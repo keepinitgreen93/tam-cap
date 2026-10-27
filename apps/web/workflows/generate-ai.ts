@@ -1,5 +1,12 @@
-import { db } from "@cap/database";
-import { organizations, videos } from "@cap/database/schema";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import {
+	LEGACY_AI_SUMMARY_FALLBACK,
+	ownsAiGeneration,
+	updateAiGenerationRun,
+} from "@cap/database/cloudflare/ai-generation";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { organizations, videos } from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { Storage } from "@cap/web-backend/src/Storage/index";
 import {
@@ -10,19 +17,20 @@ import {
 	type Video,
 } from "@cap/web-domain";
 import { generateText } from "ai";
-import { and, eq, sql } from "drizzle-orm";
-import { Effect, Option } from "effect";
+import { eq } from "drizzle-orm";
+import { Option } from "effect";
 import { FatalError } from "workflow";
 import { isAiConfigured } from "@/lib/ai/provider";
 import { AiUnavailableError, runWithAiProviders } from "@/lib/ai/run";
-import { setGeneratedAiContent } from "@/lib/ai-content-metadata";
 import { enqueueVideoStorageNameSync } from "@/lib/sync-video-storage-names";
+import { readTranscriptVtt } from "@/lib/transcript-publication";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
 interface GenerateAiWorkflowPayload {
 	videoId: string;
 	userId: string;
+	runId: string;
 }
 
 interface VideoData {
@@ -47,20 +55,8 @@ interface AiResult {
 	chapters?: { title: string; start: number }[];
 }
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
-
 const MAX_CHARS_PER_CHUNK = 24000;
 const LEGACY_AI_TITLE_FALLBACK = "Generated Title";
-const LEGACY_AI_SUMMARY_FALLBACK =
-	"The AI was unable to generate a proper summary for this content.";
 const GENERATED_TITLE_PATTERN =
 	/^(Cap (Recording|Upload) - .+|Cap \d{4}-\d{2}-\d{2} at \d{2}[.:]\d{2}[.:]\d{2}|Untitled|\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|.+ \((Display|Window|Area|Camera)\) \d{4}-\d{2}-\d{2} \d{2}:\d{2} [AP]M)$/;
 
@@ -92,21 +88,21 @@ export function shouldReplaceVideoTitle({
 export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
 	"use workflow";
 
-	const { videoId, userId } = payload;
+	const { videoId, userId, runId } = payload;
 
 	let videoData: VideoData;
 	try {
-		videoData = await validateAndSetProcessing(videoId);
+		videoData = await validateAndSetProcessing(videoId, userId, runId);
 	} catch (error) {
-		await markError(videoId);
+		await markError(videoId, runId);
 		throw error;
 	}
 
 	try {
-		const transcript = await fetchTranscript(videoId, userId, videoData.video);
+		const transcript = await fetchTranscript(videoData.video);
 
 		if (!transcript) {
-			await markSkipped(videoId);
+			await markSkipped(videoId, runId);
 			return {
 				success: true,
 				message: "Transcript empty or too short - skipped",
@@ -120,129 +116,98 @@ export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
 
 		await saveResults(videoId, videoData, result);
 	} catch (error) {
-		await markError(videoId);
+		await markError(videoId, runId);
 		throw error;
 	}
 
 	return { success: true, message: "AI generation completed successfully" };
 }
 
-async function validateAndSetProcessing(videoId: string): Promise<VideoData> {
+async function validateAndSetProcessing(
+	videoId: string,
+	userId: string,
+	runId: string,
+): Promise<VideoData> {
 	"use step";
-
-	if (!isAiConfigured()) {
-		throw new FatalError("No AI provider configured");
-	}
-
-	const query = await db()
-		.select({ video: videos, orgSettings: organizations.settings })
-		.from(videos)
-		.leftJoin(organizations, eq(videos.orgId, organizations.id))
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	if (query.length === 0 || !query[0]?.video) {
-		throw new FatalError("Video does not exist");
-	}
-
-	const { video } = query[0];
-	const metadata = (video.metadata as VideoMetadata) || {};
-
-	if (video.transcriptionStatus !== "COMPLETE") {
-		throw new FatalError("Transcription not complete");
-	}
-
-	if (
-		metadata.summary &&
-		metadata.summary !== LEGACY_AI_SUMMARY_FALLBACK &&
-		metadata.chapters
-	) {
-		throw new FatalError("AI metadata already generated");
-	}
-
-	let processingMetadata = sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.aiGenerationStatus', 'PROCESSING')`;
-	for (const [metadataPath, fallback] of [
-		["$.aiTitle", LEGACY_AI_TITLE_FALLBACK],
-		["$.summary", LEGACY_AI_SUMMARY_FALLBACK],
-	] as const) {
-		processingMetadata = sql`IF(JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, ${metadataPath})) = ${fallback} AND (${metadataPath} <> '$.summary' OR COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.summaryManuallyEdited')), 'false') <> 'true'), JSON_REMOVE(${processingMetadata}, ${metadataPath}), ${processingMetadata})`;
-	}
-
-	await db()
-		.update(videos)
-		.set({
-			metadata: processingMetadata,
-		})
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	return {
-		video,
-		metadata,
-		aiGenerationLanguage: parseAiGenerationLanguage(
-			query[0]?.orgSettings?.aiGenerationLanguage,
-		),
-	};
+	if (!isAiConfigured()) throw new FatalError("No AI provider configured");
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select({ video: videos, orgSettings: organizations.settings })
+				.from(videos)
+				.leftJoin(organizations, eq(videos.orgId, organizations.id))
+				.where(eq(videos.id, videoId as Video.VideoId))
+				.limit(1),
+		);
+		if (
+			!row ||
+			row.video.ownerId !== userId ||
+			!ownsAiGeneration(row.video, runId)
+		)
+			throw new FatalError("AI generation superseded");
+		const { video } = row;
+		if (video.orgId) await requireActiveOrganization(snapshot, video.orgId);
+		const metadata = { ...video.metadata };
+		if (!["QUEUED", "PROCESSING"].includes(metadata.aiGenerationStatus ?? ""))
+			throw new FatalError("AI generation is no longer active");
+		if (metadata.aiTitle === LEGACY_AI_TITLE_FALLBACK) delete metadata.aiTitle;
+		if (
+			metadata.summary === LEGACY_AI_SUMMARY_FALLBACK &&
+			!metadata.summaryManuallyEdited
+		)
+			delete metadata.summary;
+		metadata.aiGenerationStatus = "PROCESSING";
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({ metadata })
+					.where(eq(videos.id, video.id)),
+			],
+			result: {
+				video: { ...video, metadata },
+				metadata,
+				aiGenerationLanguage: parseAiGenerationLanguage(
+					row.orgSettings?.aiGenerationLanguage,
+				),
+			},
+		};
+	});
 }
 
 async function fetchTranscript(
-	videoId: string,
-	userId: string,
 	video: typeof videos.$inferSelect,
 ): Promise<TranscriptData | null> {
 	"use step";
-
-	const vtt = await Effect.gen(function* () {
-		const [bucket] = yield* Storage.getAccessForVideo(
-			decodeStorageVideo(video),
-		);
-		return yield* bucket.getObject(`${userId}/${videoId}/transcription.vtt`);
-	}).pipe(runWorkflowPromise);
-
-	if (Option.isNone(vtt)) {
-		return null;
-	}
-
-	const segments = parseVttWithTimestamps(vtt.value);
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
+	).pipe(runWorkflowPromise);
+	const vtt = await readTranscriptVtt(video, {
+		getText: async (key) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runWorkflowPromise)),
+	});
+	if (vtt === null) return null;
+	const segments = parseVttWithTimestamps(vtt);
 	const text = segments
-		.map((s) => s.text)
+		.map((segment) => segment.text)
 		.join(" ")
 		.trim();
-
-	if (text.length < 10) {
-		return null;
-	}
-
-	return { segments, text };
+	return text.length < 10 ? null : { segments, text };
 }
 
-async function markError(videoId: string): Promise<void> {
+async function markError(videoId: string, runId: string): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({
-			metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.aiGenerationStatus', 'ERROR')`,
-		})
-		.where(
-			and(
-				eq(videos.id, videoId as Video.VideoId),
-				sql`NOT (
-					COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.aiGenerationStatus')), '') = 'COMPLETE'
-					AND JSON_EXTRACT(${videos.metadata}, '$.summary') IS NOT NULL
-					AND JSON_EXTRACT(${videos.metadata}, '$.chapters') IS NOT NULL
-				)`,
-			),
-		);
+	await updateAiGenerationRun(db(), videoId as Video.VideoId, runId, {
+		status: "ERROR",
+	});
 }
 
-async function markSkipped(videoId: string): Promise<void> {
+async function markSkipped(videoId: string, runId: string): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({
-			metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.aiGenerationStatus', 'SKIPPED')`,
-		})
-		.where(eq(videos.id, videoId as Video.VideoId));
+	await updateAiGenerationRun(db(), videoId as Video.VideoId, runId, {
+		status: "SKIPPED",
+	});
 }
 
 async function generateWithAi(
@@ -363,75 +328,68 @@ async function saveResults(
 	result: AiResult,
 ): Promise<void> {
 	"use step";
-
-	const { video, metadata } = videoData;
-	const generatedTitle = result.title?.trim();
-	const currentVideo = await getCurrentVideo(videoId);
-	const currentMetadata = currentVideo
-		? (currentVideo.metadata as VideoMetadata) || {}
-		: metadata;
-	const currentTitle = currentVideo?.name ?? video.name;
-
-	let metadataUpdate = sql`COALESCE(${videos.metadata}, JSON_OBJECT())`;
-	if (generatedTitle) {
-		metadataUpdate = sql`JSON_SET(${metadataUpdate}, '$.aiTitle', ${generatedTitle})`;
-	}
-	if (result.summary) {
-		metadataUpdate = setGeneratedAiContent(
-			metadataUpdate,
-			"summary",
-			result.summary,
+	const runId = videoData.metadata.aiGenerationRun?.id;
+	if (!runId) throw new FatalError("AI generation identity missing");
+	const database = db();
+	const titleChanged = await atomic(database, async (snapshot) => {
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(eq(videos.id, videoId as Video.VideoId))
+				.limit(1),
 		);
-	}
-	if (result.chapters) {
-		metadataUpdate = setGeneratedAiContent(
-			metadataUpdate,
-			"chapters",
-			result.chapters,
-		);
-	}
-	metadataUpdate = sql`JSON_SET(${metadataUpdate}, '$.aiGenerationStatus', 'COMPLETE')`;
-
-	await db()
-		.update(videos)
-		.set({ metadata: metadataUpdate })
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	if (
-		generatedTitle &&
-		shouldReplaceVideoTitle({
-			currentTitle,
-			previousAiTitle: currentMetadata.aiTitle,
+		if (
+			!current ||
+			!ownsAiGeneration(current, runId) ||
+			current.metadata?.aiGenerationStatus !== "PROCESSING"
+		)
+			return { statements: [], result: false };
+		if (current.orgId) await requireActiveOrganization(snapshot, current.orgId);
+		const metadata: VideoMetadata = {
+			...current.metadata,
+			aiGenerationStatus: "COMPLETE",
+		};
+		const generatedTitle = result.title?.trim();
+		const replaceTitle = shouldReplaceVideoTitle({
+			currentTitle: current.name,
+			previousAiTitle: current.metadata?.aiTitle,
 			nextAiTitle: generatedTitle,
-			sourceName: currentMetadata.sourceName,
-			titleManuallyEdited: currentMetadata.titleManuallyEdited,
-		})
-	) {
-		const titleUpdate = await db()
-			.update(videos)
-			.set({ name: generatedTitle })
-			.where(
-				and(
-					eq(videos.id, videoId as Video.VideoId),
-					eq(videos.name, currentTitle),
-					sql`COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.titleManuallyEdited')), 'false') <> 'true'`,
-				),
-			);
-		if (getAffectedRows(titleUpdate) > 0) {
-			await enqueueVideoStorageNameSync(videoId as Video.VideoId);
+			sourceName: metadata.sourceName,
+			titleManuallyEdited: metadata.titleManuallyEdited,
+		});
+		if (generatedTitle) metadata.aiTitle = generatedTitle;
+		if (
+			result.summary &&
+			!(metadata.summaryManuallyEdited && Object.hasOwn(metadata, "summary"))
+		) {
+			metadata.summary = result.summary;
+			metadata.summaryManuallyEdited = false;
 		}
-	}
-}
-
-async function getCurrentVideo(
-	videoId: string,
-): Promise<typeof videos.$inferSelect | null> {
-	const [currentVideo] = await db()
-		.select()
-		.from(videos)
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	return currentVideo ?? null;
+		if (
+			result.chapters &&
+			!(metadata.chaptersManuallyEdited && Object.hasOwn(metadata, "chapters"))
+		) {
+			metadata.chapters = result.chapters;
+			metadata.chaptersManuallyEdited = false;
+		}
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({
+						metadata,
+						...(replaceTitle && generatedTitle ? { name: generatedTitle } : {}),
+					})
+					.where(eq(videos.id, current.id)),
+			],
+			result:
+				replaceTitle &&
+				Boolean(generatedTitle) &&
+				generatedTitle !== current.name,
+		};
+	});
+	if (titleChanged) await enqueueVideoStorageNameSync(videoId as Video.VideoId);
 }
 
 function parseVttWithTimestamps(vttContent: string): VttSegment[] {

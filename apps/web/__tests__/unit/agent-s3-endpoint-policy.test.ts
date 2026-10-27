@@ -1,7 +1,24 @@
+import { createHash } from "node:crypto";
 import { Agent as HttpAgent } from "node:http";
 import { Agent as HttpsAgent } from "node:https";
 import type { S3ClientConfig } from "@aws-sdk/client-s3";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { agentApiKeys, users } from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { eq } from "drizzle-orm";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
+import { createTestOwner } from "../helpers/cloudflare-team";
+
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let owner: Awaited<ReturnType<typeof createTestOwner>>;
 
 const state = vi.hoisted(() => ({
 	isCap: "true" as string | undefined,
@@ -65,34 +82,9 @@ vi.mock("@/lib/agent-write", async (importOriginal) => {
 	};
 });
 
-const principalRow = {
-	tokenId: "agk_synthetic",
-	scopes: ["caps:read", "integrations:read", "integrations:write"],
-	expiresAt: new Date(Date.now() + 60 * 60 * 1000),
-	revokedAt: null,
-	lastUsedAt: new Date(),
-	id: "usr_synthetic",
-	email: "owner@example.com",
-	activeOrganizationId: "org_synthetic",
-	role: "owner",
-	hasProSeat: true,
-	stripeSubscriptionStatus: "active",
-	thirdPartyStripeSubscriptionId: null,
-};
-
-const query = (): unknown =>
-	new Proxy(() => undefined, {
-		get: (_, property) =>
-			property === "then"
-				? (resolve: (value: unknown) => void) => resolve([principalRow])
-				: query,
-		apply: query,
-	});
-
-vi.mock("@cap/database", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("@cap/database")>();
-	return { ...actual, db: query };
-});
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => fixture.database,
+}));
 
 const token = `cap_cli_${"A".repeat(43)}`;
 
@@ -105,7 +97,8 @@ describe("agent API S3 endpoint policy", () => {
 		Object.assign(process.env, {
 			NEXT_PUBLIC_WEB_URL: "http://localhost",
 			WEB_URL: "http://localhost",
-			DATABASE_URL: "mysql://unused:unused@127.0.0.1:3306/unused",
+			DATABASE_PROVIDER: "d1",
+			DATABASE_ENCRYPTION_KEY: "01".repeat(32),
 			NEXTAUTH_SECRET: "synthetic-test-secret-that-is-long-enough",
 			NEXTAUTH_URL: "http://localhost",
 			CAP_AWS_BUCKET: "synthetic",
@@ -114,11 +107,27 @@ describe("agent API S3 endpoint policy", () => {
 			CAP_AWS_SECRET_KEY: "synthetic",
 			NODE_ENV: "test",
 		});
+		fixture = await createTestDatabase();
+		owner = await createTestOwner(fixture.database);
+		await fixture.database
+			.update(users)
+			.set({ stripeSubscriptionStatus: "active" })
+			.where(eq(users.id, owner.id));
+		await fixture.database.insert(agentApiKeys).values({
+			id: nanoId(),
+			userId: owner.id,
+			tokenHash: createHash("sha256").update(token).digest("hex"),
+			name: "Endpoint policy",
+			scopes: ["caps:read", "integrations:read", "integrations:write"],
+			expiresAt: new Date(Date.now() + 3600000),
+			lastUsedAt: new Date(),
+		});
 		const route = await import("@/app/api/v1/[...route]/route");
 		POST = route.POST;
 		PUT = route.PUT;
 		({ blockedS3EndpointMessage } = await import("@/lib/s3-endpoint-policy"));
-	});
+	}, 120000);
+	afterAll(async () => fixture?.dispose());
 
 	beforeEach(() => {
 		state.isCap = "true";
@@ -129,7 +138,7 @@ describe("agent API S3 endpoint policy", () => {
 
 	const s3Request = (method: "POST" | "PUT", endpoint: string) =>
 		new Request(
-			`http://localhost/api/v1/organizations/org_synthetic/storage/s3${
+			`http://localhost/api/v1/organizations/${owner.activeOrganizationId}/storage/s3${
 				method === "POST" ? "/test" : ""
 			}`,
 			{

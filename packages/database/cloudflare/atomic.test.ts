@@ -389,6 +389,14 @@ test("canonical identity equates Unicode case/composition and IDNA domains witho
 	);
 	assert.throws(() => normalizeEmail("one\u200btwo@example.com"));
 	assert.throws(() => normalizeEmail("person@example.com,other@example.com"));
+	for (const domain of [
+		"example.com/path",
+		"example.com?query",
+		"example.com#fragment",
+		"example.com:443",
+		"exam\u200bple.com",
+	])
+		assert.throws(() => normalizeEmail(`person@${domain}`));
 	assert.throws(() => normalizeEmail(`${"é".repeat(33)}@example.com`));
 });
 

@@ -24,7 +24,9 @@ const mocks = vi.hoisted(() => ({
 	}[],
 }));
 
-vi.mock("@cap/database", () => ({ db: () => ({ select: mocks.select }) }));
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => ({ select: mocks.select }),
+}));
 vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.user }));
 vi.mock("@cap/env", () => ({
 	buildEnv: mocks.buildEnv,
@@ -33,7 +35,7 @@ vi.mock("@cap/env", () => ({
 vi.mock("@cap/ui", () => ({ Logo: () => null }));
 vi.mock("@cap/utils", () => ({ userIsPro: () => mocks.ownerIsPro }));
 vi.mock("@cap/web-backend", () => ({
-	Database: Context.GenericTag("ShareTestDatabase"),
+	CloudflareDatabase: Context.GenericTag("ShareTestDatabase"),
 	ImageUploads: Context.GenericTag("ShareTestImages"),
 	Videos: Context.GenericTag("ShareTestVideos"),
 	provideOptionalAuth: <A, E, R>(effect: Effect.Effect<A, E, R>) =>

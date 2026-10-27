@@ -92,8 +92,46 @@ const supportEmailInput = {
 
 describe("generateMessengerAgentReply", () => {
 	beforeEach(() => {
+		vi.unstubAllEnvs();
 		searchSupermemoryMock.mockResolvedValue([]);
 		vi.spyOn(console, "error").mockImplementation(() => {});
+	});
+
+	it("uses instance URLs and support contact without hosted employee or pricing claims on Cloudflare", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		vi.stubEnv("WEB_URL", "https://videos.example.com");
+		vi.stubEnv("CAP_OWNER_EMAIL", "support@example.com");
+		const model = new MockLanguageModelV4({
+			doGenerate: [textResult("Open the recording library.")],
+		});
+		getAiProviderChainMock.mockReturnValue([makeSelection(model)]);
+		const { generateMessengerAgentReply } = await import(
+			"@/lib/messenger/agent"
+		);
+		await generateMessengerAgentReply(baseArgs);
+		const prompt = JSON.stringify(model.doGenerateCalls[0]?.prompt);
+		expect(prompt).toContain(
+			"https://videos.example.com/dashboard/caps/record",
+		);
+		expect(prompt).toContain("support@example.com");
+		expect(prompt).toContain("AI support assistant");
+		expect(prompt).not.toContain("https://cap.so");
+		expect(prompt).not.toContain("hello@cap.so");
+		expect(prompt).not.toContain("You ARE a Cap employee");
+		expect(prompt).not.toContain("$199/month");
+	});
+
+	it("does not promise a human takeover when Cloudflare AI fails", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		vi.stubEnv("WEB_URL", "https://videos.example.com");
+		vi.stubEnv("CAP_OWNER_EMAIL", "support@example.com");
+		getAiProviderChainMock.mockReturnValue([]);
+		const { generateMessengerAgentReply } = await import(
+			"@/lib/messenger/agent"
+		);
+		expect(await generateMessengerAgentReply(baseArgs)).toBe(
+			"I couldn't answer that right now. Please try again or contact support@example.com for help.",
+		);
 	});
 
 	it("executes the constrained support email tool and strips spoofed fields", async () => {

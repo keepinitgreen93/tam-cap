@@ -1,13 +1,21 @@
 import "server-only";
 
-import { db } from "@cap/database";
-import { nanoId } from "@cap/database/helpers";
+import { normalizeEmail } from "@cap/database/auth/identity";
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import {
+	requireActiveOrganization,
+	requireOrganizationManager,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicSnapshot, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	folders,
 	importedVideos,
 	loomMigrationImports,
 	loomMigrationRequests,
 	organizationMembers,
+	organizations,
 	sharedVideos,
 	spaceMembers,
 	spaces,
@@ -15,8 +23,8 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import { buildEnv, NODE_ENV, serverEnv } from "@cap/env";
 import { dub } from "@cap/utils";
 import { Storage } from "@cap/web-backend";
@@ -28,10 +36,13 @@ import {
 	type User,
 	Video,
 } from "@cap/web-domain";
-import { and, asc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNull, notExists, sql } from "drizzle-orm";
 import { Option } from "effect";
 import { revalidatePath } from "next/cache";
-import { renewConciergeImport } from "@/lib/loom-concierge";
+import {
+	assertMigrationOperator,
+	renewConciergeImport,
+} from "@/lib/loom-concierge";
 import {
 	getLoomDownloadUrl,
 	LoomDownloadTemporaryError,
@@ -185,51 +196,117 @@ export async function fetchLoomOEmbed(
 	}
 }
 
-export type LoomImportTransaction = Parameters<
-	Parameters<ReturnType<typeof db>["transaction"]>[0]
->[0];
-
 export async function assertConciergeLease(
-	tx: LoomImportTransaction,
+	snapshot: AtomicSnapshot,
 	requestId: string,
 	leaseToken: string | undefined,
+	organizationId?: Organisation.OrganisationId,
 ) {
-	const [reservation] = await tx
-		.select({
-			activeOrganizationId: loomMigrationRequests.activeOrganizationId,
-			leaseToken: loomMigrationRequests.activeImportLeaseToken,
-			leaseUntil: loomMigrationRequests.activeImportLeaseUntil,
-		})
-		.from(loomMigrationRequests)
-		.where(eq(loomMigrationRequests.id, requestId))
-		.limit(1)
-		.for("update");
+	const [reservation] = await snapshot.read((reader) =>
+		reader
+			.select()
+			.from(loomMigrationRequests)
+			.where(eq(loomMigrationRequests.id, requestId))
+			.limit(1),
+	);
 	if (
 		!leaseToken ||
-		!reservation?.activeOrganizationId ||
-		reservation.leaseToken !== leaseToken ||
-		!reservation.leaseUntil ||
-		reservation.leaseUntil <= new Date()
-	) {
+		!reservation ||
+		reservation.activeOrganizationId !== reservation.organizationId ||
+		(organizationId && reservation.organizationId !== organizationId) ||
+		reservation.activeImportLeaseToken !== leaseToken ||
+		!reservation.activeImportLeaseUntil ||
+		reservation.activeImportLeaseUntil <= new Date() ||
+		!reservation.lastOperatorUserId
+	)
 		throw new LoomMigrationError(
 			"The concierge import expired. Retry this video.",
 		);
-	}
+	await assertMigrationOperator(snapshot, reservation.lastOperatorUserId);
+	await requireActiveOrganization(snapshot, reservation.organizationId);
+	return reservation;
 }
 
-export async function recordConciergeImport(
-	tx: LoomImportTransaction,
+export function conciergeImportStatements(
+	database: CloudflareDatabase,
 	videoId: Video.VideoId,
 	requestId: string,
 ) {
-	await tx.insert(loomMigrationImports).values({ videoId, requestId });
-	await tx
-		.update(loomMigrationRequests)
-		.set({
-			queuedVideoCount: sql`${loomMigrationRequests.queuedVideoCount} + 1`,
-			updatedAt: new Date(),
-		})
-		.where(eq(loomMigrationRequests.id, requestId));
+	return [
+		database.insert(loomMigrationImports).values({ videoId, requestId }),
+		database
+			.update(loomMigrationRequests)
+			.set({
+				queuedVideoCount: sql`${loomMigrationRequests.queuedVideoCount} + 1`,
+				updatedAt: new Date(),
+			})
+			.where(eq(loomMigrationRequests.id, requestId)),
+	];
+}
+
+export async function assertLoomImportDestination(
+	snapshot: AtomicSnapshot,
+	orgId: Organisation.OrganisationId,
+	ownerId: User.UserId,
+	destination: LoomImportDestination,
+	actorId: User.UserId = ownerId,
+) {
+	const access = await requireOrganizationMember(snapshot, orgId, ownerId);
+	if (actorId !== ownerId)
+		await requireOrganizationManager(snapshot, orgId, actorId);
+	if (destination.spaceId === orgId)
+		await requireOrganizationManager(snapshot, orgId, actorId);
+	else if (destination.spaceId) {
+		const [space] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(spaces)
+				.where(eq(spaces.id, destination.spaceId as Space.SpaceId))
+				.limit(1),
+		);
+		if (!space || space.organizationId !== orgId)
+			throw new Error("Space not found");
+		const actorAccess =
+			actorId === ownerId
+				? access
+				: await requireOrganizationMember(snapshot, orgId, actorId);
+		const [membership] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(spaceMembers)
+				.where(
+					and(
+						eq(spaceMembers.spaceId, space.id),
+						eq(spaceMembers.userId, actorId),
+					),
+				)
+				.limit(1),
+		);
+		if (
+			actorAccess.role === "member" &&
+			space.createdById !== actorId &&
+			membership?.role !== "admin"
+		)
+			throw new Error("Space management is required");
+	}
+	if (destination.folderId) {
+		const [folder] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(folders)
+				.where(eq(folders.id, destination.folderId as Folder.FolderId))
+				.limit(1),
+		);
+		if (
+			!folder ||
+			folder.organizationId !== orgId ||
+			(destination.spaceId
+				? folder.spaceId !== destination.spaceId
+				: folder.spaceId !== null || folder.createdById !== ownerId)
+		)
+			throw new Error("Folder not found");
+	}
+	return access.organization;
 }
 
 export async function importLoomVideoForOwner({
@@ -240,10 +317,12 @@ export async function importLoomVideoForOwner({
 	migrationRequestId,
 	migrationLeaseToken,
 	importPriority,
+	actorId = ownerId,
 }: {
 	loomUrl: string;
 	orgId: Organisation.OrganisationId;
 	ownerId: User.UserId;
+	actorId?: User.UserId;
 	destination?: LoomImportDestination;
 	migrationRequestId?: string;
 	migrationLeaseToken?: string;
@@ -310,49 +389,75 @@ export async function importLoomVideoForOwner({
 			const failedVideoId = existingVideo.videoId;
 			const failedUpdatedAt = existingVideo.uploadUpdatedAt;
 			const claimedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
-			const claimOutcome = await db().transaction(async (tx) => {
+			const database = db();
+			const claimOutcome = await atomic(database, async (snapshot) => {
+				await assertLoomImportDestination(
+					snapshot,
+					orgId,
+					ownerId,
+					destination,
+					actorId,
+				);
 				let mappedRequestId: string | undefined;
 				if (migrationRequestId) {
 					await assertConciergeLease(
-						tx,
+						snapshot,
 						migrationRequestId,
 						migrationLeaseToken,
+						orgId,
 					);
-					const [mapped] = await tx
-						.select({ requestId: loomMigrationImports.requestId })
-						.from(loomMigrationImports)
-						.where(eq(loomMigrationImports.videoId, failedVideoId))
-						.limit(1);
+					const [mapped] = await snapshot.read((reader) =>
+						reader
+							.select({ requestId: loomMigrationImports.requestId })
+							.from(loomMigrationImports)
+							.where(eq(loomMigrationImports.videoId, failedVideoId))
+							.limit(1),
+					);
 					mappedRequestId = mapped?.requestId;
-					if (mappedRequestId && mappedRequestId !== migrationRequestId) {
-						return "foreign" as const;
-					}
+					if (mappedRequestId && mappedRequestId !== migrationRequestId)
+						return { statements: [], result: "foreign" as const };
 				}
-				const claim = await tx
-					.update(videoUploads)
-					.set({
-						phase: "processing",
-						processingProgress: 0,
-						processingMessage: "Restarting Loom import...",
-						processingError: null,
-						rawFileKey,
-						updatedAt: claimedAt,
-					})
-					.where(
-						and(
-							eq(videoUploads.videoId, failedVideoId),
-							eq(videoUploads.phase, "error"),
-							eq(videoUploads.updatedAt, failedUpdatedAt),
-						),
-					);
-				const affectedRows = Array.isArray(claim)
-					? (claim[0] as { affectedRows?: number } | undefined)?.affectedRows
-					: (claim as { affectedRows?: number }).affectedRows;
-				if (affectedRows !== 1) return "busy" as const;
-				if (migrationRequestId && !mappedRequestId) {
-					await recordConciergeImport(tx, failedVideoId, migrationRequestId);
-				}
-				return "claimed" as const;
+				const [current] = await snapshot.read((reader) =>
+					reader
+						.select({ video: videos, upload: videoUploads })
+						.from(videos)
+						.innerJoin(videoUploads, eq(videoUploads.videoId, videos.id))
+						.where(eq(videos.id, failedVideoId))
+						.limit(1),
+				);
+				if (
+					!current ||
+					current.video.ownerId !== ownerId ||
+					current.video.orgId !== orgId ||
+					current.upload.phase !== "error" ||
+					current.upload.updatedAt.getTime() !== failedUpdatedAt.getTime() ||
+					JSON.stringify(current.video.metadata?.loomImportRun) !==
+						JSON.stringify(existingVideo.metadata?.loomImportRun)
+				)
+					return { statements: [], result: "busy" as const };
+				return {
+					statements: [
+						database
+							.update(videoUploads)
+							.set({
+								phase: "processing",
+								processingProgress: 0,
+								processingMessage: "Restarting Loom import...",
+								processingError: null,
+								rawFileKey,
+								updatedAt: claimedAt,
+							})
+							.where(eq(videoUploads.videoId, failedVideoId)),
+						...(migrationRequestId && !mappedRequestId
+							? conciergeImportStatements(
+									database,
+									failedVideoId,
+									migrationRequestId,
+								)
+							: []),
+					],
+					result: "claimed" as const,
+				};
 			});
 			if (claimOutcome === "foreign") {
 				return {
@@ -400,18 +505,6 @@ export async function importLoomVideoForOwner({
 			success: false,
 			error: "This Loom video has already been imported.",
 		};
-	}
-
-	if (existing.length > 0) {
-		await db()
-			.delete(importedVideos)
-			.where(
-				and(
-					eq(importedVideos.orgId, orgId),
-					eq(importedVideos.source, "loom"),
-					eq(importedVideos.sourceId, loomVideoId),
-				),
-			);
 	}
 
 	let downloadUrl: string | null;
@@ -470,65 +563,118 @@ export async function importLoomVideoForOwner({
 		.join("");
 
 	const claimedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
-	await db().transaction(async (tx) => {
-		if (migrationRequestId) {
-			await assertConciergeLease(tx, migrationRequestId, migrationLeaseToken);
-		}
-		await tx.insert(videos).values({
-			id: videoId,
-			name,
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const organization = await assertLoomImportDestination(
+			snapshot,
+			orgId,
 			ownerId,
-			orgId,
-			folderId: destination.spaceId ? undefined : destination.folderId,
-			source: { type: "webMP4" as const },
-			bucket: Option.getOrNull(writable.bucketId),
-			storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
-			public: await getNewVideoPublic(orgId),
-			...(oembedMeta?.duration ? { duration: oembedMeta.duration } : {}),
-			...(oembedMeta?.width ? { width: oembedMeta.width } : {}),
-			...(oembedMeta?.height ? { height: oembedMeta.height } : {}),
-		});
-
-		await tx.insert(videoUploads).values({
-			videoId,
-			phase: "uploading",
-			processingProgress: 0,
-			processingMessage: "Importing from Loom...",
-			updatedAt: claimedAt,
-		});
-
-		await tx.insert(importedVideos).values({
-			id: videoId,
-			orgId,
-			source: "loom",
-			sourceId: loomVideoId,
-		});
-		if (migrationRequestId) {
-			await recordConciergeImport(tx, videoId, migrationRequestId);
-		}
-
-		if (destination.spaceId === orgId) {
-			await tx.insert(sharedVideos).values({
-				id: nanoId(),
+			destination,
+			actorId,
+		);
+		if (migrationRequestId)
+			await assertConciergeLease(
+				snapshot,
+				migrationRequestId,
+				migrationLeaseToken,
+				orgId,
+			);
+		const prior = await snapshot.read((reader) =>
+			reader
+				.select({ id: importedVideos.id, liveId: videos.id })
+				.from(importedVideos)
+				.leftJoin(videos, eq(videos.id, importedVideos.id))
+				.where(
+					and(
+						eq(importedVideos.orgId, orgId),
+						eq(importedVideos.source, "loom"),
+						eq(importedVideos.sourceId, loomVideoId),
+					),
+				),
+		);
+		if (prior.some((row) => row.liveId !== null))
+			throw new Error("This Loom video has already been imported.");
+		const statements = [
+			...(prior.length
+				? [
+						database
+							.delete(importedVideos)
+							.where(
+								and(
+									eq(importedVideos.orgId, orgId),
+									eq(importedVideos.source, "loom"),
+									eq(importedVideos.sourceId, loomVideoId),
+									notExists(
+										database
+											.select({ id: videos.id })
+											.from(videos)
+											.where(eq(videos.id, importedVideos.id)),
+									),
+								),
+							),
+					]
+				: []),
+			database.insert(videos).values({
+				id: videoId,
+				name,
+				ownerId,
+				orgId,
+				folderId: destination.spaceId ? undefined : destination.folderId,
+				source: { type: "webMP4" as const },
+				bucket: Option.getOrNull(writable.bucketId),
+				storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
+				public:
+					organization.defaultVideoVisibility !== "private" &&
+					serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC,
+				...(oembedMeta?.duration ? { duration: oembedMeta.duration } : {}),
+				...(oembedMeta?.width ? { width: oembedMeta.width } : {}),
+				...(oembedMeta?.height ? { height: oembedMeta.height } : {}),
+			}),
+			database.insert(videoUploads).values({
 				videoId,
-				organizationId: orgId,
-				sharedByUserId: ownerId,
-				folderId: destination.folderId,
-			});
-		} else if (destination.spaceId) {
-			await tx.insert(spaceVideos).values({
-				id: nanoId(),
-				videoId,
-				spaceId: destination.spaceId,
-				addedById: ownerId,
-				folderId: destination.folderId,
-			});
-		}
+				phase: "uploading",
+				processingProgress: 0,
+				processingMessage: "Importing from Loom...",
+				updatedAt: claimedAt,
+			}),
+			database
+				.insert(importedVideos)
+				.values({ id: videoId, orgId, source: "loom", sourceId: loomVideoId }),
+			...(migrationRequestId
+				? conciergeImportStatements(database, videoId, migrationRequestId)
+				: []),
+			...(destination.spaceId === orgId
+				? [
+						database.insert(sharedVideos).values({
+							id: nanoId(),
+							videoId,
+							organizationId: orgId,
+							sharedByUserId: ownerId,
+							folderId: destination.folderId,
+						}),
+					]
+				: destination.spaceId
+					? [
+							database.insert(spaceVideos).values({
+								id: nanoId(),
+								videoId,
+								spaceId: destination.spaceId,
+								addedById: actorId,
+								folderId: destination.folderId,
+							}),
+						]
+					: []),
+		];
+		return { statements, result: undefined };
 	});
 
 	const rawFileKey = `${ownerId}/${videoId}/raw-upload.mp4`;
 
-	if (buildEnv.NEXT_PUBLIC_IS_CAP && NODE_ENV === "production") {
+	if (
+		process.env.CAP_RUNTIME !== "cloudflare" &&
+		buildEnv.NEXT_PUBLIC_IS_CAP === "true" &&
+		NODE_ENV === "production"
+	) {
 		await dub()
 			.links.create({
 				url: `${serverEnv().WEB_URL}/s/${videoId}`,
@@ -576,7 +722,11 @@ export async function importLoomVideoForOwner({
 }
 
 export function normalizeImportEmail(email: string) {
-	return email.trim().toLowerCase();
+	try {
+		return normalizeEmail(email);
+	} catch {
+		return email.trim().toLowerCase();
+	}
 }
 
 export function normalizeImportSpaceName(spaceName: string) {
@@ -588,7 +738,12 @@ export function getSpaceNameCacheKey(spaceName: string) {
 }
 
 export function isValidImportEmail(email: string) {
-	return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+	try {
+		normalizeEmail(email);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 export function isValidImportSpaceName(spaceName: string) {
@@ -606,10 +761,15 @@ export async function getOrganizationMemberByEmail(
 		})
 		.from(organizationMembers)
 		.innerJoin(users, eq(organizationMembers.userId, users.id))
+		.innerJoin(
+			organizations,
+			eq(organizations.id, organizationMembers.organizationId),
+		)
 		.where(
 			and(
 				eq(organizationMembers.organizationId, orgId),
-				eq(users.email, email),
+				isNull(organizations.tombstoneAt),
+				eq(users.email, normalizeImportEmail(email)),
 			),
 		)
 		.limit(1);
@@ -638,49 +798,40 @@ export async function getOrCreateImportSpace({
 	const cached = spaceCache.get(cacheKey);
 	if (cached) return cached;
 
-	const [existingSpace] = await db()
-		.select({
-			id: spaces.id,
-			name: spaces.name,
-		})
-		.from(spaces)
-		.where(
-			and(eq(spaces.organizationId, orgId), eq(spaces.name, normalizedName)),
-		)
-		.limit(1);
-
-	if (existingSpace) {
-		const value = {
-			id: existingSpace.id,
-			name: existingSpace.name,
-		};
-		spaceCache.set(cacheKey, value);
-		return value;
-	}
-
 	const spaceId = Space.SpaceId.make(nanoId());
-
-	await db().transaction(async (tx) => {
-		await tx.insert(spaces).values({
-			id: spaceId,
-			name: normalizedName,
-			organizationId: orgId,
-			createdById,
-			iconUrl: null,
-		});
-
-		await tx.insert(spaceMembers).values({
-			id: SpaceMemberId.make(nanoId()),
-			spaceId,
-			userId: createdById,
-			role: "admin",
-		});
+	const memberId = SpaceMemberId.make(nanoId());
+	const database = db();
+	const value = await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, orgId, createdById);
+		const candidates = await snapshot.read((reader) =>
+			reader
+				.select({ id: spaces.id, name: spaces.name })
+				.from(spaces)
+				.where(eq(spaces.organizationId, orgId)),
+		);
+		const existing = candidates.find(
+			(candidate) => getSpaceNameCacheKey(candidate.name) === cacheKey,
+		);
+		if (existing) return { statements: [], result: existing };
+		return {
+			statements: [
+				database.insert(spaces).values({
+					id: spaceId,
+					name: normalizedName,
+					organizationId: orgId,
+					createdById,
+					iconUrl: null,
+				}),
+				database.insert(spaceMembers).values({
+					id: memberId,
+					spaceId,
+					userId: createdById,
+					role: "admin",
+				}),
+			],
+			result: { id: spaceId, name: normalizedName },
+		};
 	});
-
-	const value = {
-		id: spaceId,
-		name: normalizedName,
-	};
 	spaceCache.set(cacheKey, value);
 	return value;
 }
@@ -694,87 +845,150 @@ export async function addImportedVideoToSpace({
 	spaceId: Space.SpaceIdOrOrganisationId;
 	addedById: User.UserId;
 }) {
-	const [existingSpaceVideo] = await db()
-		.select({ id: spaceVideos.id })
-		.from(spaceVideos)
-		.where(
-			and(eq(spaceVideos.spaceId, spaceId), eq(spaceVideos.videoId, videoId)),
-		)
-		.limit(1);
-
-	if (existingSpaceVideo) return;
-
-	await db().insert(spaceVideos).values({
-		id: nanoId(),
-		spaceId,
-		videoId,
-		addedById,
+	const database = db();
+	const id = nanoId();
+	await atomic(database, async (snapshot) => {
+		const [space] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(spaces)
+				.where(eq(spaces.id, spaceId as Space.SpaceId))
+				.limit(1),
+		);
+		const [video] = await snapshot.read((reader) =>
+			reader.select().from(videos).where(eq(videos.id, videoId)).limit(1),
+		);
+		if (!space || !video || video.orgId !== space.organizationId)
+			throw new Error("Space or video not found");
+		await requireOrganizationManager(snapshot, space.organizationId, addedById);
+		await requireOrganizationMember(
+			snapshot,
+			space.organizationId,
+			video.ownerId,
+		);
+		const [existing] = await snapshot.read((reader) =>
+			reader
+				.select({ id: spaceVideos.id })
+				.from(spaceVideos)
+				.where(
+					and(
+						eq(spaceVideos.spaceId, spaceId),
+						eq(spaceVideos.videoId, videoId),
+					),
+				)
+				.limit(1),
+		);
+		return {
+			statements: existing
+				? []
+				: [
+						database
+							.insert(spaceVideos)
+							.values({ id, spaceId, videoId, addedById }),
+					],
+			result: undefined,
+		};
 	});
 }
 
 export async function addImportOwnerToSpace({
 	spaceId,
 	userId,
+	actorId,
 }: {
 	spaceId: Space.SpaceIdOrOrganisationId;
 	userId: User.UserId;
+	actorId: User.UserId;
 }) {
-	const [existingSpaceMember] = await db()
-		.select({ id: spaceMembers.id })
-		.from(spaceMembers)
-		.where(
-			and(eq(spaceMembers.spaceId, spaceId), eq(spaceMembers.userId, userId)),
-		)
-		.limit(1);
-
-	if (existingSpaceMember) return;
-
-	await db()
-		.insert(spaceMembers)
-		.values({
-			id: SpaceMemberId.make(nanoId()),
-			spaceId,
-			userId,
-			role: "member",
-		});
+	const database = db();
+	const id = SpaceMemberId.make(nanoId());
+	await atomic(database, async (snapshot) => {
+		const [space] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(spaces)
+				.where(eq(spaces.id, spaceId as Space.SpaceId))
+				.limit(1),
+		);
+		if (!space) throw new Error("Space not found");
+		await requireOrganizationManager(snapshot, space.organizationId, actorId);
+		await requireOrganizationMember(snapshot, space.organizationId, userId);
+		const [existing] = await snapshot.read((reader) =>
+			reader
+				.select({ id: spaceMembers.id })
+				.from(spaceMembers)
+				.where(
+					and(
+						eq(spaceMembers.spaceId, spaceId),
+						eq(spaceMembers.userId, userId),
+					),
+				)
+				.limit(1),
+		);
+		return {
+			statements: existing
+				? []
+				: [
+						database.insert(spaceMembers).values({
+							id,
+							spaceId,
+							userId,
+							role: space.createdById === userId ? "admin" : "member",
+						}),
+					],
+			result: undefined,
+		};
+	});
 }
 
 async function getOrCreatePersonalImportFolder({
 	orgId,
 	ownerId,
+	actorId,
 	name,
 }: {
 	orgId: Organisation.OrganisationId;
 	ownerId: User.UserId;
+	actorId: User.UserId;
 	name: string;
 }) {
-	const match = () =>
-		db()
-			.select({ id: folders.id })
-			.from(folders)
-			.where(
-				and(
-					eq(folders.organizationId, orgId),
-					eq(folders.createdById, ownerId),
-					eq(folders.name, name),
-					isNull(folders.spaceId),
-					isNull(folders.parentId),
-				),
-			)
-			.orderBy(asc(folders.createdAt))
-			.limit(1);
-	const [existing] = await match();
-	if (existing) return existing.id;
-	await db()
-		.insert(folders)
-		.values({
-			id: Folder.FolderId.make(nanoId()),
-			name,
-			organizationId: orgId,
-			createdById: ownerId,
-		});
-	const [created] = await match();
-	return created?.id;
+	const database = db();
+	const id = Folder.FolderId.make(nanoId());
+	return atomic(database, async (snapshot) => {
+		await requireOrganizationMember(snapshot, orgId, ownerId);
+		await requireOrganizationManager(snapshot, orgId, actorId);
+		const candidates = await snapshot.read((reader) =>
+			reader
+				.select({ id: folders.id, name: folders.name })
+				.from(folders)
+				.where(
+					and(
+						eq(folders.organizationId, orgId),
+						eq(folders.createdById, ownerId),
+						isNull(folders.spaceId),
+						isNull(folders.parentId),
+					),
+				)
+				.orderBy(asc(folders.createdAt)),
+		);
+		const existing = candidates.find(
+			(candidate) =>
+				getSpaceNameCacheKey(candidate.name) === getSpaceNameCacheKey(name),
+		);
+		return {
+			statements: existing
+				? []
+				: [
+						database.insert(folders).values({
+							id,
+							name,
+							organizationId: orgId,
+							createdById: ownerId,
+						}),
+					],
+			result: existing?.id ?? id,
+		};
+	});
 }
 
 export async function processLoomCsvRows({
@@ -914,6 +1128,7 @@ export async function processLoomCsvRows({
 				? await getOrCreatePersonalImportFolder({
 						orgId,
 						ownerId: member.userId,
+						actorId,
 						name: row.folderName,
 					})
 				: undefined;
@@ -921,6 +1136,7 @@ export async function processLoomCsvRows({
 				loomUrl: row.loomUrl,
 				orgId,
 				ownerId: member.userId,
+				actorId,
 				destination: folderId ? { folderId } : {},
 				migrationRequestId,
 				migrationLeaseToken,
@@ -945,6 +1161,7 @@ export async function processLoomCsvRows({
 					await addImportOwnerToSpace({
 						spaceId: space.id,
 						userId: member.userId,
+						actorId,
 					});
 					touchedSpaceIds.add(space.id);
 					spaceName = space.name;

@@ -1,7 +1,9 @@
+import * as Db from "@cap/database/cloudflare/schema";
 import { Effect } from "effect";
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopRecordingJob } from "@/lib/desktop-recording-jobs";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
 	secret: "media-secret" as string | undefined,
@@ -13,17 +15,23 @@ const mocks = vi.hoisted(() => ({
 	abort: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: () => ({ where: async () => mocks.rows }),
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () =>
+		createRecordingD1Model({
+			read: async ({ table, fields }) => {
+				if (table === Db.videos) return mocks.rows as Record<string, unknown>[];
+				if (table === Db.organizations)
+					return [
+						{ id: "organization", ownerId: "owned-user", tombstoneAt: null },
+					];
+				if (table === Db.videoProcessingJobs) {
+					const job = await mocks.getState({ videoId: "owned-video" });
+					return job ? [fields ? { errorCode: job.errorCode } : job] : [];
+				}
+				return [];
+			},
+			apply: () => {},
 		}),
-	}),
-}));
-vi.mock("@cap/database/schema", () => ({
-	videos: { id: "videos.id" },
-	videoProcessingJobs: { videoId: "jobs.videoId" },
-	videoUploads: { videoId: "uploads.videoId" },
 }));
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({ MEDIA_SERVER_WEBHOOK_SECRET: mocks.secret }),
@@ -33,10 +41,6 @@ vi.mock("@cap/web-backend", () => ({
 }));
 vi.mock("@cap/web-backend/src/Storage/index", () => ({
 	Storage: { getAccessForVideo: mocks.storage },
-}));
-vi.mock("@/lib/desktop-recording-jobs", async (importOriginal) => ({
-	...(await importOriginal<typeof import("@/lib/desktop-recording-jobs")>()),
-	getProcessingState: mocks.getState,
 }));
 vi.mock("@/lib/server", async () => ({
 	runPromise: (await import("effect")).Effect.runPromise,
@@ -150,7 +154,12 @@ describe("media-server multipart fencing", () => {
 	beforeEach(() => {
 		mocks.secret = "media-secret";
 		mocks.rows = [
-			{ id: videoId, ownerId, source: { type: "desktopSegments" } },
+			{
+				id: videoId,
+				ownerId,
+				orgId: "organization",
+				source: { type: "desktopSegments" },
+			},
 		];
 		mocks.getState.mockReset().mockResolvedValue(currentJob());
 		mocks.signPart
@@ -281,13 +290,14 @@ describe("media-server multipart fencing", () => {
 		});
 		const response = await request("abort");
 		expect(response.status).toBe(200);
-		expect(mocks.getState).not.toHaveBeenCalled();
+		expect(mocks.getState).toHaveBeenCalled();
 		expect(mocks.abort).toHaveBeenCalledWith(outputKey, "multipart-upload");
 		expect((await request("sign-part")).status).toBe(409);
 		expect((await request("complete")).status).toBe(409);
 	});
 
 	it("retains the canonical multipart contract for an unfenced legacy worker", async () => {
+		mocks.getState.mockResolvedValue(null);
 		const body = {
 			...payload(),
 			generation: undefined,
@@ -296,7 +306,7 @@ describe("media-server multipart fencing", () => {
 		};
 		expect((await request("sign-part", body)).status).toBe(200);
 		expect((await request("complete", body)).status).toBe(200);
-		expect(mocks.getState).not.toHaveBeenCalled();
+		expect(mocks.getState).toHaveBeenCalled();
 		expect(mocks.complete).toHaveBeenCalledWith(body.key, body.uploadId, {
 			MultipartUpload: {
 				Parts: [
@@ -304,6 +314,7 @@ describe("media-server multipart fencing", () => {
 					{ PartNumber: 2, ETag: '"part-2"' },
 				],
 			},
+			IfNoneMatch: "*",
 		});
 	});
 
@@ -330,7 +341,12 @@ describe("media-server multipart fencing", () => {
 		mocks.rows = [];
 		expect((await request("complete")).status).toBe(404);
 		mocks.rows = [
-			{ id: videoId, ownerId, source: { type: "desktopSegments" } },
+			{
+				id: videoId,
+				ownerId,
+				orgId: "organization",
+				source: { type: "desktopSegments" },
+			},
 		];
 		useStorage("google-drive");
 		expect((await request("complete")).status).toBe(400);

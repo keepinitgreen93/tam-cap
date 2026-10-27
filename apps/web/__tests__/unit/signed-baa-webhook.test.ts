@@ -1,5 +1,5 @@
 import { sendEmail } from "@cap/database/emails/config";
-import { signedBaas, users } from "@cap/database/schema";
+import { signedBaas, users } from "@cap/database/legacy/schema";
 import { STRIPE_SAML_SSO_LEGACY_PRICE_ID } from "@cap/utils";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -31,7 +31,7 @@ function resetDbChain() {
 	mockDbChain.values.mockReturnValue(Promise.resolve());
 }
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/legacy", () => ({
 	db: () => mockDbChain,
 }));
 
@@ -43,7 +43,7 @@ vi.mock("@cap/database/emails/config", () => ({
 	sendEmail: vi.fn(),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/legacy/schema", () => ({
 	developerCreditTransactions: {
 		id: "id",
 		accountId: "accountId",

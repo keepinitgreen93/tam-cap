@@ -1,3 +1,4 @@
+import { isInstanceOrigin } from "../shared/instance";
 import {
 	isOverlayMessage,
 	isRecordingStatusBroadcast,
@@ -32,16 +33,7 @@ const READY_EVENT = "cap-chrome-extension-ready";
 const OPEN_EVENT = "cap-chrome-extension-open";
 
 const isCapWebOrigin = () => {
-	const { hostname, protocol } = window.location;
-	if (protocol !== "http:" && protocol !== "https:") return false;
-
-	return (
-		hostname === "cap.so" ||
-		hostname.endsWith(".cap.so") ||
-		hostname === "localhost" ||
-		hostname === "127.0.0.1" ||
-		hostname === "::1"
-	);
+	return isInstanceOrigin(window.location.href);
 };
 
 const readPhase = (value: unknown): string | null => {

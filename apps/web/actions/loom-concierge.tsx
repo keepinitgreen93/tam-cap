@@ -1,12 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
-import { sendEmail } from "@cap/database/emails/config";
+import { cloudflareAccessPolicy } from "@cap/database/auth/identity";
 import {
-	LoomMigrationRequestEmail,
-	LoomMigrationStatusEmail,
-} from "@cap/database/emails/loom-migration";
-import { nanoId } from "@cap/database/helpers";
+	requireActiveOrganization,
+	requireOrganizationManager,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	importedVideos,
 	loomMigrationImports,
@@ -15,12 +15,19 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { sendEmail } from "@cap/database/emails/config";
+import {
+	LoomMigrationRequestEmail,
+	LoomMigrationStatusEmail,
+} from "@cap/database/emails/loom-migration";
+import { nanoId } from "@cap/database/helpers";
 import { serverEnv } from "@cap/env";
 import type { Organisation } from "@cap/web-domain";
-import { and, eq, isNotNull } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import {
+	assertMigrationOperator,
 	getCustomerMigrationRequests,
 	getOperatorMigrationQueue,
 	requireCustomerMigrationAccess,
@@ -39,16 +46,10 @@ import {
 } from "@/lib/loom-migration-state";
 import { isOrganizationOwnerPro } from "@/lib/org-pro";
 
-const SUPPORT_EMAIL = "hello@cap.so";
-
-function affectedRows(result: unknown) {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-}
+const supportEmail = () =>
+	process.env.CAP_RUNTIME === "cloudflare"
+		? cloudflareAccessPolicy().ownerEmail
+		: "hello@cap.so";
 
 function refreshMigrationPages() {
 	revalidatePath("/dashboard/import/loom");
@@ -110,16 +111,32 @@ async function createMigrationRequest({
 
 	const id = nanoId();
 	try {
-		await db()
-			.insert(loomMigrationRequests)
-			.values({
-				id,
-				organizationId,
-				activeOrganizationId: organizationId,
-				requestedByUserId: user.id,
-				workspaceName: normalizedWorkspaceName || null,
-				customerNote: normalizedNote || null,
-			});
+		const database = db();
+		const existingId = await atomic(database, async (snapshot) => {
+			await requireOrganizationManager(snapshot, organizationId, user.id);
+			const [current] = await snapshot.read((reader) =>
+				reader
+					.select({ id: loomMigrationRequests.id })
+					.from(loomMigrationRequests)
+					.where(eq(loomMigrationRequests.activeOrganizationId, organizationId))
+					.limit(1),
+			);
+			if (current) return { statements: [], result: current.id };
+			return {
+				statements: [
+					database.insert(loomMigrationRequests).values({
+						id,
+						organizationId,
+						activeOrganizationId: organizationId,
+						requestedByUserId: user.id,
+						workspaceName: normalizedWorkspaceName || null,
+						customerNote: normalizedNote || null,
+					}),
+				],
+				result: null,
+			};
+		});
+		if (existingId) return { id: existingId, alreadyRequested: true };
 	} catch (error) {
 		const [racedRequest] = await db()
 			.select({ id: loomMigrationRequests.id })
@@ -139,7 +156,7 @@ async function createMigrationRequest({
 		.limit(1);
 	try {
 		const delivery = await sendEmail({
-			email: SUPPORT_EMAIL,
+			email: supportEmail(),
 			subject: `New Loom migration request: ${organization?.name ?? "Cap workspace"}`,
 			react: (
 				<LoomMigrationRequestEmail
@@ -171,25 +188,41 @@ export async function confirmLoomMigrationInvite(requestId: string) {
 
 async function markMigrationInviteSent(requestId: string) {
 	const request = await findMigration(requestId);
-	await requireCustomerMigrationAccess(request.organizationId);
+	const user = await requireCustomerMigrationAccess(request.organizationId);
 	if (request.status === "completed") {
 		throw new LoomMigrationError("This migration is already complete.");
 	}
 	if (request.invitedAt) return;
-	const result = await db()
-		.update(loomMigrationRequests)
-		.set({ invitedAt: new Date(), updatedAt: new Date() })
-		.where(
-			and(
-				eq(loomMigrationRequests.id, requestId),
-				isNotNull(loomMigrationRequests.activeOrganizationId),
-			),
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, request.organizationId, user.id);
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(loomMigrationRequests)
+				.where(eq(loomMigrationRequests.id, requestId))
+				.limit(1),
 		);
-	if (affectedRows(result) === 0) {
-		throw new LoomMigrationError(
-			"The migration request changed. Refresh and try again.",
-		);
-	}
+		if (
+			!current ||
+			current.activeOrganizationId !== request.organizationId ||
+			current.status === "completed"
+		)
+			throw new LoomMigrationError(
+				"The migration request changed. Refresh and try again.",
+			);
+		return {
+			statements: current.invitedAt
+				? []
+				: [
+						database
+							.update(loomMigrationRequests)
+							.set({ invitedAt: new Date(), updatedAt: new Date() })
+							.where(eq(loomMigrationRequests.id, requestId)),
+					],
+			result: undefined,
+		};
+	});
 	refreshMigrationPages();
 }
 
@@ -206,28 +239,42 @@ async function saveMigrationAnswer({
 	answer,
 }: LoomMigrationAnswerInput) {
 	const request = await findMigration(requestId);
-	await requireCustomerMigrationAccess(request.organizationId);
+	const user = await requireCustomerMigrationAccess(request.organizationId);
 	const normalizedAnswer = normalizeMigrationText(answer, "Answer", 2000);
 	if (!normalizedAnswer)
 		throw new LoomMigrationError("Enter the information Cap asked for.");
-	const result = await db()
-		.update(loomMigrationRequests)
-		.set({
-			customerReply: normalizedAnswer,
-			status: "pending",
-			updatedAt: new Date(),
-		})
-		.where(
-			and(
-				eq(loomMigrationRequests.id, requestId),
-				eq(loomMigrationRequests.status, "needs_information"),
-			),
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, request.organizationId, user.id);
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(loomMigrationRequests)
+				.where(eq(loomMigrationRequests.id, requestId))
+				.limit(1),
 		);
-	if (affectedRows(result) === 0) {
-		throw new LoomMigrationError(
-			"The migration request changed. Refresh and try again.",
-		);
-	}
+		if (
+			!current ||
+			current.status !== "needs_information" ||
+			current.activeOrganizationId !== request.organizationId
+		)
+			throw new LoomMigrationError(
+				"The migration request changed. Refresh and try again.",
+			);
+		return {
+			statements: [
+				database
+					.update(loomMigrationRequests)
+					.set({
+						customerReply: normalizedAnswer,
+						status: "pending",
+						updatedAt: new Date(),
+					})
+					.where(eq(loomMigrationRequests.id, requestId)),
+			],
+			result: undefined,
+		};
+	});
 	refreshMigrationPages();
 }
 
@@ -292,19 +339,23 @@ async function saveMigrationStatus({
 		.from(organizations)
 		.where(eq(organizations.id, request.organizationId))
 		.limit(1);
-	await db().transaction(async (tx) => {
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await assertMigrationOperator(snapshot, operator.id);
+		await requireActiveOrganization(snapshot, request.organizationId);
 		const now = new Date();
-		const [current] = await tx
-			.select({
-				status: loomMigrationRequests.status,
-				activeOrganizationId: loomMigrationRequests.activeOrganizationId,
-				activeImportCount: loomMigrationRequests.activeImportCount,
-				activeImportLeaseUntil: loomMigrationRequests.activeImportLeaseUntil,
-			})
-			.from(loomMigrationRequests)
-			.where(eq(loomMigrationRequests.id, requestId))
-			.limit(1)
-			.for("update");
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select({
+					status: loomMigrationRequests.status,
+					activeOrganizationId: loomMigrationRequests.activeOrganizationId,
+					activeImportCount: loomMigrationRequests.activeImportCount,
+					activeImportLeaseUntil: loomMigrationRequests.activeImportLeaseUntil,
+				})
+				.from(loomMigrationRequests)
+				.where(eq(loomMigrationRequests.id, requestId))
+				.limit(1),
+		);
 		const importStarting =
 			!!current &&
 			current.activeImportCount > 0 &&
@@ -319,50 +370,58 @@ async function saveMigrationStatus({
 			);
 		}
 		if (nextStatus === "completed") {
-			const imports = await tx
-				.select({
-					videoId: videos.id,
-					videoOrganizationId: videos.orgId,
-					mappingId: importedVideos.id,
-					mappingOrganizationId: importedVideos.orgId,
-					source: importedVideos.source,
-					phase: videoUploads.phase,
-				})
-				.from(loomMigrationImports)
-				.leftJoin(videos, eq(videos.id, loomMigrationImports.videoId))
-				.leftJoin(
-					importedVideos,
-					eq(importedVideos.id, loomMigrationImports.videoId),
-				)
-				.leftJoin(
-					videoUploads,
-					eq(videoUploads.videoId, loomMigrationImports.videoId),
-				)
-				.where(eq(loomMigrationImports.requestId, requestId))
-				.for("share");
+			const imports = await snapshot.read((reader) =>
+				reader
+					.select({
+						videoId: videos.id,
+						videoOrganizationId: videos.orgId,
+						mappingId: importedVideos.id,
+						mappingOrganizationId: importedVideos.orgId,
+						source: importedVideos.source,
+						phase: videoUploads.phase,
+					})
+					.from(loomMigrationImports)
+					.leftJoin(videos, eq(videos.id, loomMigrationImports.videoId))
+					.leftJoin(
+						importedVideos,
+						eq(importedVideos.id, loomMigrationImports.videoId),
+					)
+					.leftJoin(
+						videoUploads,
+						eq(videoUploads.videoId, loomMigrationImports.videoId),
+					)
+					.where(eq(loomMigrationImports.requestId, requestId)),
+			);
 			validateLoomMigrationInventory({
 				organizationId: request.organizationId,
 				imports,
 			});
 		}
-		await tx
-			.update(loomMigrationRequests)
-			.set({
-				status: nextStatus,
-				capMessage: normalizedMessage || null,
-				expectedVideoCount,
-				importedVideoCount,
-				activeImportCount: nextStatus === "completed" ? 0 : undefined,
-				activeImportLeaseToken: nextStatus === "completed" ? null : undefined,
-				activeImportLeaseUntil: nextStatus === "completed" ? null : undefined,
-				activeOrganizationId:
-					nextStatus === "completed" ? null : request.organizationId,
-				completedAt: nextStatus === "completed" ? now : null,
-				lastOperatorUserId: operator.id,
-				lastOperatorAt: now,
-				updatedAt: now,
-			})
-			.where(eq(loomMigrationRequests.id, requestId));
+		return {
+			statements: [
+				database
+					.update(loomMigrationRequests)
+					.set({
+						status: nextStatus,
+						capMessage: normalizedMessage || null,
+						expectedVideoCount,
+						importedVideoCount,
+						activeImportCount: nextStatus === "completed" ? 0 : undefined,
+						activeImportLeaseToken:
+							nextStatus === "completed" ? null : undefined,
+						activeImportLeaseUntil:
+							nextStatus === "completed" ? null : undefined,
+						activeOrganizationId:
+							nextStatus === "completed" ? null : request.organizationId,
+						completedAt: nextStatus === "completed" ? now : null,
+						lastOperatorUserId: operator.id,
+						lastOperatorAt: now,
+						updatedAt: now,
+					})
+					.where(eq(loomMigrationRequests.id, requestId)),
+			],
+			result: undefined,
+		};
 	});
 
 	const customerVisibleChange =
@@ -388,7 +447,7 @@ async function saveMigrationStatus({
 						dashboardUrl={`${serverEnv().WEB_URL}/dashboard/import/loom`}
 					/>
 				),
-				replyTo: SUPPORT_EMAIL,
+				replyTo: supportEmail(),
 				idempotencyKey: `loom-migration-status-${requestId}-${Date.now()}`,
 			});
 			if (delivery?.error) {

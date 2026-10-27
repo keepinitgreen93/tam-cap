@@ -1,14 +1,18 @@
 "use server";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { users } from "@cap/database/schema";
+import { users } from "@cap/database/legacy/schema";
 import { serverEnv } from "@cap/env";
 import { stripe } from "@cap/utils";
 import { eq } from "drizzle-orm";
 import type Stripe from "stripe";
 
 export async function manageBilling() {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor billing is unavailable on this self-hosted instance",
+		);
 	const user = await getCurrentUser();
 	let customerId = user?.stripeCustomerId;
 

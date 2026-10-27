@@ -1,3 +1,5 @@
+vi.mock("server-only", () => ({}));
+
 import {
 	type CloudflareDatabase,
 	createCloudflareDb,

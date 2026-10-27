@@ -10,11 +10,9 @@ const mocks = vi.hoisted(() => ({
 	dispatchFailure: vi.fn(),
 	transcribe: vi.fn(),
 }));
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({ select: () => ({ from: () => ({ where: async () => [] }) }) }),
 }));
-vi.mock("@cap/database/schema", () => ({ users: {}, videos: {} }));
-vi.mock("drizzle-orm", () => ({ eq: vi.fn() }));
 vi.mock("workflow/api", () => ({ start: mocks.start }));
 vi.mock("@/lib/ai-generation-entitlement", () => ({
 	isAiGenerationEnabledForUser: () => false,

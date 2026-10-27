@@ -1,11 +1,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+	AUTH_KEY,
 	type FailedRecording,
+	loadAuth,
 	loadFailedRecordings,
 	loadOverlayTokens,
+	loadSettings,
 	loadSharedRecordingState,
 	loadSharedUiState,
 	registerOverlayToken,
+	saveAuth,
+	saveSettings,
 	saveSharedRecordingState,
 	updateSharedUiState,
 	upsertFailedRecording,
@@ -74,6 +79,33 @@ beforeEach(() => {
 });
 
 describe("storage read-modify-write serialization", () => {
+	it("binds stored credentials to their instance and discards unscoped legacy keys", async () => {
+		const settings = {
+			...(await loadSettings()),
+			apiBaseUrl: "https://videos.example.com",
+		};
+		await saveSettings(settings);
+		await saveAuth({
+			authApiKey: "synthetic",
+			userId: "user",
+			apiOrigin: settings.apiBaseUrl,
+		});
+		expect(await loadAuth()).toMatchObject({ apiOrigin: settings.apiBaseUrl });
+		await saveSettings({
+			...settings,
+			apiBaseUrl: "https://staging.example.com",
+		});
+		expect(await loadAuth()).toBeNull();
+		await saveSettings(settings);
+		expect(await loadAuth()).toBeNull();
+		await new Promise<void>((resolve) =>
+			chrome.storage.local.set(
+				{ [AUTH_KEY]: { authApiKey: "old-unscoped-key", userId: "user" } },
+				resolve,
+			),
+		);
+		expect(await loadAuth()).toBeNull();
+	});
 	it("keeps every overlay token registered by concurrent calls", async () => {
 		await Promise.all([
 			registerOverlayToken("token-a"),

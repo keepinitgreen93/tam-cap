@@ -4,6 +4,8 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
+		"build:self-hosted": "node scripts/build-self-hosted.mjs production",
+		"build:staging": "node scripts/build-self-hosted.mjs staging",
 		"build": "rm -rf dist && vite build && vite build --config vite.content.config.ts && vite build --config vite.content-overlay.config.ts",
 		"dev": "rm -rf dist && (trap 'kill 0' INT TERM; vite build --watch --config vite.content.config.ts --mode development & vite build --watch --config vite.content-overlay.config.ts --mode development & vite build --watch --mode development & wait)",
 		"typecheck": "tsc --noEmit",

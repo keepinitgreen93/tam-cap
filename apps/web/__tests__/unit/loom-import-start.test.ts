@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	importerJobState: vi.fn(),
 	where: vi.fn(),
+	writeReceipt: vi.fn(),
 	set: vi.fn(),
 	queue: vi.fn(),
 	start: vi.fn(),
@@ -11,10 +12,15 @@ const mocks = vi.hoisted(() => ({
 	mediaJobFailed: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
-	db: () => ({ update: () => ({ set: mocks.set }) }),
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => ({
+		update: () => ({ set: mocks.set }),
+		select: () => ({
+			from: () => ({ where: () => ({ limit: async () => [{}] }) }),
+		}),
+	}),
 }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	videos: { id: "videoId", ownerId: "ownerId", metadata: "metadata" },
 	videoUploads: {
 		videoId: "uploadVideoId",
@@ -40,6 +46,9 @@ vi.mock("@/lib/loom-media-dispatch", () => ({
 	isLoomMediaJobFailed: mocks.mediaJobFailed,
 	getLoomImporterJobState: mocks.importerJobState,
 }));
+vi.mock("@/lib/loom-import-state", () => ({
+	writeLoomImportReceipt: mocks.writeReceipt,
+}));
 vi.mock("@/workflows/import-loom-video", () => ({
 	importLoomVideoWorkflow: vi.fn(),
 }));
@@ -63,7 +72,8 @@ describe("Loom workflow startup receipts", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
 		mocks.set.mockReturnValue({ where: mocks.where });
-		mocks.where.mockResolvedValue([{ affectedRows: 1 }]);
+		mocks.where.mockResolvedValue({ meta: { changes: 1 } });
+		mocks.writeReceipt.mockResolvedValue(true);
 		mocks.queue.mockResolvedValue({ messageId: "message-1" });
 		mocks.getWorld.mockReturnValue({ queue: mocks.queue });
 		mocks.mediaJobFailed.mockResolvedValue(false);
@@ -175,39 +185,41 @@ describe("Loom workflow startup receipts", () => {
 
 	it("records the run before dispatch and stores queue acceptance", async () => {
 		await startLoomImportWorkflow(payload);
-		expect(
-			mocks.set.mock.calls.map(([value]) =>
-				JSON.parse(value.metadata.values.at(-1)),
-			),
-		).toEqual([
-			{ runId: "run-1", dispatch: "pending" },
-			{ runId: "run-1", dispatch: "accepted" },
+		expect(mocks.writeReceipt.mock.calls.map((call) => call[2])).toEqual([
+			{ runId: "run-1", workflowQueue: "workflow-loom", dispatch: "pending" },
+			{ runId: "run-1", workflowQueue: "workflow-loom", dispatch: "accepted" },
 		]);
-		expect(mocks.where.mock.invocationCallOrder[0]).toBeLessThan(
+		expect(mocks.writeReceipt.mock.invocationCallOrder[0]).toBeLessThan(
 			mocks.queue.mock.invocationCallOrder[0] ?? 0,
 		);
 	});
 
 	it("keeps an operator import's bulk lane on its startup receipt", async () => {
 		await startLoomImportWorkflow({ ...payload, importPriority: "bulk" });
-		expect(
-			mocks.set.mock.calls.map(([value]) =>
-				JSON.parse(value.metadata.values.at(-1)),
-			),
-		).toEqual([
-			{ runId: "run-1", dispatch: "pending", importPriority: "bulk" },
-			{ runId: "run-1", dispatch: "accepted", importPriority: "bulk" },
+		expect(mocks.writeReceipt.mock.calls.map((call) => call[2])).toEqual([
+			{
+				runId: "run-1",
+				workflowQueue: "workflow-loom",
+				dispatch: "pending",
+				importPriority: "bulk",
+			},
+			{
+				runId: "run-1",
+				workflowQueue: "workflow-loom",
+				dispatch: "accepted",
+				importPriority: "bulk",
+			},
 		]);
 	});
 
 	it("does not overwrite a newer import startup receipt", async () => {
-		mocks.where
-			.mockResolvedValueOnce([{ affectedRows: 1 }])
-			.mockResolvedValueOnce([{ affectedRows: 0 }]);
+		mocks.writeReceipt.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
 		await expect(startLoomImportWorkflow(payload)).resolves.toBeUndefined();
-		const condition = mocks.where.mock.calls.at(-1)?.[0].conditions.at(-1);
-		expect(condition.values).toEqual(["metadata", "run-1"]);
-		expect(condition.strings.join("")).toContain("$.loomImportRun.runId");
+		expect(mocks.writeReceipt.mock.calls[0]?.[3]).toBeNull();
+		expect(mocks.writeReceipt.mock.calls.at(-1)?.[2]).toMatchObject({
+			runId: "run-1",
+			dispatch: "accepted",
+		});
 	});
 
 	it.each([
@@ -222,9 +234,11 @@ describe("Loom workflow startup receipts", () => {
 		await expect(startLoomImportWorkflow(payload)).rejects.toMatchObject({
 			canRetry: true,
 		});
-		expect(
-			JSON.parse(mocks.set.mock.calls.at(-1)?.[0].metadata.values.at(-1)),
-		).toEqual({ runId: "run-1", dispatch: "rejected" });
+		expect(mocks.writeReceipt.mock.calls.at(-1)?.[2]).toEqual({
+			runId: "run-1",
+			workflowQueue: "workflow-loom",
+			dispatch: "rejected",
+		});
 	});
 
 	it("preserves an uncertain queue acknowledgement without allowing another dispatch", async () => {
@@ -232,9 +246,11 @@ describe("Loom workflow startup receipts", () => {
 		await expect(startLoomImportWorkflow(payload)).rejects.toMatchObject({
 			canRetry: false,
 		});
-		expect(
-			JSON.parse(mocks.set.mock.calls.at(-1)?.[0].metadata.values.at(-1)),
-		).toEqual({ runId: "run-1", dispatch: "uncertain" });
+		expect(mocks.writeReceipt.mock.calls.at(-1)?.[2]).toEqual({
+			runId: "run-1",
+			workflowQueue: "workflow-loom",
+			dispatch: "uncertain",
+		});
 	});
 
 	it("does not treat a run creation error as a rejected queue message", async () => {
@@ -258,10 +274,7 @@ describe("Loom workflow startup receipts", () => {
 			},
 		);
 		await expect(startLoomImportWorkflow(payload)).resolves.toBeUndefined();
-		expect(
-			JSON.parse(mocks.set.mock.calls.at(-1)?.[0].metadata.values.at(-1))
-				.dispatch,
-		).toBe("accepted");
+		expect(mocks.writeReceipt.mock.calls.at(-1)?.[2].dispatch).toBe("accepted");
 	});
 
 	it("allows retry when startup fails before dispatch", async () => {
@@ -274,7 +287,7 @@ describe("Loom workflow startup receipts", () => {
 	});
 
 	it("does not send a job when its run receipt cannot be saved", async () => {
-		mocks.where.mockResolvedValueOnce([{ affectedRows: 0 }]);
+		mocks.writeReceipt.mockResolvedValueOnce(false);
 		await expect(startLoomImportWorkflow(payload)).rejects.toMatchObject({
 			canRetry: true,
 		});
@@ -285,8 +298,8 @@ describe("Loom workflow startup receipts", () => {
 		mocks.queue.mockRejectedValueOnce(
 			Object.assign(new Error("Queue rejected"), { name: "ForbiddenError" }),
 		);
-		mocks.where
-			.mockResolvedValueOnce([{ affectedRows: 1 }])
+		mocks.writeReceipt
+			.mockResolvedValueOnce(true)
 			.mockRejectedValueOnce(new Error("Database unavailable"));
 		await expect(startLoomImportWorkflow(payload)).rejects.toMatchObject({
 			canRetry: false,
@@ -308,6 +321,27 @@ describe("Loom workflow startup receipts", () => {
 			);
 		},
 	);
+
+	it("requeues a pending durable receipt without creating a new workflow", async () => {
+		mocks.getRun.mockReturnValue({
+			status: Promise.resolve("pending"),
+			createdAt: Promise.resolve(new Date()),
+		});
+		expect(
+			await getLoomImportRunState({
+				runId: "run-1",
+				dispatch: "uncertain",
+				workflowQueue: "workflow-loom",
+				deploymentId: "deployment",
+			}),
+		).toBe("pending");
+		expect(mocks.queue).toHaveBeenCalledWith(
+			"workflow-loom",
+			{ runId: "run-1" },
+			{ deploymentId: "deployment" },
+		);
+		expect(mocks.start).not.toHaveBeenCalled();
+	});
 
 	it("cancels a run that never left pending and treats it as inactive", async () => {
 		const run = {

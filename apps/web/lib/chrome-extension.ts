@@ -1,5 +1,7 @@
 export const CAP_CHROME_EXTENSION_URL =
-	"https://chromewebstore.google.com/detail/cap-screen-recorder-scree/fefjaffcodfiogbbngmjkcjpbpclbdcp";
+	process.env.NEXT_PUBLIC_IS_CAP === "true"
+		? "https://chromewebstore.google.com/detail/cap-screen-recorder-scree/fefjaffcodfiogbbngmjkcjpbpclbdcp"
+		: "/download#chrome";
 
 export const CHROME_EXTENSION_BUTTON_CLASS =
 	"border-gray-6 bg-gray-1 text-gray-12 shadow-[0_1px_2px_rgba(0,0,0,0.08)] hover:border-gray-7 hover:bg-gray-2";

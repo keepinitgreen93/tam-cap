@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({
 	remove: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({ from: () => ({ where: mocks.where }) }),
 	}),
@@ -45,6 +45,15 @@ describe("completed Loom file cleanup", () => {
 
 	afterEach(() => {
 		vi.restoreAllMocks();
+		vi.unstubAllEnvs();
+	});
+
+	it("retains the original upload on Cloudflare", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		const { cleanupLoomFileSource } = await import("@/lib/loom-file-cleanup");
+		await cleanupLoomFileSource(input);
+		expect(mocks.where).not.toHaveBeenCalled();
+		expect(mocks.remove).not.toHaveBeenCalled();
 	});
 
 	it("removes only the owned source after finding a completed output", async () => {

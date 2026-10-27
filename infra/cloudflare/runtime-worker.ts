@@ -4,6 +4,7 @@ import {
 	decode,
 	encode,
 } from "../../packages/workflow-cloudflare/transport.mjs";
+import { downloadArtifact } from "./downloads";
 import { runMaintenance } from "./maintenance";
 import { applicationHeaders } from "./request-headers";
 import { webEnvironment } from "./runtime-env";
@@ -14,6 +15,7 @@ export { CapWorkflowStore } from "./workflow-store.mjs";
 interface RuntimeBindings {
 	DB: D1Database;
 	ANALYTICS_DB: D1Database;
+	DOWNLOADS: R2Bucket;
 	CAP_WEB: DurableObjectNamespace<CapWeb>;
 	CAP_MEDIA: DurableObjectNamespace<CapMedia>;
 	CAP_WORKFLOW: DurableObjectNamespace;
@@ -173,6 +175,8 @@ export default {
 			});
 		}
 		const headers = applicationHeaders(request, request.cf);
+		if (path.startsWith("/downloads/"))
+			return downloadArtifact(request, path, env.DOWNLOADS, isPreview);
 		const response = await getContainer(env.CAP_WEB, "primary").fetch(
 			new Request(request, { headers }),
 		);

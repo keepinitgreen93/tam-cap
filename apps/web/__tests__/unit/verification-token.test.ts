@@ -1,16 +1,16 @@
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
 import type { SQL } from "drizzle-orm";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
-import type { MySql2Database } from "drizzle-orm/mysql2";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { describe, expect, it } from "vitest";
 import { DrizzleAdapter } from "../../../../packages/database/auth/drizzle-adapter";
 
 type TokenRow = { identifier: string; token: string; expires: Date };
 
 function matchesPredicate(condition: SQL, row: TokenRow) {
-	const query = new MySqlDialect().sqlToQuery(condition);
+	const query = new SQLiteSyncDialect().sqlToQuery(condition);
 	const columns = [
 		...query.sql.matchAll(
-			/`verification_tokens`\.`(identifier|token)`\s*=\s*\?/g,
+			/"verification_tokens"\."(identifier|token)"\s*=\s*\?/g,
 		),
 	].map((match) => match[1] as "identifier" | "token");
 	if (columns.length === 0) {
@@ -40,14 +40,14 @@ function fakeDatabase(
 			where: async (condition: SQL) => {
 				if (row && matchesPredicate(condition, row)) {
 					row = undefined;
-					return [{ affectedRows: 1 }];
+					return { meta: { changes: 1 } };
 				}
-				return [{ affectedRows: 0 }];
+				return { meta: { changes: 0 } };
 			},
 		}),
 	};
 	return {
-		db: db as unknown as MySql2Database,
+		db: db as unknown as CloudflareDatabase,
 		getRow: () => row,
 		setRow: (next: TokenRow) => {
 			row = next;

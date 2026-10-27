@@ -1,0 +1,14 @@
+{
+	"production": {
+		"apiBaseUrl": "https://videos.trulyauthenticmarketing.com",
+		"name": "TAM Cap - Screen Recorder",
+		"key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzYgXKidS/XpjWlf/bzGjx/lzk6nQczcE3gn0jf9PnTYBCWpt8ZUaEolnEuBWdgmAeipNWUsOmM3kQ6DQx1bxoCk2gNy24jIPnn95C/t5kbnUizXWnI98+qEKp2omJVBBJ8cn9wz+c+nShdy07gWMGVCHTk01StjjI55Nr3Ip3JZqJig2TdsrU78vJ/KNxpXnj0Y3TNsG/I7OuAdt/dphcPU5irQhT26XtRQWwM2VkKCYogLah+rY72/Fif2pEChE5OKTOIvvDKouiGU1Hs53S6YdZ63h5IqGDXI02KuRzvD8a86A8N5M/upIVPlZ3l4J2nAqprTpxMem4EQ8IuFkSwIDAQAB",
+		"extensionId": "ffocnmodhfclminiaapbfapkehcppkga"
+	},
+	"staging": {
+		"apiBaseUrl": "https://tam-cap-app.ciglesia.workers.dev",
+		"name": "TAM Cap Staging - Screen Recorder",
+		"key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAsCzgL07aIV6Al19i1hmeYA4X5BO2AjI5l40MO0rOGwQykd96MJMhJC3lCOd8snkN3NISnf84sXzVnb2LXHxWUUhqP8tekMCwS8STch1ibKiuyU15VdnF+TQEkH1qpw+H864gs+1waP3iiZiiqNJQfUlhsAWOfTZTOm2mnA5qCw2a1Bk56S15dbqoMlOu2J/bN8GBWRenI1HZ+YFx4i3DpoH/k8CamRxIpHkt4NPhZZc5aOh/IIaPVG3GIh7+A+EADgu+M5QTPm9MPIw7iW0/MLHIHySgrecrnqicPaqqYfcnnGDUqDJnBGVuz64lCmpG29bP9br1Ve3keyB7oEVy+QIDAQAB",
+		"extensionId": "ajkhoihmncjajolcphcjlnoooccldadm"
+	}
+}

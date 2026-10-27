@@ -1,17 +1,17 @@
-import { db } from "@cap/database";
-import * as Db from "@cap/database/schema";
-import { Storage } from "@cap/web-backend/src/Storage/index";
+import { isDeepStrictEqual } from "node:util";
 import {
-	Folder,
-	Organisation,
-	S3Bucket,
-	Space,
-	Storage as StorageDomain,
-	User,
-	Video,
-} from "@cap/web-domain";
-import { and, eq, inArray, isNull, like, notInArray, sql } from "drizzle-orm";
-import { Option } from "effect";
+	requireOrganizationManager,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	type AtomicSnapshot,
+	type AtomicStatement,
+	atomic,
+} from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
+import { Folder, Organisation, Space, User, Video } from "@cap/web-domain";
+import { and, eq, isNull, not, or, sql } from "drizzle-orm";
 import { FatalError } from "workflow";
 import {
 	CONTENT_TRANSFER_KIND,
@@ -20,11 +20,20 @@ import {
 	type ContentTransferUploadPhase,
 	type ContentTransferVideoPlan,
 	getContentTransferStorageBlockReason,
+	isContentTransferProgress,
 	MAX_CONTENT_TRANSFER_FOLDERS,
 	MAX_CONTENT_TRANSFER_VIDEOS,
 } from "@/lib/content-transfer";
+import { decodeContentTransferPayload } from "@/lib/content-transfer-payload";
 import { enqueueVideoStorageNameSync } from "@/lib/sync-video-storage-names";
-import { runWorkflowPromise } from "@/lib/workflow-runtime";
+import {
+	loadVideoOwnershipTransfer,
+	planVideoOwnershipTransfer,
+	prepareVideoOwnershipTransfer,
+	retainedOwnershipTransferMediaReason,
+	type VideoOwnershipTransferState,
+} from "@/lib/video-ownership-transfer";
+import { inJsonArray } from "@/utils/sql";
 
 const CONTENT_TRANSFER_UPLOAD_PHASES = new Set<ContentTransferUploadPhase>([
 	"uploading",
@@ -35,6 +44,7 @@ const CONTENT_TRANSFER_UPLOAD_PHASES = new Set<ContentTransferUploadPhase>([
 ]);
 
 function parsePayload(value: unknown): ContentTransferPayload {
+	value = decodeContentTransferPayload(value);
 	if (!value || typeof value !== "object") {
 		throw new FatalError("Content transfer payload is invalid");
 	}
@@ -129,41 +139,6 @@ function parsePayload(value: unknown): ContentTransferPayload {
 	return payload as ContentTransferPayload;
 }
 
-function canManageContentTransfer(role: string | null | undefined) {
-	return role === "owner" || role === "admin";
-}
-
-function makeStorageVideo(input: {
-	id: string;
-	ownerId: string;
-	orgId: string;
-	bucketId: string | null;
-	storageIntegrationId: string | null;
-}) {
-	return Video.Video.make({
-		id: Video.VideoId.make(input.id),
-		ownerId: User.UserId.make(input.ownerId),
-		orgId: Organisation.OrganisationId.make(input.orgId),
-		name: "Content transfer",
-		public: false,
-		source: { type: "MediaConvert" },
-		metadata: Option.none(),
-		bucketId: Option.fromNullable(input.bucketId).pipe(
-			Option.map(S3Bucket.S3BucketId.make),
-		),
-		storageIntegrationId: Option.fromNullable(input.storageIntegrationId).pipe(
-			Option.map(StorageDomain.StorageIntegrationId.make),
-		),
-		folderId: Option.none(),
-		transcriptionStatus: Option.none(),
-		width: Option.none(),
-		height: Option.none(),
-		duration: Option.none(),
-		createdAt: new Date(0),
-		updatedAt: new Date(0),
-	});
-}
-
 function initialProgress(
 	payload: ContentTransferPayload,
 ): ContentTransferProgress {
@@ -180,157 +155,154 @@ function initialProgress(
 	};
 }
 
-async function claimOperation(operationId: string) {
-	"use step";
-
-	return db().transaction(async (tx) => {
-		const [operation] = await tx
+async function requireTransferAccess(
+	snapshot: AtomicSnapshot,
+	operationId: string,
+	payload: ContentTransferPayload,
+) {
+	const [operation] = await snapshot.read((reader) =>
+		reader
 			.select()
 			.from(Db.agentApiOperations)
 			.where(eq(Db.agentApiOperations.id, operationId))
-			.limit(1)
-			.for("update");
-		if (!operation)
-			throw new FatalError("Content transfer operation not found");
-		if (operation.kind !== CONTENT_TRANSFER_KIND) {
-			throw new FatalError("Operation is not a content transfer");
-		}
-		if (operation.state !== "queued") return null;
-		const payload = parsePayload(operation.payload);
-		const organizationId = Organisation.OrganisationId.make(
-			payload.organizationId,
+			.limit(1),
+	);
+	if (
+		!operation ||
+		operation.kind !== CONTENT_TRANSFER_KIND ||
+		operation.resourceId !== payload.organizationId ||
+		operation.userId !== payload.requestedByUserId ||
+		operation.state !== "running" ||
+		!isDeepStrictEqual(parsePayload(operation.payload), payload)
+	)
+		throw new FatalError("Content transfer operation is no longer active");
+	await requireOrganizationManager(
+		snapshot,
+		Organisation.OrganisationId.make(payload.organizationId),
+		User.UserId.make(payload.requestedByUserId),
+	);
+	await requireOrganizationMember(
+		snapshot,
+		Organisation.OrganisationId.make(payload.organizationId),
+		User.UserId.make(payload.targetUserId),
+	);
+	return operation;
+}
+
+async function claimOperation(operationId: string) {
+	"use step";
+	const database = db(),
+		now = new Date();
+	return atomic(database, async (snapshot) => {
+		const [operation] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(Db.agentApiOperations)
+				.where(eq(Db.agentApiOperations.id, operationId))
+				.limit(1),
 		);
-		const requestedByUserId = User.UserId.make(payload.requestedByUserId);
-		const targetUserId = User.UserId.make(payload.targetUserId);
+		if (!operation || operation.kind !== CONTENT_TRANSFER_KIND)
+			throw new FatalError("Content transfer operation not found");
+		if (operation.state !== "queued") return { statements: [], result: null };
+		const payload = parsePayload(operation.payload);
 		if (
-			operation.userId !== payload.requestedByUserId ||
-			operation.resourceId !== payload.organizationId
-		) {
+			operation.resourceId !== payload.organizationId ||
+			operation.userId !== payload.requestedByUserId
+		)
 			throw new FatalError("Content transfer operation scope is invalid");
-		}
-
-		const [[organization], [actorMembership], [targetMembership]] =
-			await Promise.all([
-				tx
-					.select({ ownerId: Db.organizations.ownerId })
-					.from(Db.organizations)
-					.where(
-						and(
-							eq(Db.organizations.id, organizationId),
-							isNull(Db.organizations.tombstoneAt),
-						),
-					)
-					.limit(1),
-				tx
-					.select({ role: Db.organizationMembers.role })
-					.from(Db.organizationMembers)
-					.where(
-						and(
-							eq(Db.organizationMembers.organizationId, organizationId),
-							eq(Db.organizationMembers.userId, requestedByUserId),
-						),
-					)
-					.limit(1),
-				tx
-					.select({ id: Db.organizationMembers.id })
-					.from(Db.organizationMembers)
-					.where(
-						and(
-							eq(Db.organizationMembers.organizationId, organizationId),
-							eq(Db.organizationMembers.userId, targetUserId),
-						),
-					)
-					.limit(1),
-			]);
-		if (!organization) throw new FatalError("Organization not found");
-		const actorIsManager =
-			organization.ownerId === payload.requestedByUserId ||
-			canManageContentTransfer(actorMembership?.role);
-		if (!actorIsManager) {
-			throw new FatalError("The requesting user is no longer an administrator");
-		}
-		if (organization.ownerId !== payload.targetUserId && !targetMembership) {
-			throw new FatalError("The destination user is no longer a member");
-		}
-
-		await tx
-			.update(Db.agentApiOperations)
-			.set({
-				state: "running",
-				result: initialProgress(payload),
-				updatedAt: new Date(),
-			})
-			.where(
-				and(
-					eq(Db.agentApiOperations.id, operationId),
-					eq(Db.agentApiOperations.state, "queued"),
-				),
-			);
-		return payload;
+		await requireOrganizationManager(
+			snapshot,
+			Organisation.OrganisationId.make(payload.organizationId),
+			User.UserId.make(payload.requestedByUserId),
+		);
+		await requireOrganizationMember(
+			snapshot,
+			Organisation.OrganisationId.make(payload.organizationId),
+			User.UserId.make(payload.targetUserId),
+		);
+		return {
+			statements: [
+				database
+					.update(Db.agentApiOperations)
+					.set({
+						state: "running",
+						result: initialProgress(payload),
+						updatedAt: now,
+					})
+					.where(eq(Db.agentApiOperations.id, operationId)),
+			],
+			result: payload,
+		};
 	});
 }
 
-async function verifySourceSnapshot(payload: ContentTransferPayload) {
-	"use step";
-
+async function readSourceSnapshot(
+	snapshot: AtomicSnapshot,
+	payload: ContentTransferPayload,
+) {
 	const organizationId = Organisation.OrganisationId.make(
 		payload.organizationId,
-	);
-	const sourceFolderIds = payload.sourceFolderIds.map((id) =>
-		Folder.FolderId.make(id),
 	);
 	const sourceSpaceId =
 		payload.source.type === "organization"
 			? organizationId
 			: Space.SpaceId.make(payload.source.spaceId);
 	if (payload.source.type === "space") {
-		const [sourceSpace] = await db()
-			.select({ id: Db.spaces.id })
-			.from(Db.spaces)
+		const [space] = await snapshot.read((reader) =>
+			reader
+				.select({ id: Db.spaces.id })
+				.from(Db.spaces)
+				.where(
+					and(
+						eq(Db.spaces.id, sourceSpaceId),
+						eq(Db.spaces.organizationId, organizationId),
+					),
+				)
+				.limit(1),
+		);
+		if (!space) throw new FatalError("Source space no longer exists");
+	}
+	const currentFolders = await snapshot.read((reader) =>
+		reader
+			.select()
+			.from(Db.folders)
 			.where(
 				and(
-					eq(Db.spaces.id, sourceSpaceId),
-					eq(Db.spaces.organizationId, organizationId),
+					inJsonArray(Db.folders.id, payload.sourceFolderIds),
+					eq(Db.folders.organizationId, organizationId),
+					eq(Db.folders.spaceId, sourceSpaceId),
 				),
-			)
-			.limit(1);
-		if (!sourceSpace) throw new FatalError("Source space no longer exists");
-	}
-
-	const currentFolders = await db()
-		.select({
-			id: Db.folders.id,
-			name: Db.folders.name,
-			parentId: Db.folders.parentId,
-			color: Db.folders.color,
-			public: Db.folders.public,
-		})
-		.from(Db.folders)
-		.where(
-			and(
-				inArray(Db.folders.id, sourceFolderIds),
-				eq(Db.folders.organizationId, organizationId),
-				eq(Db.folders.spaceId, sourceSpaceId),
 			),
-		);
-	if (currentFolders.length !== payload.folderPlan.length) {
+	);
+	if (currentFolders.length !== payload.folderPlan.length)
 		throw new FatalError("Source folder hierarchy changed after review");
-	}
-	const currentById = new Map(
+	const byId = new Map(
 		currentFolders.map((folder) => [folder.id as string, folder]),
 	);
 	for (const plan of payload.folderPlan) {
-		const current = currentById.get(plan.sourceFolderId);
+		const current = byId.get(plan.sourceFolderId);
 		if (
 			!current ||
 			current.name !== plan.name ||
 			current.parentId !== plan.sourceParentId ||
 			current.color !== plan.color ||
 			current.public !== plan.sourcePublic
-		) {
+		)
 			throw new FatalError("Source folder hierarchy changed after review");
-		}
 	}
+}
+
+async function verifySourceSnapshot(
+	operationId: string,
+	payload: ContentTransferPayload,
+) {
+	"use step";
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireTransferAccess(snapshot, operationId, payload);
+		await readSourceSnapshot(snapshot, payload);
+		return { statements: [], result: undefined };
+	});
 }
 
 async function setOperationProgress(
@@ -354,240 +326,218 @@ async function createDestinationFolders(
 	progress: ContentTransferProgress,
 ) {
 	"use step";
-
 	const nextProgress = { ...progress, phase: "creating_folders" as const };
-	await setOperationProgress(operationId, nextProgress);
-	await db().transaction(async (tx) => {
+	const database = db(),
+		now = Date.now();
+	await atomic(database, async (snapshot) => {
+		await requireTransferAccess(snapshot, operationId, payload);
+		await readSourceSnapshot(snapshot, payload);
 		const organizationId = Organisation.OrganisationId.make(
-			payload.organizationId,
-		);
-		const targetUserId = User.UserId.make(payload.targetUserId);
-		for (const plan of payload.folderPlan) {
-			const destinationFolderId = Folder.FolderId.make(
-				plan.destinationFolderId,
-			);
-			const destinationParentId = plan.destinationParentId
-				? Folder.FolderId.make(plan.destinationParentId)
-				: null;
-			const [existing] = await tx
-				.select({
-					id: Db.folders.id,
-					name: Db.folders.name,
-					parentId: Db.folders.parentId,
-					organizationId: Db.folders.organizationId,
-					createdById: Db.folders.createdById,
-					spaceId: Db.folders.spaceId,
-					public: Db.folders.public,
-				})
-				.from(Db.folders)
-				.where(eq(Db.folders.id, destinationFolderId))
-				.limit(1)
-				.for("update");
-			if (existing) {
-				if (
-					existing.organizationId !== organizationId ||
-					existing.createdById !== targetUserId ||
-					existing.spaceId !== null ||
-					existing.public ||
-					existing.parentId !== destinationParentId ||
-					existing.name.trim().toLocaleLowerCase() !==
-						plan.name.trim().toLocaleLowerCase()
-				) {
-					throw new FatalError("A destination folder changed after review");
-				}
-				continue;
-			}
-			if (!plan.create) {
-				throw new FatalError("A destination folder was removed after review");
-			}
-
-			const parentCondition = destinationParentId
-				? eq(Db.folders.parentId, destinationParentId)
-				: isNull(Db.folders.parentId);
-			const [nameConflict] = await tx
-				.select({ id: Db.folders.id })
+				payload.organizationId,
+			),
+			targetUserId = User.UserId.make(payload.targetUserId);
+		const existing = await snapshot.read((reader) =>
+			reader
+				.select()
 				.from(Db.folders)
 				.where(
-					and(
-						eq(Db.folders.organizationId, organizationId),
-						eq(Db.folders.createdById, targetUserId),
-						isNull(Db.folders.spaceId),
-						parentCondition,
-						eq(Db.folders.name, plan.name),
+					or(
+						inJsonArray(
+							Db.folders.id,
+							payload.folderPlan.map((plan) => plan.destinationFolderId),
+						),
+						and(
+							eq(Db.folders.organizationId, organizationId),
+							eq(Db.folders.createdById, targetUserId),
+							isNull(Db.folders.spaceId),
+						),
 					),
+				),
+		);
+		const byId = new Map(
+			existing.map((folder) => [folder.id as string, folder]),
+		);
+		const names = new Map(
+			existing
+				.filter(
+					(folder) =>
+						folder.organizationId === organizationId &&
+						folder.createdById === targetUserId &&
+						folder.spaceId === null,
 				)
-				.limit(1);
-			if (nameConflict) {
+				.map((folder) => [
+					JSON.stringify([
+						folder.parentId,
+						folder.name.trim().toLocaleLowerCase(),
+					]),
+					folder.id as string,
+				]),
+		);
+		const missing = [];
+		for (const plan of payload.folderPlan) {
+			const folder = byId.get(plan.destinationFolderId);
+			if (folder) {
+				if (
+					folder.organizationId !== organizationId ||
+					folder.createdById !== targetUserId ||
+					folder.spaceId !== null ||
+					folder.public ||
+					folder.parentId !== plan.destinationParentId ||
+					folder.name.trim().toLocaleLowerCase() !==
+						plan.name.trim().toLocaleLowerCase()
+				)
+					throw new FatalError("A destination folder changed after review");
+				continue;
+			}
+			if (!plan.create)
+				throw new FatalError("A destination folder was removed after review");
+			const key = JSON.stringify([
+				plan.destinationParentId,
+				plan.name.trim().toLocaleLowerCase(),
+			]);
+			if (names.has(key))
 				throw new FatalError(
 					"A matching destination folder was created after review",
 				);
-			}
-
-			await tx.insert(Db.folders).values({
-				id: destinationFolderId,
+			names.set(key, plan.destinationFolderId);
+			missing.push({
+				id: plan.destinationFolderId,
+				parentId: plan.destinationParentId,
 				name: plan.name,
 				color: plan.color,
-				public: false,
-				organizationId,
-				createdById: targetUserId,
-				parentId: destinationParentId,
-				spaceId: null,
 			});
 		}
+		const projected = new Set([
+			...byId.keys(),
+			...missing.map((folder) => folder.id),
+		]);
+		if (
+			missing.some(
+				(folder) => folder.parentId && !projected.has(folder.parentId),
+			)
+		)
+			throw new FatalError("A destination parent folder is missing");
+		const statements: AtomicStatement[] = [];
+		if (missing.length)
+			statements.push(
+				database
+					.insert(Db.folders)
+					.select(
+						sql`select json_extract(value,'$.id'),json_extract(value,'$.name'),json_extract(value,'$.color'),0,null,${organizationId},${targetUserId},json_extract(value,'$.parentId'),null,${now},${now} from json_each(${JSON.stringify(missing)})`,
+					),
+			);
+		statements.push(
+			database
+				.update(Db.agentApiOperations)
+				.set({ result: nextProgress, updatedAt: new Date(now) })
+				.where(eq(Db.agentApiOperations.id, operationId)),
+		);
+		return { statements, result: undefined };
 	});
 	return nextProgress;
 }
 
-async function listObjectsForOwner(input: {
-	videoId: string;
-	ownerId: string;
-	organizationId: string;
-	bucketId: string | null;
-	storageIntegrationId: string | null;
-}) {
-	const [bucket] = await Storage.getAccessForVideo(
-		makeStorageVideo({
-			id: input.videoId,
-			ownerId: input.ownerId,
-			orgId: input.organizationId,
-			bucketId: input.bucketId,
-			storageIntegrationId: input.storageIntegrationId,
-		}),
-	).pipe(runWorkflowPromise);
-	const prefix = `${input.ownerId}/${input.videoId}/`;
-	const objects: Array<{ key: string; size: number }> = [];
-	let continuationToken: string | undefined;
-	do {
-		const page = await bucket
-			.listObjects({ prefix, maxKeys: 1_000, continuationToken })
-			.pipe(runWorkflowPromise);
-		for (const object of page.Contents ?? []) {
-			if (!object.Key) continue;
-			let size = object.Size;
-			if (size === undefined) {
-				const head = await bucket
-					.headObject(object.Key)
-					.pipe(runWorkflowPromise);
-				size = head.ContentLength;
-			}
-			if (size === undefined) {
-				throw new FatalError(`Unable to verify source object ${object.Key}`);
-			}
-			objects.push({ key: object.Key, size });
-		}
-		continuationToken = page.IsTruncated
-			? page.NextContinuationToken
-			: undefined;
-	} while (continuationToken);
-	return { bucket, prefix, objects };
+async function readSourceMembership(
+	snapshot: AtomicSnapshot,
+	payload: ContentTransferPayload,
+	item: ContentTransferVideoPlan,
+) {
+	const videoId = Video.VideoId.make(item.videoId);
+	const sourceSpaceId =
+		payload.source.type === "space"
+			? Space.SpaceId.make(payload.source.spaceId)
+			: Organisation.OrganisationId.make(payload.organizationId);
+	return payload.source.type === "organization"
+		? (
+				await snapshot.read((reader) =>
+					reader
+						.select({
+							id: Db.sharedVideos.id,
+							folderId: Db.sharedVideos.folderId,
+						})
+						.from(Db.sharedVideos)
+						.where(
+							and(
+								eq(Db.sharedVideos.id, item.sourceMembershipId),
+								eq(Db.sharedVideos.videoId, videoId),
+								eq(
+									Db.sharedVideos.organizationId,
+									Organisation.OrganisationId.make(payload.organizationId),
+								),
+							),
+						)
+						.limit(1),
+				)
+			)[0]
+		: (
+				await snapshot.read((reader) =>
+					reader
+						.select({
+							id: Db.spaceVideos.id,
+							folderId: Db.spaceVideos.folderId,
+						})
+						.from(Db.spaceVideos)
+						.where(
+							and(
+								eq(Db.spaceVideos.id, item.sourceMembershipId),
+								eq(Db.spaceVideos.videoId, videoId),
+								eq(Db.spaceVideos.spaceId, sourceSpaceId),
+							),
+						)
+						.limit(1),
+				)
+			)[0];
 }
 
-async function copyAndVerifyObjects({
-	payload,
-	item,
-	allowDestinationSuperset,
-}: {
-	payload: ContentTransferPayload;
-	item: ContentTransferVideoPlan;
-	allowDestinationSuperset: boolean;
-}) {
-	const listed = await listObjectsForOwner({
-		videoId: item.videoId,
-		ownerId: item.sourceOwnerId,
-		organizationId: payload.organizationId,
-		bucketId: item.bucketId,
-		storageIntegrationId: item.storageIntegrationId,
-	});
-	const destination = await listObjectsForOwner({
-		videoId: item.videoId,
-		ownerId: payload.targetUserId,
-		organizationId: payload.organizationId,
-		bucketId: item.bucketId,
-		storageIntegrationId: item.storageIntegrationId,
-	});
-	if (listed.objects.length === 0) {
-		if (allowDestinationSuperset && destination.objects.length > 0) {
-			return {
-				...listed,
-				copiedObjects: 0,
-				destinationPrefix: destination.prefix,
-			};
-		}
-		throw new FatalError(`No media objects were found for ${item.name}`);
-	}
-	const destinationSizes = new Map(
-		destination.objects.map((object) => [object.key, object.size]),
-	);
-	const expectedDestinationKeys = new Set(
-		listed.objects.map((object) =>
-			object.key.replace(listed.prefix, destination.prefix),
-		),
-	);
+function assertTransferVideo(
+	current: VideoOwnershipTransferState,
+	payload: ContentTransferPayload,
+	item: ContentTransferVideoPlan,
+) {
+	const video = current.video;
 	if (
-		!allowDestinationSuperset &&
-		destination.objects.some(
-			(object) => !expectedDestinationKeys.has(object.key),
-		)
-	) {
-		throw new FatalError(`Destination media conflicts with ${item.name}`);
-	}
-	let copiedObjects = 0;
-	for (let index = 0; index < listed.objects.length; index += 4) {
-		const chunk = listed.objects.slice(index, index + 4);
-		const copied = await Promise.all(
-			chunk.map(async (object) => {
-				const destinationKey = object.key.replace(
-					listed.prefix,
-					destination.prefix,
-				);
-				const existingSize = destinationSizes.get(destinationKey) ?? null;
-				if (existingSize === object.size) return 0;
-
-				await listed.bucket
-					.copyObject(
-						`${listed.bucket.bucketName}/${object.key}`,
-						destinationKey,
-					)
-					.pipe(runWorkflowPromise);
-				const destinationHead = await listed.bucket
-					.headObject(destinationKey)
-					.pipe(runWorkflowPromise);
-				if (destinationHead.ContentLength !== object.size) {
-					throw new FatalError(`Copied object size mismatch for ${item.name}`);
-				}
-				return 1;
-			}),
-		);
-		copiedObjects += copied.reduce<number>((total, count) => total + count, 0);
-	}
-	return { ...listed, copiedObjects, destinationPrefix: destination.prefix };
-}
-
-async function getCurrentVideo(item: ContentTransferVideoPlan) {
-	const [video] = await db()
-		.select({
-			id: Db.videos.id,
-			ownerId: Db.videos.ownerId,
-			orgId: Db.videos.orgId,
-			folderId: Db.videos.folderId,
-			bucketId: Db.videos.bucket,
-			bucketOwnerId: Db.s3Buckets.ownerId,
-			bucketOrganizationId: Db.s3Buckets.organizationId,
-			storageIntegrationId: Db.videos.storageIntegrationId,
-			storageIntegrationOwnerId: Db.storageIntegrations.ownerId,
-			storageIntegrationOrganizationId: Db.storageIntegrations.organizationId,
-			uploadPhase: Db.videoUploads.phase,
-		})
-		.from(Db.videos)
-		.leftJoin(Db.s3Buckets, eq(Db.videos.bucket, Db.s3Buckets.id))
-		.leftJoin(
-			Db.storageIntegrations,
-			eq(Db.videos.storageIntegrationId, Db.storageIntegrations.id),
-		)
-		.leftJoin(Db.videoUploads, eq(Db.videos.id, Db.videoUploads.videoId))
-		.where(eq(Db.videos.id, Video.VideoId.make(item.videoId)))
-		.limit(1);
-	return video;
+		video.orgId !== payload.organizationId ||
+		(video.ownerId !== item.sourceOwnerId &&
+			video.ownerId !== payload.targetUserId)
+	)
+		throw new FatalError(`Ownership changed for ${item.name}`);
+	if (
+		video.bucket !== item.bucketId ||
+		video.storageIntegrationId !== item.storageIntegrationId ||
+		(current.upload?.phase ?? null) !== item.sourceUploadPhase
+	)
+		throw new FatalError(`Storage changed for ${item.name}`);
+	if (
+		(current.upload && current.upload.phase !== "complete") ||
+		video.source.type === "desktopSegments" ||
+		video.transcriptionStatus === "PROCESSING" ||
+		video.metadata?.editProcessing ||
+		video.metadata?.aiGenerationStatus === "PROCESSING" ||
+		(current.job &&
+			["committing", "processing", "retry", "queued"].includes(
+				current.job.state,
+			)) ||
+		current.job?.errorCode === "video-deleting"
+	)
+		throw new FatalError(`Cap ${item.name} is not ready to transfer`);
+	if (
+		(video.bucket && !current.bucketActive) ||
+		(video.storageIntegrationId &&
+			current.storageIntegrationStatus !== "active")
+	)
+		throw new FatalError(`Storage changed for ${item.name}`);
+	const reason = getContentTransferStorageBlockReason({
+		sourceOwnerId: video.ownerId,
+		targetUserId: payload.targetUserId,
+		organizationId: payload.organizationId,
+		bucketId: video.bucket,
+		bucketOwnerId: current.bucketOwnerId,
+		bucketOrganizationId: current.bucketOrganizationId,
+		storageIntegrationId: video.storageIntegrationId,
+		storageIntegrationOwnerId: current.storageIntegrationOwnerId,
+		storageIntegrationOrganizationId: current.storageIntegrationOrganizationId,
+	});
+	if (reason) throw new FatalError(reason);
 }
 
 async function transferOneVideo(
@@ -597,269 +547,115 @@ async function transferOneVideo(
 	progress: ContentTransferProgress,
 ) {
 	"use step";
-	const organizationId = Organisation.OrganisationId.make(
-		payload.organizationId,
+	const database = db(),
+		targetUserId = User.UserId.make(payload.targetUserId),
+		videoId = Video.VideoId.make(item.videoId),
+		destinationFolderId = Folder.FolderId.make(item.destinationFolderId);
+	const loaded = await atomic(database, async (snapshot) => {
+		const operation = await requireTransferAccess(
+			snapshot,
+			operationId,
+			payload,
+		);
+		const current = await loadVideoOwnershipTransfer(snapshot, videoId);
+		const membership = await readSourceMembership(snapshot, payload, item);
+		const saved = operation.result;
+		if (
+			isContentTransferProgress(saved) &&
+			saved.processedVideos > progress.processedVideos &&
+			current.video.ownerId === targetUserId &&
+			current.video.folderId === destinationFolderId &&
+			!membership
+		)
+			return { statements: [], result: { current, replayed: saved } };
+		assertTransferVideo(current, payload, item);
+		if (!membership || membership.folderId !== item.sourceFolderId)
+			throw new FatalError(`Source placement changed for ${item.name}`);
+		return { statements: [], result: { current, replayed: null } };
+	});
+	if (loaded.replayed) return loaded.replayed;
+	const prepared = await prepareVideoOwnershipTransfer(
+		loaded.current,
+		targetUserId,
 	);
-	const targetUserId = User.UserId.make(payload.targetUserId);
-	const videoId = Video.VideoId.make(item.videoId);
-	const destinationFolderId = Folder.FolderId.make(item.destinationFolderId);
-
-	const current = await getCurrentVideo(item);
-	if (!current || current.orgId !== payload.organizationId) {
-		throw new FatalError(`Cap ${item.name} is no longer in this organization`);
-	}
-	if (
-		current.ownerId !== item.sourceOwnerId &&
-		current.ownerId !== payload.targetUserId
-	) {
-		throw new FatalError(`Ownership changed for ${item.name}`);
-	}
-	if (
-		current.bucketId !== item.bucketId ||
-		current.storageIntegrationId !== item.storageIntegrationId ||
-		current.uploadPhase !== item.sourceUploadPhase
-	) {
-		throw new FatalError(`Storage changed for ${item.name}`);
-	}
-	if (current.uploadPhase && current.uploadPhase !== "complete") {
-		throw new FatalError(`Cap ${item.name} is not ready to transfer`);
-	}
-	const storageBlockReason = getContentTransferStorageBlockReason({
-		sourceOwnerId: current.ownerId,
-		targetUserId: payload.targetUserId,
-		organizationId: payload.organizationId,
-		bucketId: current.bucketId,
-		bucketOwnerId: current.bucketOwnerId,
-		bucketOrganizationId: current.bucketOrganizationId,
-		storageIntegrationId: current.storageIntegrationId,
-		storageIntegrationOwnerId: current.storageIntegrationOwnerId,
-		storageIntegrationOrganizationId: current.storageIntegrationOrganizationId,
-	});
-	if (storageBlockReason) throw new FatalError(storageBlockReason);
-
-	const ownerChanged = current.ownerId !== payload.targetUserId;
-	const copied =
-		item.sourceOwnerId !== payload.targetUserId
-			? await copyAndVerifyObjects({
-					payload,
-					item,
-					allowDestinationSuperset: !ownerChanged,
-				})
-			: null;
-
-	await db().transaction(async (tx) => {
-		const accessRows = await tx
-			.select({
-				ownerId: Db.organizations.ownerId,
-				memberUserId: Db.organizationMembers.userId,
-				memberRole: Db.organizationMembers.role,
-			})
-			.from(Db.organizations)
-			.leftJoin(
-				Db.organizationMembers,
-				and(
-					eq(Db.organizationMembers.organizationId, Db.organizations.id),
-					inArray(Db.organizationMembers.userId, [
-						User.UserId.make(payload.requestedByUserId),
-						targetUserId,
-					]),
-				),
-			)
-			.where(
-				and(
-					eq(Db.organizations.id, organizationId),
-					isNull(Db.organizations.tombstoneAt),
-				),
-			)
-			.for("share");
-		const organization = accessRows[0];
-		const actorMembership = accessRows.find(
-			(row) => row.memberUserId === payload.requestedByUserId,
-		);
-		const targetMembership = accessRows.find(
-			(row) => row.memberUserId === payload.targetUserId,
-		);
-		if (!organization) throw new FatalError("Organization no longer exists");
-		if (
-			organization.ownerId !== payload.requestedByUserId &&
-			!canManageContentTransfer(actorMembership?.memberRole)
-		) {
-			throw new FatalError("The requesting user is no longer an administrator");
-		}
-		if (organization.ownerId !== payload.targetUserId && !targetMembership) {
-			throw new FatalError("The destination user is no longer a member");
-		}
-
-		const [lockedVideo] = await tx
-			.select({
-				ownerId: Db.videos.ownerId,
-				bucketId: Db.videos.bucket,
-				storageIntegrationId: Db.videos.storageIntegrationId,
-				uploadPhase: Db.videoUploads.phase,
-			})
-			.from(Db.videos)
-			.leftJoin(Db.videoUploads, eq(Db.videos.id, Db.videoUploads.videoId))
-			.where(eq(Db.videos.id, videoId))
-			.limit(1)
-			.for("update");
-		if (!lockedVideo) throw new FatalError(`Cap ${item.name} no longer exists`);
-		if (
-			lockedVideo.ownerId !== item.sourceOwnerId &&
-			lockedVideo.ownerId !== payload.targetUserId
-		) {
-			throw new FatalError(`Ownership changed for ${item.name}`);
-		}
-		if (
-			lockedVideo.bucketId !== item.bucketId ||
-			lockedVideo.storageIntegrationId !== item.storageIntegrationId ||
-			lockedVideo.uploadPhase !== item.sourceUploadPhase
-		) {
-			throw new FatalError(`Storage changed for ${item.name}`);
-		}
-
-		const [destinationFolder] = await tx
-			.select({ id: Db.folders.id })
-			.from(Db.folders)
-			.where(
-				and(
-					eq(Db.folders.id, destinationFolderId),
-					eq(Db.folders.organizationId, organizationId),
-					eq(Db.folders.createdById, targetUserId),
-					isNull(Db.folders.spaceId),
-					eq(Db.folders.public, false),
-				),
-			)
-			.limit(1);
-		if (!destinationFolder) {
-			throw new FatalError(`Destination folder is missing for ${item.name}`);
-		}
-
-		const sourceMembership =
-			payload.source.type === "organization"
-				? (
-						await tx
-							.select({
-								id: Db.sharedVideos.id,
-								folderId: Db.sharedVideos.folderId,
-							})
-							.from(Db.sharedVideos)
-							.where(
-								and(
-									eq(Db.sharedVideos.id, item.sourceMembershipId),
-									eq(Db.sharedVideos.videoId, videoId),
-									eq(Db.sharedVideos.organizationId, organizationId),
-								),
-							)
-							.limit(1)
-							.for("update")
-					)[0]
-				: (
-						await tx
-							.select({
-								id: Db.spaceVideos.id,
-								folderId: Db.spaceVideos.folderId,
-							})
-							.from(Db.spaceVideos)
-							.where(
-								and(
-									eq(Db.spaceVideos.id, item.sourceMembershipId),
-									eq(Db.spaceVideos.videoId, videoId),
-									eq(
-										Db.spaceVideos.spaceId,
-										Space.SpaceId.make(payload.source.spaceId),
-									),
-								),
-							)
-							.limit(1)
-							.for("update")
-					)[0];
-		const alreadyComplete =
-			lockedVideo.ownerId === payload.targetUserId && !sourceMembership;
-		if (!sourceMembership && !alreadyComplete) {
-			throw new FatalError(`Source placement changed for ${item.name}`);
-		}
-		if (sourceMembership && sourceMembership.folderId !== item.sourceFolderId) {
-			throw new FatalError(`Source placement changed for ${item.name}`);
-		}
-
-		await tx
-			.update(Db.videos)
-			.set({
-				ownerId: targetUserId,
-				folderId: destinationFolderId,
-				updatedAt: new Date(),
-			})
-			.where(eq(Db.videos.id, videoId));
-
-		if (item.sourceOwnerId !== payload.targetUserId) {
-			const sourcePrefix = `${item.sourceOwnerId}/${item.videoId}/`;
-			const destinationPrefix = `${payload.targetUserId}/${item.videoId}/`;
-			await tx
-				.update(Db.videoUploads)
-				.set({
-					rawFileKey: sql`REPLACE(${Db.videoUploads.rawFileKey}, ${sourcePrefix}, ${destinationPrefix})`,
-				})
-				.where(
-					and(
-						eq(Db.videoUploads.videoId, videoId),
-						like(Db.videoUploads.rawFileKey, `${sourcePrefix}%`),
-					),
-				);
-			await tx
-				.update(Db.videoEdits)
-				.set({
-					sourceKey: sql`REPLACE(${Db.videoEdits.sourceKey}, ${sourcePrefix}, ${destinationPrefix})`,
-				})
-				.where(
-					and(
-						eq(Db.videoEdits.videoId, videoId),
-						like(Db.videoEdits.sourceKey, `${sourcePrefix}%`),
-					),
-				);
-		}
-
-		if (sourceMembership) {
-			if (payload.source.type === "organization") {
-				await tx
-					.delete(Db.sharedVideos)
-					.where(eq(Db.sharedVideos.id, item.sourceMembershipId));
-			} else {
-				await tx
-					.delete(Db.spaceVideos)
-					.where(eq(Db.spaceVideos.id, item.sourceMembershipId));
-			}
-		}
-	});
-	await enqueueVideoStorageNameSync(videoId);
-
-	const cleanupWarnings: string[] = [];
-	if (copied) {
-		try {
-			for (let index = 0; index < copied.objects.length; index += 1_000) {
-				await copied.bucket
-					.deleteObjects(
-						copied.objects.slice(index, index + 1_000).map((object) => ({
-							Key: object.key,
-						})),
-					)
-					.pipe(runWorkflowPromise);
-			}
-		} catch {
-			cleanupWarnings.push(`Old media copies remain for ${item.name}`);
-		}
-	}
-
+	const ownerChanged = loaded.current.video.ownerId !== targetUserId;
 	const nextProgress: ContentTransferProgress = {
 		...progress,
 		phase: "transferring",
 		processedVideos: progress.processedVideos + 1,
 		transferredVideos: progress.transferredVideos + (ownerChanged ? 1 : 0),
 		alreadyOwnedVideos: progress.alreadyOwnedVideos + (ownerChanged ? 0 : 1),
-		copiedObjects: progress.copiedObjects + (copied?.copiedObjects ?? 0),
+		copiedObjects: progress.copiedObjects + prepared.copiedObjects,
 		currentVideoId: item.videoId,
-		cleanupWarnings: [...progress.cleanupWarnings, ...cleanupWarnings],
+		cleanupWarnings:
+			prepared.copied &&
+			!progress.cleanupWarnings.includes(retainedOwnershipTransferMediaReason)
+				? [...progress.cleanupWarnings, retainedOwnershipTransferMediaReason]
+				: progress.cleanupWarnings,
 	};
-	await setOperationProgress(operationId, nextProgress);
+	const now = new Date();
+	try {
+		await atomic(database, async (snapshot) => {
+			await requireTransferAccess(snapshot, operationId, payload);
+			const membership = await readSourceMembership(snapshot, payload, item);
+			if (!membership || membership.folderId !== item.sourceFolderId)
+				throw new FatalError(`Source placement changed for ${item.name}`);
+			const statements = await planVideoOwnershipTransfer(
+				snapshot,
+				database,
+				prepared,
+				{
+					organizationId: Organisation.OrganisationId.make(
+						payload.organizationId,
+					),
+					folderId: destinationFolderId,
+					now,
+				},
+			);
+			statements.push(
+				payload.source.type === "organization"
+					? database
+							.delete(Db.sharedVideos)
+							.where(eq(Db.sharedVideos.id, item.sourceMembershipId))
+					: database
+							.delete(Db.spaceVideos)
+							.where(eq(Db.spaceVideos.id, item.sourceMembershipId)),
+				database
+					.update(Db.agentApiOperations)
+					.set({ result: nextProgress, updatedAt: now })
+					.where(eq(Db.agentApiOperations.id, operationId)),
+			);
+			return { statements, result: undefined };
+		});
+	} catch (error) {
+		const confirmed = await atomic(database, async (snapshot) => {
+			const operation = await requireTransferAccess(
+				snapshot,
+				operationId,
+				payload,
+			);
+			const [video] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(Db.videos)
+					.where(eq(Db.videos.id, videoId))
+					.limit(1),
+			);
+			const membership = await readSourceMembership(snapshot, payload, item);
+			return {
+				statements: [],
+				result: Boolean(
+					video?.ownerId === targetUserId &&
+						video.folderId === destinationFolderId &&
+						!membership &&
+						isContentTransferProgress(operation.result) &&
+						operation.result.processedVideos >= nextProgress.processedVideos,
+				),
+			};
+		});
+		if (!confirmed) throw error;
+	}
+	await enqueueVideoStorageNameSync(videoId);
 	return nextProgress;
 }
 
@@ -869,92 +665,121 @@ async function cleanupSourceFolders(
 	progress: ContentTransferProgress,
 ) {
 	"use step";
-
-	const nextProgress: ContentTransferProgress = {
-		...progress,
-		phase: "cleaning_up",
-		currentVideoId: null,
-	};
-	await setOperationProgress(operationId, nextProgress);
-
-	const warning = await db().transaction(async (tx) => {
+	const database = db();
+	const warning = await atomic<string | null>(database, async (snapshot) => {
+		await requireTransferAccess(snapshot, operationId, payload);
 		const organizationId = Organisation.OrganisationId.make(
-			payload.organizationId,
-		);
-		const sourceFolderIds = payload.sourceFolderIds.map((id) =>
-			Folder.FolderId.make(id),
-		);
-		const sourceSpaceId =
-			payload.source.type === "organization"
-				? organizationId
-				: Space.SpaceId.make(payload.source.spaceId);
-		const lockedFolders = await tx
-			.select({ id: Db.folders.id })
-			.from(Db.folders)
-			.where(
-				and(
-					inArray(Db.folders.id, sourceFolderIds),
-					eq(Db.folders.organizationId, organizationId),
-					eq(Db.folders.spaceId, sourceSpaceId),
+				payload.organizationId,
+			),
+			ids = payload.sourceFolderIds,
+			sourceSpaceId =
+				payload.source.type === "organization"
+					? organizationId
+					: Space.SpaceId.make(payload.source.spaceId);
+		const folders = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(Db.folders)
+				.where(
+					and(
+						inJsonArray(Db.folders.id, ids),
+						eq(Db.folders.organizationId, organizationId),
+						eq(Db.folders.spaceId, sourceSpaceId),
+					),
 				),
-			)
-			.for("update");
-		if (lockedFolders.length !== payload.sourceFolderIds.length) {
-			return "Source folders changed during the transfer";
-		}
-
-		const [organizationPlacement] = await tx
-			.select({ id: Db.sharedVideos.id })
-			.from(Db.sharedVideos)
-			.where(inArray(Db.sharedVideos.folderId, sourceFolderIds))
-			.limit(1);
-		const [spacePlacement] = await tx
-			.select({ id: Db.spaceVideos.id })
-			.from(Db.spaceVideos)
-			.where(inArray(Db.spaceVideos.folderId, sourceFolderIds))
-			.limit(1);
-		const [personalPlacement] = await tx
-			.select({ id: Db.videos.id })
-			.from(Db.videos)
-			.where(inArray(Db.videos.folderId, sourceFolderIds))
-			.limit(1);
-		const [newChild] = await tx
-			.select({ id: Db.folders.id })
-			.from(Db.folders)
-			.where(
-				and(
-					inArray(Db.folders.parentId, sourceFolderIds),
-					notInArray(Db.folders.id, sourceFolderIds),
-				),
-			)
-			.limit(1);
+		);
+		const byId = new Map(
+			folders.map((folder) => [folder.id as string, folder]),
+		);
+		if (
+			folders.length !== ids.length ||
+			payload.folderPlan.some((plan) => {
+				const folder = byId.get(plan.sourceFolderId);
+				return (
+					!folder ||
+					folder.name !== plan.name ||
+					folder.parentId !== plan.sourceParentId ||
+					folder.public !== plan.sourcePublic
+				);
+			})
+		)
+			return {
+				statements: [],
+				result: "Source folders changed during the transfer",
+			};
+		const [
+			[organizationPlacement],
+			[spacePlacement],
+			[personalPlacement],
+			[newChild],
+		] = await Promise.all([
+			snapshot.read((reader) =>
+				reader
+					.select({ id: Db.sharedVideos.id })
+					.from(Db.sharedVideos)
+					.where(inJsonArray(Db.sharedVideos.folderId, ids))
+					.limit(1),
+			),
+			snapshot.read((reader) =>
+				reader
+					.select({ id: Db.spaceVideos.id })
+					.from(Db.spaceVideos)
+					.where(inJsonArray(Db.spaceVideos.folderId, ids))
+					.limit(1),
+			),
+			snapshot.read((reader) =>
+				reader
+					.select({ id: Db.videos.id })
+					.from(Db.videos)
+					.where(inJsonArray(Db.videos.folderId, ids))
+					.limit(1),
+			),
+			snapshot.read((reader) =>
+				reader
+					.select({ id: Db.folders.id })
+					.from(Db.folders)
+					.where(
+						and(
+							inJsonArray(Db.folders.parentId, ids),
+							not(inJsonArray(Db.folders.id, ids)),
+						),
+					)
+					.limit(1),
+			),
+		]);
 		if (
 			organizationPlacement ||
 			spacePlacement ||
 			personalPlacement ||
 			newChild
-		) {
-			return "Source folders were kept because they received new content";
-		}
-
-		await tx
-			.delete(Db.folders)
-			.where(
-				and(
-					inArray(Db.folders.id, sourceFolderIds),
-					eq(Db.folders.organizationId, organizationId),
-					eq(Db.folders.spaceId, sourceSpaceId),
-				),
-			);
-		return null;
+		)
+			return {
+				statements: [],
+				result: "Source folders were kept because they received new content",
+			};
+		return {
+			statements: [
+				database
+					.delete(Db.folders)
+					.where(
+						and(
+							inJsonArray(Db.folders.id, ids),
+							eq(Db.folders.organizationId, organizationId),
+							eq(Db.folders.spaceId, sourceSpaceId),
+						),
+					),
+			],
+			result: null,
+		};
 	});
-
 	const completed: ContentTransferProgress = {
-		...nextProgress,
+		...progress,
+		phase: "cleaning_up",
+		currentVideoId: null,
 		removedSourceFolder: warning === null,
 		cleanupWarnings: warning
-			? [...nextProgress.cleanupWarnings, warning]
-			: nextProgress.cleanupWarnings,
+			? [...progress.cleanupWarnings, warning]
+			: progress.cleanupWarnings,
 	};
 	await setOperationProgress(operationId, completed);
 	return completed;
@@ -965,24 +790,50 @@ async function completeOperation(
 	progress: ContentTransferProgress,
 ) {
 	"use step";
-
-	const now = new Date();
-	await db()
-		.update(Db.agentApiOperations)
-		.set({
-			state: "succeeded",
-			result: { ...progress, currentVideoId: null },
-			completedAt: now,
-			updatedAt: now,
-			errorCode: null,
-			errorMessage: null,
-		})
-		.where(eq(Db.agentApiOperations.id, operationId));
+	const database = db(),
+		now = new Date(),
+		result = { ...progress, currentVideoId: null };
+	try {
+		const changed = await database
+			.update(Db.agentApiOperations)
+			.set({
+				state: "succeeded",
+				result,
+				completedAt: now,
+				updatedAt: now,
+				errorCode: null,
+				errorMessage: null,
+			})
+			.where(
+				and(
+					eq(Db.agentApiOperations.id, operationId),
+					eq(Db.agentApiOperations.kind, CONTENT_TRANSFER_KIND),
+					eq(Db.agentApiOperations.state, "running"),
+				),
+			);
+		if (changed.meta.changes !== 1)
+			throw Error("Content transfer operation is no longer active");
+	} catch (error) {
+		const [operation] = await database
+			.select()
+			.from(Db.agentApiOperations)
+			.where(
+				and(
+					eq(Db.agentApiOperations.id, operationId),
+					eq(Db.agentApiOperations.kind, CONTENT_TRANSFER_KIND),
+				),
+			)
+			.limit(1);
+		if (
+			operation?.state !== "succeeded" ||
+			!isDeepStrictEqual(operation.result, result)
+		)
+			throw error;
+	}
 }
 
 async function failOperation(operationId: string, error: unknown) {
 	"use step";
-
 	const now = new Date();
 	await db()
 		.update(Db.agentApiOperations)
@@ -994,7 +845,13 @@ async function failOperation(operationId: string, error: unknown) {
 			completedAt: now,
 			updatedAt: now,
 		})
-		.where(eq(Db.agentApiOperations.id, operationId));
+		.where(
+			and(
+				eq(Db.agentApiOperations.id, operationId),
+				eq(Db.agentApiOperations.kind, CONTENT_TRANSFER_KIND),
+				inJsonArray(Db.agentApiOperations.state, ["queued", "running"]),
+			),
+		);
 }
 
 export async function transferOrganizationContentWorkflow(input: {
@@ -1006,7 +863,7 @@ export async function transferOrganizationContentWorkflow(input: {
 		const payload = await claimOperation(input.operationId);
 		if (!payload) return;
 		let progress = initialProgress(payload);
-		await verifySourceSnapshot(payload);
+		await verifySourceSnapshot(input.operationId, payload);
 		progress = await createDestinationFolders(
 			input.operationId,
 			payload,

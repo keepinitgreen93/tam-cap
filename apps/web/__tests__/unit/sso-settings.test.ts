@@ -1,5 +1,6 @@
 import { verifySsoLoginIntent } from "@cap/database/auth/sso-state";
-import { organizations } from "@cap/database/schema";
+import { organizations as cloudflareOrganizations } from "@cap/database/cloudflare/schema";
+import { organizations } from "@cap/database/legacy/schema";
 import { Organisation, User } from "@cap/web-domain";
 import type { SQL } from "drizzle-orm";
 import { type AnyMySqlColumn, MySqlDialect } from "drizzle-orm/mysql-core";
@@ -52,7 +53,8 @@ const mocks = vi.hoisted(() => ({
 	},
 }));
 
-vi.mock("@cap/database", () => ({ db: mocks.db }));
+vi.mock("@cap/database/legacy", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.getCurrentUser,
 }));
@@ -226,7 +228,8 @@ function makeFixture({
 			let condition: SQL | undefined;
 			const selection = {
 				from: (table: unknown) => {
-					if (table !== organizations) throw new Error("Unexpected table");
+					if (table !== organizations && table !== cloudflareOrganizations)
+						throw new Error("Unexpected table");
 					return selection;
 				},
 				leftJoin: () => {

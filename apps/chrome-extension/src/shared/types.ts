@@ -118,6 +118,7 @@ export type ExtensionSettings = {
 };
 
 export type ExtensionAuth = {
+	apiOrigin: string;
 	authApiKey: string;
 	userId: string;
 };
@@ -512,6 +513,7 @@ export type OverlayMessage =
 			type: "overlay-settings";
 			settings: WebcamSettings;
 			recording: boolean;
+			recorderOpen: boolean;
 	  }
 	| {
 			// Play the pre-roll countdown over the page. `durationMs` mirrors the

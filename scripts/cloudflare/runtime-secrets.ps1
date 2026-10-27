@@ -2,7 +2,9 @@
 param(
 	[ValidateSet('Initialize', 'Verify', 'Publish')]
 	[string]$Operation = 'Verify',
-	[string]$Origin
+	[string]$Origin,
+	[ValidatePattern('^[a-p]{32}$')]
+	[string]$ChromeExtensionId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -52,6 +54,9 @@ try {
 	}
 	if (-not $capPayload.web.CRON_SECRET) {
 		$capPayload.web.CRON_SECRET = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
+	}
+	if ($ChromeExtensionId) {
+		$capPayload.web.CAP_CHROME_EXTENSION_ID = $ChromeExtensionId
 	}
 	if ($Origin) {
 		if ($Origin -notin @('https://videos.trulyauthenticmarketing.com', 'https://tam-cap-app.ciglesia.workers.dev')) { throw 'Origin must be the configured staging or production origin.' }

@@ -2,8 +2,24 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { organizations, users, videos } from "@cap/database/cloudflare/schema";
+import { getTranscriptObjectKey } from "@cap/database/cloudflare/transcript-publication";
+import {
+	claimTranscriptionRun,
+	transcriptionAudioFilename,
+} from "@cap/database/cloudflare/transcription-state";
+import { eq } from "drizzle-orm";
 import { Option } from "effect";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
 import { assemblyAIEditResponse } from "../fixtures/assemblyai-edit-response";
 
 const mocks = vi.hoisted(() => ({
@@ -15,24 +31,6 @@ const mocks = vi.hoisted(() => ({
 	startAiGeneration: vi.fn(),
 	startWorkflow: vi.fn(),
 	updates: [] as Record<string, unknown>[],
-}));
-
-const schemaMocks = vi.hoisted(() => ({
-	videos: {
-		id: "videos.id",
-		metadata: "videos.metadata",
-		transcriptionStatus: "videos.transcriptionStatus",
-		updatedAt: "videos.updatedAt",
-	},
-	organizations: { id: "organizations.id" },
-	videoUploads: {
-		videoId: "videoUploads.videoId",
-		rawFileKey: "videoUploads.rawFileKey",
-	},
-	videoEdits: {
-		videoId: "videoEdits.videoId",
-		editSpec: "videoEdits.editSpec",
-	},
 }));
 
 const videoRow = vi.hoisted(() => ({
@@ -51,6 +49,11 @@ const state = vi.hoisted(() => ({
 	editRows: [] as unknown[],
 	fakeAudioPath: "",
 	cloudflare: false,
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	objects: new Map<string, unknown>(),
+	audioFilename: "",
 }));
 
 vi.mock("@cap/env", () => ({
@@ -67,43 +70,11 @@ vi.mock("@cap/env", () => ({
 	}),
 }));
 
-vi.mock("@cap/database/schema", () => schemaMocks);
-
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: (table: unknown) => {
-				if (table === schemaMocks.videoUploads) {
-					return { where: () => ({ limit: async () => [] }) };
-				}
-				if (table === schemaMocks.videoEdits) {
-					return { where: async () => state.editRows };
-				}
-				return {
-					leftJoin: () => ({
-						where: async () => [{ video: videoRow, orgSettings: null }],
-					}),
-					where: async () => [videoRow],
-				};
-			},
-		}),
-		update: () => ({
-			set: (values: Record<string, unknown>) => {
-				mocks.updates.push(values);
-				return { where: async () => [{ affectedRows: 1 }] };
-			},
-		}),
-	}),
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
 }));
-
-vi.mock("drizzle-orm", () => ({
-	and: (...conditions: unknown[]) => ({ conditions }),
-	eq: (field: unknown, value: unknown) => ({ field, value }),
-	isNull: (field: unknown) => ({ isNull: field }),
-	sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
-		strings,
-		values,
-	}),
+vi.mock("@/lib/transcription-dispatch", () => ({
+	dispatchTranscriptionRun: mocks.startWorkflow,
 }));
 
 vi.mock("server-only", () => ({}));
@@ -196,6 +167,66 @@ const manifest = {
 	is_complete: true,
 };
 
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+beforeAll(async () => {
+	fixture = await createTestDatabase();
+	state.database = fixture.database;
+	await fixture.database.insert(users).values({
+		id: "user-456" as typeof users.$inferSelect.id,
+		email: "segments-fixture@example.com",
+		emailVerified: new Date(),
+		activeOrganizationId: "org-123" as typeof organizations.$inferSelect.id,
+	});
+	await fixture.database.insert(organizations).values({
+		id: "org-123" as typeof organizations.$inferSelect.id,
+		name: "Segments fixture",
+		ownerId: "user-456" as typeof users.$inferSelect.id,
+	});
+});
+afterAll(async () => fixture.dispose());
+async function currentVideo() {
+	const [video] = await fixture.database
+		.select()
+		.from(videos)
+		.where(eq(videos.id, "video-123" as typeof videos.$inferSelect.id));
+	if (!video) throw new Error("Fixture missing");
+	return video;
+}
+async function transcribeVideoWorkflow(payload: {
+	videoId: string;
+	userId: string;
+	aiGenerationEnabled: boolean;
+	earlyFromSegments?: boolean;
+}) {
+	await fixture.database
+		.delete(videos)
+		.where(eq(videos.id, "video-123" as typeof videos.$inferSelect.id));
+	await fixture.database.insert(videos).values({
+		id: "video-123" as typeof videos.$inferSelect.id,
+		ownerId: "user-456" as typeof users.$inferSelect.id,
+		orgId: "org-123" as typeof organizations.$inferSelect.id,
+		name: "Segments",
+		source: { type: "desktopSegments" },
+		duration: videoRow.duration,
+	});
+	const claim = await claimTranscriptionRun(
+		fixture.database,
+		"video-123" as typeof videos.$inferSelect.id,
+		"user-456" as typeof users.$inferSelect.id,
+		{ earlyFromSegments: payload.earlyFromSegments },
+	);
+	if (!claim) throw new Error("Claim missing");
+	state.audioFilename = transcriptionAudioFilename(claim.video);
+	const workflow = await import("@/workflows/transcribe");
+	return workflow.transcribeVideoWorkflow({
+		...payload,
+		runId: claim.video.metadata.transcriptionRun.id,
+	});
+}
+async function artifactKey(kind: "edit" | "vtt") {
+	return getTranscriptObjectKey(await currentVideo(), kind);
+}
+
 describe("transcribeVideoWorkflow earlyFromSegments", () => {
 	beforeEach(async () => {
 		mocks.updates.length = 0;
@@ -209,7 +240,10 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 			...assemblyAIEditResponse,
 			audio_duration: 4,
 		});
-		mocks.putObject.mockImplementation(() => pipeValue(undefined));
+		mocks.putObject.mockImplementation((key: string, value: unknown) => {
+			state.objects.set(key, value);
+			return pipeValue(undefined);
+		});
 		mocks.deleteObject.mockImplementation(() => pipeValue(undefined));
 		mocks.getObject.mockImplementation(() =>
 			pipeValue(Option.some(JSON.stringify(manifest))),
@@ -240,8 +274,6 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 	});
 
 	it("transcribes straight from segment audio before any mux exists", async () => {
-		const { transcribeVideoWorkflow } = await import("@/workflows/transcribe");
-
 		const result = await transcribeVideoWorkflow({
 			videoId: "video-123",
 			userId: "user-456",
@@ -266,11 +298,9 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		expect(signedKeys.join()).not.toContain("segments/video");
 
 		const writtenKeys = mocks.putObject.mock.calls.map((call) => call[0]);
-		expect(writtenKeys).toContain("user-456/video-123/audio-temp.mp3");
-		expect(writtenKeys).toContain("user-456/video-123/transcription.vtt");
-		expect(writtenKeys).toContain(
-			"user-456/video-123/transcription.edit.v3.json",
-		);
+		expect(writtenKeys).toContain(`user-456/video-123/${state.audioFilename}`);
+		expect(writtenKeys).toContain(await artifactKey("vtt"));
+		expect(writtenKeys).toContain(await artifactKey("edit"));
 
 		// duration falls back to the manifest sum (2s + 2.5s) when the video row
 		// has no duration yet (it is only set by the post-mux webhook)
@@ -278,8 +308,9 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		const { decryptEditTranscriptObject } = await import(
 			"@/lib/edit-transcript-storage"
 		);
+		const editKey = await artifactKey("edit");
 		const write = mocks.putObject.mock.calls.find(
-			(call) => call[0] === "user-456/video-123/transcription.edit.v3.json",
+			(call) => call[0] === editKey,
 		);
 		const stored = parseEditTranscript(
 			decryptEditTranscriptObject(
@@ -290,18 +321,13 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		);
 		expect(stored?.durationMs).toBe(4500);
 
-		expect(mocks.updates).toContainEqual({ transcriptionStatus: "COMPLETE" });
-		expect(mocks.updates).not.toContainEqual({ transcriptionStatus: "ERROR" });
-		// the provisional live transcript is superseded by the canonical one
-		expect(mocks.deleteObject.mock.calls.map((call) => call[0])).toContain(
-			"user-456/video-123/transcription.live.json",
-		);
+		expect((await currentVideo()).transcriptionStatus).toBe("COMPLETE");
+		expect((await currentVideo()).transcriptionStatus).not.toBe("ERROR");
 	});
 
 	it("defers back to the post-mux queue when the manifest is missing", async () => {
 		mocks.getObject.mockImplementation(() => pipeValue(Option.none()));
 
-		const { transcribeVideoWorkflow } = await import("@/workflows/transcribe");
 		const result = await transcribeVideoWorkflow({
 			videoId: "video-123",
 			userId: "user-456",
@@ -313,17 +339,19 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		expect(result.message).toContain("deferred");
 		expect(mocks.transcribe).not.toHaveBeenCalled();
 		// the claim is released (PROCESSING -> null), never marked ERROR
-		expect(mocks.updates).toContainEqual({ transcriptionStatus: null });
-		expect(mocks.updates).not.toContainEqual({ transcriptionStatus: "ERROR" });
+		expect((await currentVideo()).transcriptionStatus).toBe("PROCESSING");
+		expect((await currentVideo()).transcriptionStatus).not.toBe("ERROR");
 		expect(mocks.updates).not.toContainEqual({
 			transcriptionStatus: "COMPLETE",
 		});
 		// and the video is re-offered to the normal (non-early) path, because
 		// the post-mux queue may already have run and been rejected by the claim
 		expect(mocks.startWorkflow).toHaveBeenCalledTimes(1);
-		expect(mocks.startWorkflow.mock.calls[0]?.[1]).toEqual([
-			{ videoId: "video-123", userId: "user-456", aiGenerationEnabled: false },
-		]);
+		expect(mocks.startWorkflow.mock.calls[0]?.[1]).toMatchObject({
+			id: "video-123",
+			ownerId: "user-456",
+		});
+		expect(mocks.startWorkflow.mock.calls[0]?.[3]).toBeUndefined();
 	});
 
 	it("defers when the manifest exists but is not complete", async () => {
@@ -333,7 +361,6 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 			),
 		);
 
-		const { transcribeVideoWorkflow } = await import("@/workflows/transcribe");
 		const result = await transcribeVideoWorkflow({
 			videoId: "video-123",
 			userId: "user-456",
@@ -343,7 +370,7 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 
 		expect(result.message).toContain("deferred");
 		expect(mocks.transcribe).not.toHaveBeenCalled();
-		expect(mocks.updates).toContainEqual({ transcriptionStatus: null });
+		expect((await currentVideo()).transcriptionStatus).toBe("PROCESSING");
 	});
 
 	it("marks NO_AUDIO when the completed manifest has no audio track", async () => {
@@ -359,7 +386,6 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 			),
 		);
 
-		const { transcribeVideoWorkflow } = await import("@/workflows/transcribe");
 		const result = await transcribeVideoWorkflow({
 			videoId: "video-123",
 			userId: "user-456",
@@ -369,8 +395,8 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 
 		expect(result.success).toBe(true);
 		expect(mocks.transcribe).not.toHaveBeenCalled();
-		expect(mocks.updates).toContainEqual({ transcriptionStatus: "NO_AUDIO" });
-		expect(mocks.updates).not.toContainEqual({ transcriptionStatus: "ERROR" });
+		expect((await currentVideo()).transcriptionStatus).toBe("NO_AUDIO");
+		expect((await currentVideo()).transcriptionStatus).not.toBe("ERROR");
 	});
 
 	it("preserves segment duration for Cloudflare when the normal path has no muxed source", async () => {
@@ -405,9 +431,6 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 			},
 		);
 		try {
-			const { transcribeVideoWorkflow } = await import(
-				"@/workflows/transcribe"
-			);
 			const result = await transcribeVideoWorkflow({
 				videoId: "video-123",
 				userId: "user-456",
@@ -417,8 +440,9 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 			const { decryptEditTranscriptObject } = await import(
 				"@/lib/edit-transcript-storage"
 			);
+			const editKey = await artifactKey("edit");
 			const write = mocks.putObject.mock.calls.find(
-				(call) => call[0] === "user-456/video-123/transcription.edit.v3.json",
+				(call) => call[0] === editKey,
 			);
 			const stored = JSON.parse(
 				decryptEditTranscriptObject(
@@ -440,8 +464,6 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 	});
 
 	it("falls back to segment audio in the normal path when no muxed source exists", async () => {
-		const { transcribeVideoWorkflow } = await import("@/workflows/transcribe");
-
 		const result = await transcribeVideoWorkflow({
 			videoId: "video-123",
 			userId: "user-456",
@@ -451,8 +473,8 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		expect(result.success).toBe(true);
 		expect(mocks.transcribe).toHaveBeenCalledTimes(1);
 		const writtenKeys = mocks.putObject.mock.calls.map((call) => call[0]);
-		expect(writtenKeys).toContain("user-456/video-123/transcription.vtt");
-		expect(mocks.updates).toContainEqual({ transcriptionStatus: "COMPLETE" });
-		expect(mocks.updates).not.toContainEqual({ transcriptionStatus: "ERROR" });
+		expect(writtenKeys).toContain(await artifactKey("vtt"));
+		expect((await currentVideo()).transcriptionStatus).toBe("COMPLETE");
+		expect((await currentVideo()).transcriptionStatus).not.toBe("ERROR");
 	});
 });

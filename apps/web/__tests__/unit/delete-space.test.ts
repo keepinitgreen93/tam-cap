@@ -1,111 +1,140 @@
-import { Space } from "@cap/web-domain";
-import { getTableName } from "drizzle-orm";
-import type { MySqlTable } from "drizzle-orm/mysql-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	folders,
+	organizationMembers,
+	organizations,
+	spaceMembers,
+	spaces,
+	spaceVideos,
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { eq } from "drizzle-orm";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
-const mocks = vi.hoisted(() => ({
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
 	user: vi.fn(),
 	manager: vi.fn(),
-	runPromise: vi.fn(),
-	transaction: vi.fn(),
-	events: [] as string[],
+	cleanup: vi.fn(),
 }));
-
-function table(value: MySqlTable) {
-	return getTableName(value);
-}
-
-function selectQuery(prefix: string, rows: () => unknown[]) {
-	return () => {
-		const query = Object.assign(Promise.resolve(rows()), {
-			from(value: MySqlTable) {
-				mocks.events.push(`${prefix}select:${table(value)}`);
-				return query;
-			},
-			where() {
-				return query;
-			},
-			limit() {
-				return query;
-			},
-			for(lock: string) {
-				mocks.events.push(`${prefix}lock:${lock}`);
-				return query;
-			},
-		});
-		return query;
-	};
-}
-
-function deleteQuery(prefix: string) {
-	return (value: MySqlTable) => ({
-		where: async () => {
-			mocks.events.push(`${prefix}delete:${table(value)}`);
-		},
-	});
-}
-
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: selectQuery("", () => [{ id: "space-1" }]),
-		delete: deleteQuery(""),
-		transaction: mocks.transaction,
-	}),
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
 }));
-vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.user }));
+vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: state.user }));
 vi.mock("@/actions/organization/space-authorization", () => ({
-	requireSpaceManager: mocks.manager,
+	requireSpaceManager: state.manager,
 }));
 vi.mock("@cap/web-backend", () => ({ S3Buckets: {} }));
-vi.mock("@/lib/server", () => ({ runPromise: mocks.runPromise }));
+vi.mock("@/lib/server", () => ({ runPromise: state.cleanup }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
 import { deleteSpace } from "@/actions/organization/delete-space";
 
-const spaceId = Space.SpaceId.make("space-1");
-
-beforeEach(() => {
-	mocks.events.length = 0;
-	mocks.user.mockResolvedValue({ id: "user-1", activeOrganizationId: "org" });
-	mocks.manager.mockResolvedValue({ canManage: true });
-	mocks.runPromise.mockImplementation(async () => {
-		mocks.events.push("s3");
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let owner: Awaited<ReturnType<typeof createTestOwner>>;
+let spaceId: typeof spaces.$inferSelect.id;
+async function remainingRows() {
+	return Promise.all([
+		fixture.database.select().from(spaces).where(eq(spaces.id, spaceId)),
+		fixture.database
+			.select()
+			.from(spaceMembers)
+			.where(eq(spaceMembers.spaceId, spaceId)),
+		fixture.database
+			.select()
+			.from(spaceVideos)
+			.where(eq(spaceVideos.spaceId, spaceId)),
+		fixture.database.select().from(folders).where(eq(folders.spaceId, spaceId)),
+	]);
+}
+describe("deleting a space on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
 	});
-	mocks.transaction.mockImplementation(
-		async (callback: (tx: unknown) => Promise<unknown>) => {
-			mocks.events.push("begin");
-			await callback({
-				select: selectQuery("tx:", () => [{ id: spaceId }]),
-				delete: deleteQuery("tx:"),
-			});
-			mocks.events.push("commit");
-		},
-	);
-});
-
-describe("deleting a space", () => {
-	it("locks the space and removes its records in one transaction before storage cleanup", async () => {
-		await expect(deleteSpace(spaceId)).resolves.toEqual({ success: true });
-		expect(mocks.events).toEqual([
-			"select:spaces",
-			"begin",
-			"tx:select:spaces",
-			"tx:lock:update",
-			"tx:delete:space_videos",
-			"tx:delete:space_members",
-			"tx:delete:folders",
-			"tx:delete:spaces",
-			"commit",
-			"s3",
-		]);
-	});
-
-	it("does not touch records when the caller cannot manage the space", async () => {
-		mocks.manager.mockRejectedValue(new Error("Forbidden"));
-		await expect(deleteSpace(spaceId)).resolves.toMatchObject({
-			success: false,
+	afterAll(async () => fixture.dispose());
+	beforeEach(async () => {
+		owner = await createTestOwner(fixture.database);
+		spaceId = nanoId() as typeof spaces.$inferSelect.id;
+		await fixture.database.insert(spaces).values({
+			id: spaceId,
+			organizationId: owner.activeOrganizationId,
+			createdById: owner.id,
+			name: "Delete fixture",
 		});
-		expect(mocks.transaction).not.toHaveBeenCalled();
-		expect(mocks.events).toEqual(["select:spaces"]);
+		await fixture.database
+			.insert(spaceMembers)
+			.values({ id: nanoId(), spaceId, userId: owner.id, role: "admin" });
+		await fixture.database.insert(spaceVideos).values({
+			id: nanoId(),
+			spaceId,
+			videoId: nanoId() as typeof spaceVideos.$inferInsert.videoId,
+			addedById: owner.id,
+		});
+		await fixture.database.insert(folders).values({
+			id: nanoId() as typeof folders.$inferInsert.id,
+			name: "Folder",
+			organizationId: owner.activeOrganizationId,
+			createdById: owner.id,
+			spaceId,
+		});
+		state.user.mockReset().mockResolvedValue(owner);
+		state.manager.mockReset().mockResolvedValue({ canManage: true });
+		state.cleanup.mockReset().mockResolvedValue(undefined);
+	});
+	it("removes all related records atomically before storage cleanup", async () => {
+		state.cleanup.mockImplementationOnce(async () => {
+			expect((await remainingRows()).every((rows) => rows.length === 0)).toBe(
+				true,
+			);
+		});
+		expect(await deleteSpace(spaceId)).toEqual({ success: true });
+		expect(state.cleanup).toHaveBeenCalledTimes(1);
+	});
+	it("leaves every record intact when the caller cannot manage the space", async () => {
+		state.manager.mockRejectedValueOnce(new Error("Forbidden"));
+		expect((await deleteSpace(spaceId)).success).toBe(false);
+		expect((await remainingRows()).every((rows) => rows.length === 1)).toBe(
+			true,
+		);
+		expect(state.cleanup).not.toHaveBeenCalled();
+	});
+	it("rechecks role changes made after the initial authorization", async () => {
+		const other = await createTestOwner(fixture.database);
+		state.manager.mockImplementationOnce(async () => {
+			await fixture.database
+				.update(organizations)
+				.set({ ownerId: other.id })
+				.where(eq(organizations.id, owner.activeOrganizationId));
+			await fixture.database
+				.update(organizationMembers)
+				.set({ role: "member" })
+				.where(eq(organizationMembers.userId, owner.id));
+			await fixture.database
+				.update(spaceMembers)
+				.set({ role: "member" })
+				.where(eq(spaceMembers.spaceId, spaceId));
+			await fixture.database
+				.update(spaces)
+				.set({ createdById: other.id })
+				.where(eq(spaces.id, spaceId));
+			return { canManage: true };
+		});
+		expect((await deleteSpace(spaceId)).success).toBe(false);
+		expect((await remainingRows()).every((rows) => rows.length === 1)).toBe(
+			true,
+		);
+		expect(state.cleanup).not.toHaveBeenCalled();
 	});
 });

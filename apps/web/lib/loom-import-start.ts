@@ -1,11 +1,12 @@
-import { db } from "@cap/database";
-import { videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
-import { User, Video } from "@cap/web-domain";
-import { and, eq, sql } from "drizzle-orm";
+import { Video } from "@cap/web-domain";
+import { and, eq } from "drizzle-orm";
 import { getRun, start } from "workflow/api";
 import { WorkflowRunNotFoundError } from "workflow/internal/errors";
 import { getWorld } from "workflow/runtime";
+import { writeLoomImportReceipt } from "@/lib/loom-import-state";
 import {
 	getLoomImporterJobState,
 	isLoomMediaJobFailed,
@@ -80,6 +81,12 @@ export async function getLoomImportRunState(
 		status = await run.status;
 		if (status === "pending" && (await cancelStuckPendingRun(run)))
 			status = "cancelled";
+		else if (status === "pending" && receipt.workflowQueue)
+			await getWorld().queue(
+				receipt.workflowQueue,
+				{ runId: receipt.runId },
+				{ deploymentId: receipt.deploymentId },
+			);
 	} catch (error) {
 		return WorkflowRunNotFoundError.is(error) &&
 			receipt.dispatch === "uncertain" &&
@@ -109,28 +116,12 @@ export async function getLoomImportRunState(
 	return "unconfirmed";
 }
 
-async function saveReceipt(payload: ImportPayload, receipt: LoomImportRun) {
-	const result = await db()
-		.update(videos)
-		.set({
-			metadata:
-				receipt.dispatch === "pending"
-					? sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.loomImportRun', JSON_EXTRACT(${JSON.stringify(receipt)}, '$'))`
-					: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.loomImportRun', JSON_MERGE_PATCH(COALESCE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun'), JSON_OBJECT()), JSON_EXTRACT(${JSON.stringify(receipt)}, '$')))`,
-		})
-		.where(
-			and(
-				eq(videos.id, Video.VideoId.make(payload.videoId)),
-				eq(videos.ownerId, User.UserId.make(payload.userId)),
-				receipt.dispatch === "pending"
-					? undefined
-					: sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId')) = ${receipt.runId}`,
-			),
-		);
-	const affectedRows = Array.isArray(result)
-		? (result[0] as { affectedRows?: number } | undefined)?.affectedRows
-		: (result as { affectedRows?: number }).affectedRows;
-	if (affectedRows !== 1)
+async function saveReceipt(
+	payload: ImportPayload,
+	receipt: LoomImportRun,
+	expectedRunId?: string | null,
+) {
+	if (!(await writeLoomImportReceipt(db(), payload, receipt, expectedRunId)))
 		throw new Error("Could not record Loom import startup");
 }
 
@@ -151,6 +142,18 @@ export async function startLoomImportWorkflow(payload: ImportPayload) {
 	let accepted = false;
 	let rejected = false;
 	let receipt: LoomImportRun | undefined;
+	const [video] = await db()
+		.select()
+		.from(videos)
+		.where(eq(videos.id, Video.VideoId.make(payload.videoId)))
+		.limit(1);
+	const previous = video?.metadata?.loomImportRun;
+	if (previous && (await getLoomImportRunState(previous)) !== "inactive")
+		throw new LoomImportStartError(
+			false,
+			new Error("A Loom import is already active or requires reconciliation"),
+		);
+	const expectedRunId = previous?.runId ?? null;
 	try {
 		const world = getWorld();
 		const observedWorld: ReturnType<typeof getWorld> = {
@@ -160,12 +163,14 @@ export async function startLoomImportWorkflow(payload: ImportPayload) {
 					throw new Error("Missing Loom import run ID");
 				receipt = {
 					runId: message.runId,
+					workflowQueue: name,
+					deploymentId: options?.deploymentId,
 					dispatch: "pending",
 					...(payload.importPriority === "bulk"
 						? { importPriority: "bulk" as const }
 						: {}),
 				};
-				await saveReceipt(payload, receipt);
+				await saveReceipt(payload, receipt, expectedRunId);
 				attempted = true;
 				try {
 					const result = await world.queue(name, message, options);

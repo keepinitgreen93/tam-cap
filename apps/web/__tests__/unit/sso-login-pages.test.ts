@@ -17,6 +17,7 @@ vi.mock("@cap/database/auth/session", () => ({
 }));
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({ WEB_URL: "https://cap.test" }),
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" },
 }));
 vi.mock("next/navigation", () => ({
 	redirect: mocks.redirect,

@@ -1,450 +1,267 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	organizations,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
+import { claimTranscriptionRun } from "@cap/database/cloudflare/transcription-state";
+import { nanoId } from "@cap/database/helpers";
+import { eq } from "drizzle-orm";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	configured: true,
+	start: vi.fn(),
+	queue: vi.fn(),
+	getRun: vi.fn(),
+}));
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
+}));
 vi.mock("@cap/env", () => ({
-	serverEnv: vi.fn(() => ({
-		ASSEMBLY_API_KEY: "test-assembly-api-key",
-		DATABASE_URL: "mysql://test@localhost/test",
-	})),
-}));
-
-const mockStart = vi.hoisted(() => vi.fn());
-const schemaMocks = vi.hoisted(() => ({
-	videos: {
-		id: "id",
-		settings: "settings",
-		transcriptionStatus: "transcriptionStatus",
-	},
-	organizations: { id: "id", settings: "settings" },
-	s3Buckets: { id: "id" },
-	videoUploads: { videoId: "videoId", phase: "phase" },
-}));
-
-vi.mock("workflow/api", () => ({
-	start: mockStart,
-}));
-
-vi.mock("@/workflows/transcribe", () => ({
-	transcribeVideoWorkflow: vi.fn(),
-}));
-
-let mockQueryResult: unknown[] = [];
-let mockUploadQueryResult: unknown[] = [];
-let mockUpdateResult: unknown = [{ affectedRows: 1 }];
-
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: (table: unknown) => {
-				if (table === schemaMocks.videoUploads) {
-					return {
-						where: vi.fn().mockReturnValue({
-							limit: vi.fn().mockResolvedValue(mockUploadQueryResult),
-						}),
-					};
-				}
-
-				const query = {
-					leftJoin: vi.fn(() => query),
-					where: vi
-						.fn()
-						.mockImplementation(() => Promise.resolve(mockQueryResult)),
-				};
-				return query;
-			},
-		}),
-		update: () => ({
-			set: () => ({
-				where: vi.fn().mockResolvedValue(mockUpdateResult),
-			}),
-		}),
+	serverEnv: () => ({
+		ASSEMBLY_API_KEY: state.configured ? "synthetic-key" : undefined,
 	}),
 }));
-
-vi.mock("@cap/database/schema", () => ({
-	videos: schemaMocks.videos,
-	organizations: schemaMocks.organizations,
-	s3Buckets: schemaMocks.s3Buckets,
-	videoUploads: schemaMocks.videoUploads,
+vi.mock("@/workflows/transcribe", () => ({ transcribeVideoWorkflow: vi.fn() }));
+vi.mock("workflow/api", () => ({ start: state.start, getRun: state.getRun }));
+vi.mock("workflow/runtime", () => ({
+	getWorld: () => ({ queue: state.queue }),
 }));
 
-vi.mock("drizzle-orm", () => ({
-	and: vi.fn((...conditions) => ({ conditions })),
-	eq: vi.fn((field, value) => ({ field, value })),
-	isNull: vi.fn((field) => ({ field, operator: "isNull" })),
-}));
-
-import type { Video } from "@cap/web-domain";
 import { transcribeVideo } from "@/lib/transcribe";
-import { transcribeVideoWorkflow } from "@/workflows/transcribe";
 
-describe("transcribeVideo", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
-		mockQueryResult = [];
-		mockUploadQueryResult = [];
-		mockUpdateResult = [{ affectedRows: 1 }];
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let video: typeof videos.$inferSelect;
+async function currentVideo() {
+	const [current] = await fixture.database
+		.select()
+		.from(videos)
+		.where(eq(videos.id, video.id));
+	if (!current) throw new Error("Fixture missing");
+	return current;
+}
+const invoke = (ai = false, early = false) =>
+	transcribeVideo(video.id, video.ownerId, ai, { earlyFromSegments: early });
+describe("transcription dispatcher on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
 	});
-
-	describe("input validation", () => {
-		it("requires ASSEMBLY_API_KEY environment variable", async () => {
-			const { serverEnv } = await import("@cap/env");
-			vi.mocked(serverEnv).mockReturnValueOnce({
-				ASSEMBLY_API_KEY: undefined,
-			} as ReturnType<typeof serverEnv>);
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(false);
-			expect(result.message).toContain("environment variables");
+	afterAll(async () => fixture.dispose());
+	afterEach(() => vi.unstubAllEnvs());
+	beforeEach(async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		state.configured = true;
+		const owner = await createTestOwner(fixture.database);
+		const [row] = await fixture.database
+			.insert(videos)
+			.values({
+				id: nanoId() as typeof videos.$inferInsert.id,
+				ownerId: owner.id,
+				orgId: owner.activeOrganizationId,
+				name: "Dispatcher fixture",
+				source: { type: "webMP4" },
+				duration: 10,
+			})
+			.returning();
+		if (!row) throw new Error("Fixture missing");
+		video = row;
+		state.queue.mockReset().mockResolvedValue(undefined);
+		state.getRun.mockReset().mockReturnValue({
+			exists: Promise.resolve(true),
+			status: Promise.resolve("pending"),
 		});
-
-		it("rejects empty videoId", async () => {
-			const result = await transcribeVideo("" as Video.VideoId, "user-456");
-
-			expect(result.success).toBe(false);
-			expect(result.message).toBe("userId or videoId not supplied");
-		});
-
-		it("rejects empty userId", async () => {
-			const result = await transcribeVideo("video-123" as Video.VideoId, "");
-
-			expect(result.success).toBe(false);
-			expect(result.message).toBe("userId or videoId not supplied");
-		});
-
-		it("rejects when both videoId and userId are empty", async () => {
-			const result = await transcribeVideo("" as Video.VideoId, "");
-
-			expect(result.success).toBe(false);
-			expect(result.message).toBe("userId or videoId not supplied");
-		});
+		state.start
+			.mockReset()
+			.mockImplementation(async (_workflow, _payload, options) => {
+				await options.world.queue(
+					"workflow-queue",
+					{ runId: "durable-run" },
+					{ deploymentId: "deployment" },
+				);
+				return { runId: "durable-run" };
+			});
 	});
-
-	describe("video lookup", () => {
-		it("returns error when video does not exist", async () => {
-			mockQueryResult = [];
-
-			const result = await transcribeVideo(
-				"nonexistent-video" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(false);
-			expect(result.message).toBe("Video does not exist");
-		});
-
-		it("returns error when video result is malformed", async () => {
-			mockQueryResult = [
-				{ video: null, bucket: null, settings: null, orgSettings: null },
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(false);
-			expect(result.message).toBe("Video information is missing");
-		});
+	it("requires a transcription provider", async () => {
+		state.configured = false;
+		expect((await invoke()).success).toBe(false);
+		expect(state.start).not.toHaveBeenCalled();
 	});
-
-	describe("transcription disabled scenarios", () => {
-		it("defers to a provably fresh live transcription instead of racing it", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: null,
-						settings: null,
-						metadata: {
-							liveTranscript: {
-								status: "active",
-								updatedAt: new Date().toISOString(),
-							},
-						},
-					},
-					bucket: null,
-					settings: null,
-					orgSettings: null,
-				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
+	it.each([
+		["", "owner"],
+		["video", ""],
+		["", ""],
+	])("rejects empty identifiers %s %s", async (id, owner) => {
+		expect((await transcribeVideo(id as typeof video.id, owner)).success).toBe(
+			false,
+		);
+		expect(state.start).not.toHaveBeenCalled();
+	});
+	it("rejects missing videos and a different owner", async () => {
+		expect(
+			(await transcribeVideo("missing" as typeof video.id, video.ownerId))
+				.success,
+		).toBe(false);
+		expect((await transcribeVideo(video.id, "other-owner")).success).toBe(
+			false,
+		);
+		expect(state.start).not.toHaveBeenCalled();
+	});
+	it("skips video-disabled transcription within the atomic claim", async () => {
+		await fixture.database
+			.update(videos)
+			.set({ settings: { disableTranscript: true } })
+			.where(eq(videos.id, video.id));
+		expect((await invoke()).success).toBe(true);
+		expect((await currentVideo()).transcriptionStatus).toBe("SKIPPED");
+		expect(state.start).not.toHaveBeenCalled();
+	});
+	it("honors organization defaults and video overrides", async () => {
+		await fixture.database
+			.update(organizations)
+			.set({ settings: { disableTranscript: true } })
+			.where(eq(organizations.id, video.orgId));
+		await fixture.database
+			.update(videos)
+			.set({ settings: { disableTranscript: false } })
+			.where(eq(videos.id, video.id));
+		expect((await invoke()).success).toBe(true);
+		expect(state.start).toHaveBeenCalledTimes(1);
+	});
+	it("skips an organization-disabled video without an override", async () => {
+		await fixture.database
+			.update(organizations)
+			.set({ settings: { disableTranscript: true } })
+			.where(eq(organizations.id, video.orgId));
+		await invoke();
+		expect((await currentVideo()).transcriptionStatus).toBe("SKIPPED");
+		expect(state.start).not.toHaveBeenCalled();
+	});
+	it.each(["COMPLETE", "PROCESSING", "ERROR", "NO_AUDIO", "SKIPPED"] as const)(
+		"does not overwrite terminal or active %s state",
+		async (transcriptionStatus) => {
+			await fixture.database
+				.update(videos)
+				.set({ transcriptionStatus, settings: { disableTranscript: true } })
+				.where(eq(videos.id, video.id));
+			await invoke();
+			expect((await currentVideo()).transcriptionStatus).toBe(
+				transcriptionStatus,
 			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("Live transcription in progress");
-			expect(mockStart).not.toHaveBeenCalled();
-		});
-
-		it("ignores a stale live claim so a dead workflow can never block transcription", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: null,
-						settings: null,
-						metadata: {
-							liveTranscript: {
-								status: "active",
-								updatedAt: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
-							},
-						},
+			expect(state.start).not.toHaveBeenCalled();
+		},
+	);
+	it("runs a verified full pass despite a fresh provisional live transcript", async () => {
+		await fixture.database
+			.update(videos)
+			.set({
+				metadata: {
+					liveTranscript: {
+						status: "active",
+						updatedAt: new Date().toISOString(),
 					},
-					bucket: null,
-					settings: null,
-					orgSettings: null,
 				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(mockStart).toHaveBeenCalledTimes(1);
-		});
-
-		it("skips transcription when video settings disable it", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: null,
-						settings: { disableTranscript: true },
-					},
-					bucket: null,
-					settings: { disableTranscript: true },
-					orgSettings: null,
-				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("disabled");
-			expect(mockStart).not.toHaveBeenCalled();
-		});
-
-		it("skips transcription when org settings disable it", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: null,
-						settings: null,
-					},
-					bucket: null,
-					settings: null,
-					orgSettings: { disableTranscript: true },
-				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("disabled");
-		});
-
-		it("video settings take precedence over org settings", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: null,
-						settings: { disableTranscript: false },
-					},
-					bucket: null,
-					settings: { disableTranscript: false },
-					orgSettings: { disableTranscript: true },
-				},
-			];
-			mockStart.mockResolvedValue({ id: "run-123" });
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(mockStart).toHaveBeenCalled();
+			})
+			.where(eq(videos.id, video.id));
+		expect((await invoke()).success).toBe(true);
+		expect(state.start).toHaveBeenCalledTimes(1);
+	});
+	it.each(["uploading", "processing", "generating_thumbnail"] as const)(
+		"defers normal transcription during %s",
+		async (phase) => {
+			await fixture.database
+				.insert(videoUploads)
+				.values({ videoId: video.id, phase });
+			expect((await invoke()).success).toBe(true);
+			expect(state.start).not.toHaveBeenCalled();
+		},
+	);
+	it("permits the explicit early-segment path while the mux is processing", async () => {
+		await fixture.database
+			.insert(videoUploads)
+			.values({ videoId: video.id, phase: "processing" });
+		await invoke(false, true);
+		expect(state.start).toHaveBeenCalledTimes(1);
+		expect(state.start.mock.calls[0]?.[1][0]).toMatchObject({
+			earlyFromSegments: true,
+			aiGenerationEnabled: false,
 		});
 	});
-
-	describe("existing transcription status", () => {
-		it("returns early when transcription is already complete", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: "COMPLETE",
-						settings: null,
-					},
-					bucket: null,
-					settings: null,
-					orgSettings: null,
-				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("already completed");
-			expect(mockStart).not.toHaveBeenCalled();
+	it("only dispatches once under concurrent callers and records the full durable receipt", async () => {
+		const results = await Promise.all(
+			Array.from({ length: 5 }, () => invoke(true)),
+		);
+		expect(results.every((result) => result.success)).toBe(true);
+		expect(state.start).toHaveBeenCalledTimes(1);
+		const current = await currentVideo();
+		expect(current.metadata?.transcriptionRun).toMatchObject({
+			dispatch: "accepted",
+			workflowRunId: "durable-run",
+			workflowQueue: "workflow-queue",
+			deploymentId: "deployment",
 		});
-
-		it("returns early when transcription is in progress", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: "PROCESSING",
-						settings: null,
-					},
-					bucket: null,
-					settings: null,
-					orgSettings: null,
-				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("in progress");
-			expect(mockStart).not.toHaveBeenCalled();
-		});
-
-		it("returns early when transcription failed until manual retry resets it", async () => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: "ERROR",
-						settings: null,
-					},
-					bucket: null,
-					settings: null,
-					orgSettings: null,
-				},
-			];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("in progress");
-			expect(mockStart).not.toHaveBeenCalled();
+		expect(state.start.mock.calls[0]?.[1][0]).toMatchObject({
+			videoId: video.id,
+			userId: video.ownerId,
+			runId: current.metadata?.transcriptionRun?.id,
+			aiGenerationEnabled: true,
 		});
 	});
-
-	describe("workflow triggering", () => {
-		beforeEach(() => {
-			mockQueryResult = [
-				{
-					video: {
-						id: "video-123",
-						transcriptionStatus: null,
-						settings: null,
+	it("releases a run rejected before queue delivery so it can be retried", async () => {
+		state.start.mockRejectedValueOnce(new Error("serialization failed"));
+		expect((await invoke()).success).toBe(false);
+		expect((await currentVideo()).transcriptionStatus).toBeNull();
+		expect((await invoke()).success).toBe(true);
+	});
+	it("retains and resumes an uncertain delivery without starting a duplicate", async () => {
+		state.queue.mockRejectedValueOnce(new Error("acknowledgement lost"));
+		expect((await invoke()).success).toBe(false);
+		const first = await currentVideo();
+		expect(first.metadata?.transcriptionRun?.dispatch).toBe("uncertain");
+		await invoke();
+		expect(state.start).toHaveBeenCalledTimes(1);
+		expect(state.queue).toHaveBeenCalledTimes(2);
+		expect((await currentVideo()).metadata?.transcriptionRun?.id).toBe(
+			first.metadata?.transcriptionRun?.id,
+		);
+	});
+	it("reclaims an abandoned pre-dispatch claim after its lease expires", async () => {
+		const claim = await claimTranscriptionRun(
+			fixture.database,
+			video.id,
+			video.ownerId,
+		);
+		if (!claim) throw new Error("Claim missing");
+		await fixture.database
+			.update(videos)
+			.set({
+				metadata: {
+					...claim.video.metadata,
+					transcriptionRun: {
+						...claim.video.metadata.transcriptionRun,
+						requestedAt: "2020-01-01T00:00:00.000Z",
 					},
-					bucket: { id: "bucket-456" },
-					settings: null,
-					orgSettings: null,
 				},
-			];
-			mockStart.mockResolvedValue({ id: "workflow-run-123" });
-		});
-
-		it("does not trigger while upload is still active", async () => {
-			mockUploadQueryResult = [{ phase: "processing" }];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toBe("Video upload is still in progress");
-			expect(mockStart).not.toHaveBeenCalled();
-		});
-
-		it("triggers workflow for valid video", async () => {
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toBe("Transcription workflow started");
-			expect(mockStart).toHaveBeenCalledTimes(1);
-		});
-
-		it("does not trigger workflow when another request claimed transcription first", async () => {
-			mockUpdateResult = [{ affectedRows: 0 }];
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(true);
-			expect(result.message).toContain("in progress");
-			expect(mockStart).not.toHaveBeenCalled();
-		});
-
-		it("passes correct payload to workflow", async () => {
-			await transcribeVideo("video-123" as Video.VideoId, "user-456", true);
-
-			expect(mockStart).toHaveBeenCalledWith(transcribeVideoWorkflow, [
-				{
-					videoId: "video-123",
-					userId: "user-456",
-					aiGenerationEnabled: true,
-				},
-			]);
-		});
-
-		it("defaults aiGenerationEnabled to false", async () => {
-			await transcribeVideo("video-123" as Video.VideoId, "user-456");
-
-			expect(mockStart).toHaveBeenCalledWith(transcribeVideoWorkflow, [
-				{
-					videoId: "video-123",
-					userId: "user-456",
-					aiGenerationEnabled: false,
-				},
-			]);
-		});
-
-		it("handles workflow trigger failure gracefully", async () => {
-			mockStart.mockRejectedValue(new Error("Workflow service unavailable"));
-
-			const result = await transcribeVideo(
-				"video-123" as Video.VideoId,
-				"user-456",
-			);
-
-			expect(result.success).toBe(false);
-			expect(result.message).toBe("Failed to start transcription workflow");
-		});
+			})
+			.where(eq(videos.id, video.id));
+		expect((await invoke()).success).toBe(true);
+		expect(state.start).toHaveBeenCalledTimes(1);
+		expect((await currentVideo()).metadata?.transcriptionRun?.id).not.toBe(
+			claim.video.metadata.transcriptionRun.id,
+		);
 	});
 });

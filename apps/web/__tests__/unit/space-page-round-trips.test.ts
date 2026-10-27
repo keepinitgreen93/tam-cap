@@ -1,4 +1,4 @@
-import { Database, ImageUploads } from "@cap/web-backend";
+import { CloudflareDatabase, ImageUploads } from "@cap/web-backend";
 import {
 	CurrentUser,
 	Folder,
@@ -6,15 +6,15 @@ import {
 	Space,
 	User,
 } from "@cap/web-domain";
-import { drizzle } from "drizzle-orm/mysql-proxy";
+import { drizzle } from "drizzle-orm/sqlite-proxy";
 import { Effect, Layer, Option } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import SharedCapsPage from "@/app/(org)/dashboard/spaces/[spaceId]/page";
 import { getVideosByFolderId } from "@/lib/folder";
 import {
-	Database as BackendDatabase,
-	type DbClient,
-} from "../../../../packages/web-backend/src/Database";
+	CloudflareDatabase as BackendCloudflareDatabase,
+	type CloudflareDbClient,
+} from "../../../../packages/web-backend/src/CloudflareDatabase";
 import { OrganisationsPolicy } from "../../../../packages/web-backend/src/Organisations/OrganisationsPolicy";
 import { Spaces } from "../../../../packages/web-backend/src/Spaces";
 import { SpacesPolicy } from "../../../../packages/web-backend/src/Spaces/SpacesPolicy";
@@ -25,8 +25,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const client = drizzle(mocks.query);
 	return { db: () => client };
 });
@@ -35,18 +35,21 @@ vi.mock("@cap/database/auth/session", () => ({
 }));
 vi.mock("@cap/env", () => ({ serverEnv: () => ({}) }));
 vi.mock("@cap/web-backend", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const { Effect, Layer } = await import("effect");
 	const { resolveEffectiveVideoRules } = await import(
 		"../../../../packages/web-backend/src/Videos/EffectiveVideoRules"
 	);
 	const client = drizzle(mocks.query);
-	class Database extends Effect.Service<Database>()("Database", {
-		succeed: {
-			use: <T>(callback: (db: typeof client) => Promise<T>) =>
-				Effect.promise(() => callback(client)),
+	class CloudflareDatabase extends Effect.Service<CloudflareDatabase>()(
+		"CloudflareDatabase",
+		{
+			succeed: {
+				use: <T>(callback: (db: typeof client) => Promise<T>) =>
+					Effect.promise(() => callback(client)),
+			},
 		},
-	}) {}
+	) {}
 	class ImageUploads extends Effect.Service<ImageUploads>()("ImageUploads", {
 		succeed: { resolveImageUrl: (value: string) => Effect.succeed(value) },
 	}) {}
@@ -54,7 +57,7 @@ vi.mock("@cap/web-backend", async () => {
 		succeed: { getSpaceOrOrg: () => Effect.succeed(mocks.spaceOrOrg) },
 	}) {}
 	return {
-		Database,
+		CloudflareDatabase,
 		ImageUploads,
 		Spaces,
 		makeCurrentUserLayer: () => Layer.empty,
@@ -62,16 +65,18 @@ vi.mock("@cap/web-backend", async () => {
 	};
 });
 vi.mock("@/lib/server", async () => {
-	const { Database, ImageUploads, Spaces } = await import("@cap/web-backend");
+	const { CloudflareDatabase, ImageUploads, Spaces } = await import(
+		"@cap/web-backend"
+	);
 	return {
 		runPromise: <A, E>(
-			effect: Effect.Effect<A, E, Database | ImageUploads | Spaces>,
+			effect: Effect.Effect<A, E, CloudflareDatabase | ImageUploads | Spaces>,
 		) =>
 			Effect.runPromise(
 				Effect.provide(
 					effect,
 					Layer.mergeAll(
-						Database.Default,
+						CloudflareDatabase.Default,
 						ImageUploads.Default,
 						Spaces.Default,
 					),
@@ -88,7 +93,7 @@ const LIST_COLUMNS = {
 	space: [
 		"owner-1",
 		"Walkthrough",
-		"2026-10-23 12:00:00",
+		1792756800000,
 		null,
 		false,
 		60,
@@ -98,25 +103,25 @@ const LIST_COLUMNS = {
 		0,
 		0,
 		"Owner",
-		"2026-10-23 12:00:00",
+		1792756800000,
 		false,
 	],
 	folder: [
 		"owner-1",
 		"Walkthrough",
-		"2026-10-23 12:00:00",
+		1792756800000,
 		true,
 		null,
-		{ type: "webMP4" },
+		JSON.stringify({ type: "webMP4" }),
 		false,
 		60,
 		null,
 		"org-1",
 		0,
 		0,
-		[],
+		"[]",
 		"Owner",
-		"2026-10-23 12:00:00",
+		1792756800000,
 		false,
 		false,
 	],
@@ -208,7 +213,7 @@ describe("space and folder page round trips", () => {
 	});
 
 	it("looks up the space and the organization together", async () => {
-		const client = drizzle(mocks.query) as unknown as DbClient;
+		const client = drizzle(mocks.query) as unknown as CloudflareDbClient;
 		const result = await countRoundTrips(
 			() =>
 				Effect.flatMap(Spaces, (spaces) =>
@@ -216,8 +221,8 @@ describe("space and folder page round trips", () => {
 				).pipe(
 					Effect.provide(Spaces.DefaultWithoutDependencies),
 					Effect.provideService(
-						BackendDatabase,
-						BackendDatabase.make({
+						BackendCloudflareDatabase,
+						BackendCloudflareDatabase.make({
 							use: (callback) => Effect.promise(() => callback(client)),
 						}),
 					),
@@ -257,7 +262,7 @@ describe("space and folder page round trips", () => {
 				getVideosByFolderId(Folder.FolderId.make("folder-1"), {
 					variant: "user",
 				}).pipe(
-					Effect.provide(Database.Default),
+					Effect.provide(CloudflareDatabase.Default),
 					Effect.provide(ImageUploads.Default),
 					Effect.runPromise,
 				),

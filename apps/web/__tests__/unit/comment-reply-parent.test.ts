@@ -1,179 +1,209 @@
-import * as Db from "@cap/database/schema";
-import type { SQL } from "drizzle-orm";
-import { MySqlDialect, type MySqlTable } from "drizzle-orm/mysql-core";
+import { comments, type users, videos } from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { and, eq, ne } from "drizzle-orm";
 import { Effect, Option } from "effect";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
-type Row = Record<string, unknown>;
-
-const videoId = "accessible-video";
-const commentId = "new-comment";
-const mediaKey = `owner/${videoId}/comments/${commentId}/media.webm`;
-
-const mocks = vi.hoisted(() => ({
-	notify: vi.fn(async () => undefined),
-	state: { parents: [] as Row[], inserted: [] as Row[] },
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	user: undefined as typeof users.$inferSelect | undefined,
+	video: undefined as typeof videos.$inferSelect | undefined,
+	commentId: "",
+	parentId: "",
+	notify: vi.fn(),
 }));
-
-const dialect = new MySqlDialect();
-
-function matchesParent(condition: SQL, row: Row) {
-	const { sql, params } = dialect.sqlToQuery(condition);
-	let index = 0;
-	return sql
-		.replaceAll(/[()]/g, "")
-		.split(" and ")
-		.every((clause) => {
-			const match = /^`comments`\.`([^`]+)` = \?$/.exec(clause);
-			if (!match?.[1]) throw new Error(`Unsupported predicate: ${clause}`);
-			return row[match[1]] === params[index++];
-		});
-}
-
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: (table: MySqlTable) => ({
-				where: (condition: SQL) => ({
-					limit: async () => {
-						if (table === Db.videos) return [{ id: videoId }];
-						if (table !== Db.comments) throw new Error("Unexpected table");
-						return mocks.state.parents.filter((row) =>
-							matchesParent(condition, row),
-						);
-					},
-				}),
-			}),
-		}),
-		insert: (table: MySqlTable) => ({
-			values: async (row: Row) => {
-				if (table !== Db.comments) throw new Error("Unexpected insert");
-				mocks.state.inserted.push(row);
-			},
-		}),
-	}),
-}));
-vi.mock("@cap/database/helpers", async (importOriginal) => ({
-	...(await importOriginal<typeof import("@cap/database/helpers")>()),
-	nanoId: () => commentId,
+vi.mock("server-only", () => ({}));
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => state.database,
 }));
 vi.mock("@cap/database/auth/session", () => ({
-	getCurrentUser: async () => ({ id: "viewer", name: "Viewer" }),
+	getCurrentUser: async () => state.user,
 }));
-vi.mock("@cap/web-domain", () => ({
-	Comment: { CommentId: { make: (id: string) => id } },
-	Policy: { withPublicPolicy: () => (effect: unknown) => effect },
+vi.mock("@cap/env", () => ({
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "false" },
+	serverEnv: () => ({}),
 }));
-vi.mock("@cap/web-backend", () => ({
-	provideOptionalAuth: (effect: unknown) => effect,
-	verifyCommentMediaUploadToken: () => ({
-		userId: "viewer",
-		videoId,
-		commentId,
-		kind: "audio",
-		key: mediaKey,
-		thumbnailKey: null,
-		contentType: "audio/webm",
-	}),
-	VideosRepo: Effect.succeed({
-		getById: () =>
-			Effect.succeed(Option.some([{ id: videoId, ownerId: "owner" }])),
-	}),
-	VideosPolicy: Effect.succeed({ canView: () => Effect.void }),
-	Storage: {
-		getAccessForVideo: () =>
-			Effect.succeed([
-				{ headObject: () => Effect.succeed({ ContentLength: 2048 }) },
-			]),
-	},
-}));
+vi.mock("@cap/web-backend", async () => {
+	const { decodeStorageVideo } = await import("@/lib/video-storage");
+	return {
+		provideOptionalAuth: (effect: unknown) => effect,
+		verifyCommentMediaUploadToken: () => ({
+			userId: state.user?.id,
+			videoId: state.video?.id,
+			commentId: state.commentId,
+			kind: "audio",
+			key: `${state.video?.ownerId}/${state.video?.id}/comments/${state.commentId}/media.webm`,
+			thumbnailKey: null,
+			contentType: "audio/webm",
+		}),
+		VideosRepo: Effect.succeed({
+			getById: () => {
+				if (!state.video) throw new Error("Video missing");
+				return Effect.succeed(Option.some([decodeStorageVideo(state.video)]));
+			},
+		}),
+		VideosPolicy: Effect.succeed({ canView: () => Effect.void }),
+		Storage: {
+			getAccessForVideo: () =>
+				Effect.succeed([
+					{ headObject: () => Effect.succeed({ ContentLength: 2048 }) },
+				]),
+		},
+	};
+});
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
-vi.mock("@/lib/comment-media", () => ({ sanitizeWaveform: () => undefined }));
 vi.mock("@/lib/media-comments", () => ({
 	canUseMediaComments: async () => true,
 }));
-vi.mock("@/lib/Notification", () => ({ createNotification: mocks.notify }));
-vi.mock("@/lib/server", () => ({ runPromiseExit: Effect.runPromiseExit }));
+vi.mock("@/lib/Notification", () => ({ createNotification: state.notify }));
+vi.mock("@/lib/server", () => ({
+	runPromiseExit: Effect.runPromiseExit,
+	runPromise: Effect.runPromise,
+}));
 
 import { newComment } from "@/actions/videos/new-comment";
 import { newMediaComment } from "@/actions/videos/new-media-comment";
 
-function postText(parentCommentId = "parent") {
-	return newComment({
+let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
+function requiredVideo() {
+	if (!state.video) throw new Error("Fixture missing");
+	return state.video;
+}
+const postText = (parentId = state.parentId) =>
+	newComment({
 		content: "A reply",
-		videoId: videoId as never,
+		videoId: requiredVideo().id,
 		type: "text",
 		authorImage: null,
-		parentCommentId: parentCommentId as never,
+		parentCommentId: parentId as never,
 		timestamp: null,
 	});
-}
-
-function postMedia(parentCommentId = "parent") {
-	return newMediaComment({
-		videoId: videoId as never,
-		commentId: commentId as never,
-		uploadToken: "token",
+const postMedia = (parentId = state.parentId) =>
+	newMediaComment({
+		videoId: requiredVideo().id,
+		commentId: state.commentId as never,
+		uploadToken: "synthetic-token",
 		kind: "audio",
 		durationSeconds: 3,
-		parentCommentId: parentCommentId as never,
+		parentCommentId: parentId as never,
 		timestamp: null,
 		authorImage: null,
 	});
+async function inserted() {
+	return runtime.database
+		.select()
+		.from(comments)
+		.where(
+			and(
+				eq(comments.videoId, requiredVideo().id),
+				ne(comments.id, state.parentId as never),
+			),
+		);
 }
-
-const rejectedParents = [
-	{
-		name: "belongs to another video",
-		parents: [{ id: "parent", videoId: "private-video", type: "text" }],
-	},
-	{ name: "does not exist", parents: [] },
-];
-
-beforeEach(() => {
-	mocks.state.parents = [{ id: "parent", videoId, type: "text" }];
-	mocks.state.inserted = [];
-	mocks.notify.mockClear();
+beforeAll(async () => {
+	runtime = await createTestDatabase();
+	state.database = runtime.database;
+}, 120_000);
+afterAll(async () => runtime.dispose());
+beforeEach(async () => {
+	state.user = await createTestOwner(runtime.database);
+	state.commentId = nanoId();
+	state.parentId = nanoId();
+	state.notify.mockReset().mockResolvedValue(undefined);
+	const [row] = await runtime.database
+		.insert(videos)
+		.values({
+			id: nanoId() as typeof videos.$inferSelect.id,
+			ownerId: state.user.id,
+			orgId: state.user.activeOrganizationId,
+			name: "Public comment fixture",
+			public: true,
+			source: { type: "webMP4" },
+		})
+		.returning();
+	if (!row) throw new Error("Fixture missing");
+	state.video = row;
+	await runtime.database
+		.insert(comments)
+		.values({
+			id: state.parentId as never,
+			authorId: state.user.id,
+			videoId: row.id,
+			type: "text",
+			content: "Parent",
+		});
 });
-
 describe.each([
 	{ action: "newComment", post: postText },
 	{ action: "newMediaComment", post: postMedia },
-])("$action reply parent authorization", ({ post }) => {
-	it.each(rejectedParents)(
-		"rejects a parent that $name",
-		async ({ parents }) => {
-			mocks.state.parents = parents;
+])("$action parent authorization on D1", ({ post }) => {
+	it.each(["foreign", "missing"])(
+		"rejects a %s parent without insert or notification",
+		async (kind) => {
+			if (kind === "missing")
+				await runtime.database
+					.delete(comments)
+					.where(eq(comments.id, state.parentId as never));
+			else {
+				const video = requiredVideo();
+				const id = nanoId() as typeof videos.$inferSelect.id;
+				await runtime.database
+					.insert(videos)
+					.values({
+						id,
+						ownerId: video.ownerId,
+						orgId: video.orgId,
+						name: "Private parent fixture",
+						public: false,
+						source: { type: "webMP4" },
+					});
+				await runtime.database
+					.update(comments)
+					.set({ videoId: id })
+					.where(eq(comments.id, state.parentId as never));
+			}
 			await expect(post()).rejects.toThrow("Comment not found");
-			expect(mocks.state.inserted).toEqual([]);
-			expect(mocks.notify).not.toHaveBeenCalled();
+			expect(await inserted()).toEqual([]);
+			expect(state.notify).not.toHaveBeenCalled();
 		},
 	);
-
-	it.each(["text", "emoji", "video", "audio"])(
-		"preserves replies to a %s comment on the same video",
+	it.each(["text", "emoji", "video", "audio"] as const)(
+		"preserves replies to %s parents on the same video",
 		async (type) => {
-			mocks.state.parents = [{ id: "parent", videoId, type }];
-			await expect(post()).resolves.toMatchObject({
-				parentCommentId: "parent",
-				videoId,
+			await runtime.database
+				.update(comments)
+				.set({ type })
+				.where(eq(comments.id, state.parentId as never));
+			expect(await post()).toMatchObject({
+				parentCommentId: state.parentId,
+				videoId: requiredVideo().id,
 			});
-			expect(mocks.state.inserted).toHaveLength(1);
-			expect(mocks.notify).toHaveBeenCalledWith(
+			expect(await inserted()).toHaveLength(1);
+			expect(state.notify).toHaveBeenCalledWith(
 				expect.objectContaining({
 					type: "reply",
-					parentCommentId: "parent",
-					videoId,
+					parentCommentId: state.parentId,
+					videoId: requiredVideo().id,
 				}),
 			);
 		},
 	);
-
 	it("preserves top-level comments", async () => {
-		mocks.state.parents = [];
-		await expect(post("")).resolves.toMatchObject({ parentCommentId: "" });
-		expect(mocks.state.inserted).toHaveLength(1);
-		expect(mocks.notify).toHaveBeenCalledWith(
+		expect(await post("")).toMatchObject({ parentCommentId: "" });
+		expect(await inserted()).toHaveLength(1);
+		expect(state.notify).toHaveBeenCalledWith(
 			expect.objectContaining({ type: "comment" }),
 		);
 	});

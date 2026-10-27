@@ -1,6 +1,8 @@
+import * as Db from "@cap/database/cloudflare/schema";
 import { User, Video } from "@cap/web-domain";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
 	video: {} as Record<string, unknown>,
@@ -16,64 +18,45 @@ const mocks = vi.hoisted(() => ({
 	fetch: vi.fn(),
 	clear: vi.fn(),
 }));
-vi.mock("@cap/database/schema", () => ({
-	videos: { name: "video", id: "id" },
-	videoUploads: { name: "upload", videoId: "videoId" },
-	videoEdits: { name: "edit", videoId: "videoId" },
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => client,
 }));
-vi.mock("@cap/database", () => {
-	const client = {
-		select: () => ({
-			from: (table: { name: "video" | "upload" | "edit" }) => ({
-				where: () => {
-					const rows = mocks[table.name]
-						? [structuredClone(mocks[table.name])]
-						: [];
-					return Object.assign(Promise.resolve(rows), {
-						for: async () => rows,
-					});
-				},
-			}),
-		}),
-		insert: (table: { name: string }) => ({
-			values: async (data: Record<string, unknown>) => {
-				mocks.writes.push(`insert-${table.name}`);
-				mocks.upload = data;
-			},
-		}),
-		delete: (table: { name: string }) => ({
-			where: async () => {
-				mocks.writes.push(`delete-${table.name}`);
-				mocks.upload = undefined;
-			},
-		}),
-		update: (table: { name: string }) => ({
-			set: (data: Record<string, unknown>) => ({
-				where: async () => {
-					mocks.writes.push(`update-${table.name}`);
-					Object.assign(mocks.video, data);
-				},
-			}),
-		}),
-	};
-	return {
-		db: () => ({
-			...client,
-			transaction: async (run: (tx: typeof client) => Promise<unknown>) => {
-				const snapshot = structuredClone({
-					video: mocks.video,
-					upload: mocks.upload,
-					writes: mocks.writes,
-				});
-				try {
-					return await run(client);
-				} catch (error) {
-					Object.assign(mocks, snapshot);
-					throw error;
-				}
-			},
-		}),
-	};
+const client = createRecordingD1Model({
+	read: ({ table }) => {
+		const value =
+			table === Db.videos
+				? mocks.video
+				: table === Db.videoUploads
+					? mocks.upload
+					: table === Db.videoEdits
+						? mocks.edit
+						: undefined;
+		return value ? [structuredClone(value)] : [];
+	},
+	apply: (statements) => {
+		for (const statement of statements) {
+			const name =
+				statement.table === Db.videos
+					? "video"
+					: statement.table === Db.videoUploads
+						? "upload"
+						: "edit";
+			mocks.writes.push(`${statement.operation}-${name}`);
+			if (statement.operation === "delete") {
+				if (name === "upload") mocks.upload = undefined;
+				if (name === "edit") mocks.edit = undefined;
+			} else {
+				if (Array.isArray(statement.values))
+					throw Error("Unexpected array mutation");
+				if (name === "video") Object.assign(mocks.video, statement.values);
+				if (name === "upload")
+					mocks.upload = { ...mocks.upload, ...statement.values };
+				if (name === "edit")
+					mocks.edit = { ...mocks.edit, ...statement.values };
+			}
+		}
+	},
+	signature: () => JSON.stringify([mocks.video, mocks.upload, mocks.edit]),
 });
 vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.auth }));
 vi.mock("@cap/utils", () => ({

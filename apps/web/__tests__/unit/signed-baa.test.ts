@@ -1,6 +1,6 @@
 import { getCurrentUser } from "@cap/database/auth/session";
 import { sendEmail } from "@cap/database/emails/config";
-import { signedBaas, users } from "@cap/database/schema";
+import { signedBaas, users } from "@cap/database/legacy/schema";
 import { STRIPE_SIGNED_BAA_PRICE_IDS } from "@cap/utils";
 import type Stripe from "stripe";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -34,7 +34,7 @@ const mockStripe = {
 	},
 };
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/legacy", () => ({
 	db: () => mockDb,
 }));
 
@@ -54,7 +54,7 @@ vi.mock("@cap/database/helpers", () => ({
 	nanoId: vi.fn(() => "baa-record-1"),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/legacy/schema", () => ({
 	organizations: {
 		id: "organizationId",
 		ownerId: "organizationOwnerId",

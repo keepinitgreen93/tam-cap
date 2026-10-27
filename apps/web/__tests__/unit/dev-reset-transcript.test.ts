@@ -23,7 +23,7 @@ const schema = vi.hoisted(() => ({
 	},
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: mocks.db,
 }));
 
@@ -31,7 +31,7 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.getCurrentUser,
 }));
 
-vi.mock("@cap/database/schema", () => schema);
+vi.mock("@cap/database/cloudflare/schema", () => schema);
 
 vi.mock("@cap/web-backend", () => ({
 	Storage: {

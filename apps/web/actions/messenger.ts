@@ -1,14 +1,18 @@
 "use server";
 
-import { db } from "@cap/database";
-import { nanoId } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicSnapshot, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	messengerConversations,
 	messengerMessages,
-} from "@cap/database/schema";
+	users,
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import { buildEnv } from "@cap/env";
-import { asc, desc, eq } from "drizzle-orm";
+import type { User } from "@cap/web-domain";
+import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { isInstanceAdmin } from "@/lib/instance-admin";
 import { generateMessengerAgentReply } from "@/lib/messenger/agent";
 import { MESSENGER_AGENT } from "@/lib/messenger/constants";
 import {
@@ -28,6 +32,39 @@ import {
 import { sendMessengerSupportEmail } from "@/lib/messenger/support-email";
 
 const normalizeContent = (content: string) => content.trim().slice(0, 6000);
+
+async function requireConversation(
+	snapshot: AtomicSnapshot,
+	conversationId: string,
+	viewer: Awaited<ReturnType<typeof getViewerContext>>,
+	anonymousId: string | null,
+) {
+	const [conversation] = await snapshot.read((reader) =>
+		reader
+			.select()
+			.from(messengerConversations)
+			.where(eq(messengerConversations.id, conversationId))
+			.limit(1),
+	);
+	if (!conversation) throw new Error("Conversation not found");
+	const matchesUser = Boolean(
+		viewer.user && conversation.userId === viewer.user.id,
+	);
+	const matchesAnonymous = Boolean(
+		!conversation.userId &&
+			anonymousId &&
+			conversation.anonymousId === anonymousId,
+	);
+	if (!matchesUser && !matchesAnonymous) throw new Error("Unauthorized");
+	return conversation;
+}
+
+async function requireLiveAdmin(snapshot: AtomicSnapshot, userId: User.UserId) {
+	const [user] = await snapshot.read((reader) =>
+		reader.select().from(users).where(eq(users.id, userId)).limit(1),
+	);
+	if (!isInstanceAdmin(user)) throw new Error("Unauthorized");
+}
 
 const assertMessengerEnabled = () => {
 	if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true") {
@@ -53,6 +90,7 @@ const persistConversationToSupermemory = async ({
 	userId: string | null;
 	anonymousId: string | null;
 }) => {
+	if (process.env.CAP_RUNTIME === "cloudflare") return;
 	const messages = await db()
 		.select()
 		.from(messengerMessages)
@@ -89,45 +127,57 @@ export const createMessengerConversation = async () => {
 	const whereClause = viewer.user
 		? eq(messengerConversations.userId, viewer.user.id)
 		: anonymousId
-			? eq(messengerConversations.anonymousId, anonymousId)
+			? and(
+					isNull(messengerConversations.userId),
+					eq(messengerConversations.anonymousId, anonymousId),
+				)
 			: null;
 
-	if (whereClause) {
-		const [latest] = await db()
-			.select({ id: messengerConversations.id })
-			.from(messengerConversations)
-			.where(whereClause)
-			.orderBy(desc(messengerConversations.createdAt))
-			.limit(1);
+	const conversationId = nanoId();
+	const database = db();
+	const selectedId = await atomic(database, async (snapshot) => {
+		if (whereClause) {
+			const [latest] = await snapshot.read((reader) =>
+				reader
+					.select({ id: messengerConversations.id })
+					.from(messengerConversations)
+					.where(whereClause)
+					.orderBy(desc(messengerConversations.createdAt))
+					.limit(1),
+			);
 
-		if (latest) {
-			const [hasMessage] = await db()
-				.select({ id: messengerMessages.id })
-				.from(messengerMessages)
-				.where(eq(messengerMessages.conversationId, latest.id))
-				.limit(1);
+			if (latest) {
+				const [hasMessage] = await snapshot.read((reader) =>
+					reader
+						.select({ id: messengerMessages.id })
+						.from(messengerMessages)
+						.where(eq(messengerMessages.conversationId, latest.id))
+						.limit(1),
+				);
 
-			if (!hasMessage) {
-				return latest.id;
+				if (!hasMessage) {
+					return { statements: [], result: latest.id };
+				}
 			}
 		}
-	}
 
-	const agentId = MESSENGER_AGENT.id;
-	const conversationId = nanoId();
+		const agentId = MESSENGER_AGENT.id;
+		return {
+			statements: [
+				database.insert(messengerConversations).values({
+					id: conversationId,
+					agent: agentId,
+					mode: "agent",
+					userId: viewer.user?.id ?? null,
+					anonymousId: anonymousId ?? null,
+				}),
+			],
+			result: conversationId,
+		};
+	});
 
-	await db()
-		.insert(messengerConversations)
-		.values({
-			id: conversationId,
-			agent: agentId,
-			mode: "agent",
-			userId: viewer.user?.id ?? null,
-			anonymousId: anonymousId ?? null,
-		});
-
-	revalidateMessengerPaths(conversationId);
-	return conversationId;
+	revalidateMessengerPaths(selectedId);
+	return selectedId;
 };
 
 export const sendMessengerUserMessage = async ({
@@ -153,55 +203,41 @@ export const sendMessengerUserMessage = async ({
 		});
 	}
 
-	const [conversation] = await db()
-		.select()
-		.from(messengerConversations)
-		.where(eq(messengerConversations.id, conversationId));
-
-	if (!conversation) throw new Error("Conversation not found");
-
-	const matchesUser = Boolean(
-		viewer.user && conversation.userId === viewer.user.id,
-	);
-	const matchesAnonymous = Boolean(
-		activeAnonymousId && conversation.anonymousId === activeAnonymousId,
-	);
-	const matchesAnonymousAsVisitor = Boolean(!viewer.user && matchesAnonymous);
-	const shouldAttachUser = Boolean(
-		viewer.user && !conversation.userId && matchesAnonymous,
-	);
-
-	if (!matchesUser && !matchesAnonymousAsVisitor && !shouldAttachUser) {
-		throw new Error("Unauthorized");
-	}
-
 	const now = new Date();
-
-	await db()
-		.insert(messengerMessages)
-		.values({
-			id: nanoId(),
+	const messageId = nanoId();
+	const database = db();
+	const conversation = await atomic(database, async (snapshot) => {
+		const current = await requireConversation(
+			snapshot,
 			conversationId,
-			role: "user",
-			content: normalized,
-			userId: viewer.user?.id ?? null,
-			anonymousId: activeAnonymousId ?? null,
-			createdAt: now,
-		});
+			viewer,
+			activeAnonymousId,
+		);
+		const effectiveUserId = current.userId ?? viewer.user?.id ?? null;
+		return {
+			statements: [
+				database.insert(messengerMessages).values({
+					id: messageId,
+					conversationId,
+					role: "user",
+					content: normalized,
+					userId: viewer.user?.id ?? null,
+					anonymousId: activeAnonymousId ?? null,
+					createdAt: now,
+				}),
+				database
+					.update(messengerConversations)
+					.set({
+						lastMessageAt: sql`max(${messengerConversations.lastMessageAt}, ${now.getTime()})`,
+						userId: effectiveUserId,
+					})
+					.where(eq(messengerConversations.id, conversationId)),
+			],
+			result: { ...current, userId: effectiveUserId },
+		};
+	});
 
-	await db()
-		.update(messengerConversations)
-		.set({
-			lastMessageAt: now,
-			userId: shouldAttachUser
-				? (viewer.user?.id ?? null)
-				: conversation.userId,
-		})
-		.where(eq(messengerConversations.id, conversationId));
-
-	const effectiveUserId = shouldAttachUser
-		? (viewer.user?.id ?? null)
-		: conversation.userId;
+	const effectiveUserId = conversation.userId;
 	const effectiveAnonymousId =
 		conversation.anonymousId ?? activeAnonymousId ?? null;
 
@@ -254,20 +290,37 @@ export const sendMessengerUserMessage = async ({
 	});
 
 	const responseAt = new Date();
-	await db().insert(messengerMessages).values({
-		id: nanoId(),
-		conversationId,
-		role: "agent",
-		content: reply,
-		userId: null,
-		anonymousId: effectiveAnonymousId,
-		createdAt: responseAt,
+	const responseId = nanoId();
+	const mode = await atomic(database, async (snapshot) => {
+		const current = await requireConversation(
+			snapshot,
+			conversationId,
+			viewer,
+			activeAnonymousId,
+		);
+		if (current.mode === "human")
+			return { statements: [], result: "human" as const };
+		return {
+			statements: [
+				database.insert(messengerMessages).values({
+					id: responseId,
+					conversationId,
+					role: "agent",
+					content: reply,
+					userId: null,
+					anonymousId: effectiveAnonymousId,
+					createdAt: responseAt,
+				}),
+				database
+					.update(messengerConversations)
+					.set({
+						lastMessageAt: sql`max(${messengerConversations.lastMessageAt}, ${responseAt.getTime()})`,
+					})
+					.where(eq(messengerConversations.id, conversationId)),
+			],
+			result: "agent" as const,
+		};
 	});
-
-	await db()
-		.update(messengerConversations)
-		.set({ lastMessageAt: responseAt })
-		.where(eq(messengerConversations.id, conversationId));
 
 	await persistConversationToSupermemory({
 		conversationId,
@@ -276,7 +329,7 @@ export const sendMessengerUserMessage = async ({
 	}).catch(() => undefined);
 
 	revalidateMessengerPaths(conversationId);
-	return { mode: "agent" as const };
+	return { mode };
 };
 
 export const adminSetMessengerMode = async ({
@@ -289,23 +342,41 @@ export const adminSetMessengerMode = async ({
 	assertMessengerEnabled();
 	const viewer = await requireAdminViewer();
 	const now = new Date();
+	if (mode !== "agent" && mode !== "human") throw new Error("Invalid mode");
 
-	await db()
-		.update(messengerConversations)
-		.set(
-			mode === "human"
-				? {
-						mode,
-						takeoverByUserId: viewer.user.id,
-						takeoverAt: now,
-					}
-				: {
-						mode,
-						takeoverByUserId: null,
-						takeoverAt: null,
-					},
-		)
-		.where(eq(messengerConversations.id, conversationId));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireLiveAdmin(snapshot, viewer.user.id);
+		const [conversation] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(messengerConversations)
+				.where(eq(messengerConversations.id, conversationId))
+				.limit(1),
+		);
+		if (!conversation) throw new Error("Conversation not found");
+		return {
+			statements: [
+				database
+					.update(messengerConversations)
+					.set(
+						mode === "human"
+							? {
+									mode,
+									takeoverByUserId: viewer.user.id,
+									takeoverAt: now,
+								}
+							: {
+									mode,
+									takeoverByUserId: null,
+									takeoverAt: null,
+								},
+					)
+					.where(eq(messengerConversations.id, conversationId)),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidateMessengerPaths(conversationId);
 };
@@ -322,32 +393,43 @@ export const adminSendMessengerMessage = async ({
 	const normalized = normalizeContent(content);
 	if (!normalized) throw new Error("Message is empty");
 
-	const [conversation] = await db()
-		.select()
-		.from(messengerConversations)
-		.where(eq(messengerConversations.id, conversationId));
-	if (!conversation) throw new Error("Conversation not found");
-
 	const now = new Date();
-	await db().insert(messengerMessages).values({
-		id: nanoId(),
-		conversationId,
-		role: "admin",
-		content: normalized,
-		userId: viewer.user.id,
-		anonymousId: conversation.anonymousId,
-		createdAt: now,
+	const messageId = nanoId();
+	const database = db();
+	const conversation = await atomic(database, async (snapshot) => {
+		await requireLiveAdmin(snapshot, viewer.user.id);
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(messengerConversations)
+				.where(eq(messengerConversations.id, conversationId))
+				.limit(1),
+		);
+		if (!current) throw new Error("Conversation not found");
+		return {
+			statements: [
+				database.insert(messengerMessages).values({
+					id: messageId,
+					conversationId,
+					role: "admin",
+					content: normalized,
+					userId: viewer.user.id,
+					anonymousId: current.anonymousId,
+					createdAt: now,
+				}),
+				database
+					.update(messengerConversations)
+					.set({
+						mode: "human",
+						takeoverByUserId: viewer.user.id,
+						takeoverAt: now,
+						lastMessageAt: sql`max(${messengerConversations.lastMessageAt}, ${now.getTime()})`,
+					})
+					.where(eq(messengerConversations.id, conversationId)),
+			],
+			result: current,
+		};
 	});
-
-	await db()
-		.update(messengerConversations)
-		.set({
-			mode: "human",
-			takeoverByUserId: viewer.user.id,
-			takeoverAt: now,
-			lastMessageAt: now,
-		})
-		.where(eq(messengerConversations.id, conversationId));
 
 	await persistConversationToSupermemory({
 		conversationId,

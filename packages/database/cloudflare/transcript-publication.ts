@@ -244,7 +244,6 @@ export async function readTranscriptVtt(
 	video: TranscriptVideoReference,
 	store: TranscriptObjectReader,
 ): Promise<string | null> {
-	const pointer = publication(video.metadata);
 	const key = getTranscriptObjectKey(video, "vtt");
 	const vtt = key ? await store.getText(key) : null;
 	return validateTranscriptVtt(video, vtt);

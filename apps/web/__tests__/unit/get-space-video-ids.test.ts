@@ -9,8 +9,8 @@ const mocks = vi.hoisted(() => ({
 	spaceAccess: vi.fn(),
 }));
 
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	return { db: () => drizzle(mocks.query) };
 });
 vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.user }));

@@ -1,3 +1,5 @@
+vi.mock("server-only", () => ({}));
+
 import { Context, Effect } from "effect";
 import { isValidElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -61,7 +63,7 @@ const viewPolicy = Context.GenericTag<{
 	canViewLoaded: () => Effect.Effect<void>;
 }>("EditNavigationViewPolicy");
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: database.select,
 		delete: database.remove,

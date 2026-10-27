@@ -1,13 +1,16 @@
 import "server-only";
 
 import { randomUUID } from "node:crypto";
-import { db } from "@cap/database";
+import { cloudflareAccessPolicy } from "@cap/database/auth/identity";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicSnapshot, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	loomMigrationRequests,
 	organizations,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { buildEnv } from "@cap/env";
 import type { Organisation, User } from "@cap/web-domain";
 import {
@@ -18,12 +21,11 @@ import {
 	gt,
 	isNotNull,
 	isNull,
-	lte,
 	ne,
-	or,
 	sql,
 } from "drizzle-orm";
 import { requireOrganizationSettingsManager } from "@/actions/organization/authorization";
+import { isInstanceAdmin } from "@/lib/instance-admin";
 import { MESSENGER_ADMIN_EMAIL } from "@/lib/messenger/constants";
 import { isOrganizationOwnerPro } from "@/lib/org-pro";
 import {
@@ -108,7 +110,10 @@ export async function requireProCustomerMigrationAccess(
 	organizationId: Organisation.OrganisationId,
 ) {
 	const user = await requireCustomerMigrationAccess(organizationId);
-	if (!buildEnv.NEXT_PUBLIC_IS_CAP) {
+	if (
+		process.env.CAP_RUNTIME !== "cloudflare" &&
+		buildEnv.NEXT_PUBLIC_IS_CAP !== "true"
+	) {
 		throw new LoomMigrationError(
 			"Concierge migration is available on Cap Cloud.",
 		);
@@ -121,23 +126,36 @@ export async function requireProCustomerMigrationAccess(
 
 export async function requireMigrationOperator() {
 	const user = await getCurrentUser();
-	if (
-		!buildEnv.NEXT_PUBLIC_IS_CAP ||
-		!user ||
-		user.email.toLowerCase() !== MESSENGER_ADMIN_EMAIL
-	) {
+	if (!user || !isInstanceAdmin(user))
 		throw new LoomMigrationError("Unauthorized");
-	}
 	return user;
 }
 
-function affectedRows(result: unknown) {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
+export async function resolveTrustedMigrationOperator() {
+	const email =
+		process.env.CAP_RUNTIME === "cloudflare"
+			? cloudflareAccessPolicy().ownerEmail
+			: MESSENGER_ADMIN_EMAIL;
+	const [operator] = await db()
+		.select()
+		.from(users)
+		.where(eq(users.email, email))
+		.limit(1);
+	if (!operator || !isInstanceAdmin(operator))
+		throw new LoomMigrationError("Unauthorized");
+	return operator;
+}
+
+export async function assertMigrationOperator(
+	snapshot: AtomicSnapshot,
+	userId: User.UserId,
+) {
+	const [user] = await snapshot.read((reader) =>
+		reader.select().from(users).where(eq(users.id, userId)).limit(1),
+	);
+	if (!user || !isInstanceAdmin(user))
+		throw new LoomMigrationError("Unauthorized");
+	return user;
 }
 
 export async function reserveConciergeImport(
@@ -146,32 +164,46 @@ export async function reserveConciergeImport(
 ) {
 	const token = randomUUID();
 	const now = new Date();
-	const result = await db()
-		.update(loomMigrationRequests)
-		.set({
-			activeImportCount: 1,
-			activeImportLeaseToken: token,
-			activeImportLeaseUntil: new Date(now.getTime() + IMPORT_LEASE_MS),
-			status: sql`CASE WHEN ${loomMigrationRequests.status} = 'pending' THEN 'in_progress' ELSE ${loomMigrationRequests.status} END`,
-			lastOperatorUserId: operatorId,
-			lastOperatorAt: now,
-			updatedAt: now,
-		})
-		.where(
-			and(
-				eq(loomMigrationRequests.id, requestId),
-				isNotNull(loomMigrationRequests.activeOrganizationId),
-				or(
-					eq(loomMigrationRequests.activeImportCount, 0),
-					lte(loomMigrationRequests.activeImportLeaseUntil, now),
-				),
-			),
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await assertMigrationOperator(snapshot, operatorId);
+		const [request] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(loomMigrationRequests)
+				.where(eq(loomMigrationRequests.id, requestId))
+				.limit(1),
 		);
-	if (affectedRows(result) === 0) {
-		throw new LoomMigrationError(
-			"The migration request changed or another import is starting. Refresh and try again.",
-		);
-	}
+		if (
+			!request ||
+			request.activeOrganizationId !== request.organizationId ||
+			(request.activeImportCount > 0 &&
+				(!request.activeImportLeaseUntil ||
+					request.activeImportLeaseUntil > now))
+		)
+			throw new LoomMigrationError(
+				"The migration request changed or another import is starting. Refresh and try again.",
+			);
+		await requireActiveOrganization(snapshot, request.organizationId);
+		return {
+			statements: [
+				database
+					.update(loomMigrationRequests)
+					.set({
+						activeImportCount: 1,
+						activeImportLeaseToken: token,
+						activeImportLeaseUntil: new Date(now.getTime() + IMPORT_LEASE_MS),
+						status:
+							request.status === "pending" ? "in_progress" : request.status,
+						lastOperatorUserId: operatorId,
+						lastOperatorAt: now,
+						updatedAt: now,
+					})
+					.where(eq(loomMigrationRequests.id, requestId)),
+			],
+			result: undefined,
+		};
+	});
 	return token;
 }
 
@@ -198,7 +230,7 @@ export async function renewConciergeImport(requestId: string, token: string) {
 	const result = await db()
 		.update(loomMigrationRequests)
 		.set({
-			activeImportLeaseUntil: sql`DATE_ADD(GREATEST(${loomMigrationRequests.activeImportLeaseUntil}, ${deadline}), INTERVAL 1 SECOND)`,
+			activeImportLeaseUntil: sql`max(${loomMigrationRequests.activeImportLeaseUntil}, ${deadline.getTime()}) + 1000`,
 			updatedAt: now,
 		})
 		.where(
@@ -209,7 +241,7 @@ export async function renewConciergeImport(requestId: string, token: string) {
 				isNotNull(loomMigrationRequests.activeOrganizationId),
 			),
 		);
-	if (affectedRows(result) === 0) {
+	if (result.meta.changes === 0) {
 		throw new LoomMigrationError(
 			"The concierge import expired. Refresh and retry.",
 		);

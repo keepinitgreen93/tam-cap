@@ -11,8 +11,8 @@ const { db, start, where, syncVideoDisplayNames, runWorkflowPromise } =
 		runWorkflowPromise: vi.fn(() => Promise.resolve()),
 	}));
 
-vi.mock("@cap/database", () => ({ db }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({ db }));
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	videos: { id: "id", storageIntegrationId: "storageIntegrationId" },
 }));
 vi.mock("@cap/web-backend/src/Storage/index", () => ({

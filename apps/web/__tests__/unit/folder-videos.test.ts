@@ -1,4 +1,4 @@
-import { Database, ImageUploads } from "@cap/web-backend";
+import { CloudflareDatabase as Database, ImageUploads } from "@cap/web-backend";
 import { Folder, Organisation, Space } from "@cap/web-domain";
 import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -8,7 +8,7 @@ const mocks = vi.hoisted(() => ({ query: vi.fn() }));
 
 vi.mock("server-only", () => ({}));
 vi.mock("@cap/web-backend", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const { Effect } = await import("effect");
 	const { resolveEffectiveVideoRules } = await import(
 		"../../../../packages/web-backend/src/Videos/EffectiveVideoRules"
@@ -25,7 +25,11 @@ vi.mock("@cap/web-backend", async () => {
 			resolveImageUrl: (key: string) => Effect.succeed(key),
 		},
 	}) {}
-	return { Database, ImageUploads, resolveEffectiveVideoRules };
+	return {
+		CloudflareDatabase: Database,
+		ImageUploads,
+		resolveEffectiveVideoRules,
+	};
 });
 
 beforeEach(() => {
@@ -49,21 +53,21 @@ describe.each([
 						"video-1",
 						"owner-1",
 						"Product walkthrough",
-						"2026-10-23 12:00:00",
-						true,
+						new Date("2026-10-23T12:00:00Z").getTime(),
+						1,
 						null,
-						{ type: "webMP4" },
-						false,
+						JSON.stringify({ type: "webMP4" }),
+						0,
 						duration,
 						null,
 						"org-1",
 						0,
 						0,
-						[],
+						"[]",
 						"Owner",
-						"2026-10-23 12:00:00",
-						false,
-						false,
+						new Date("2026-10-23T12:00:00Z").getTime(),
+						0,
+						0,
 					],
 				],
 			});

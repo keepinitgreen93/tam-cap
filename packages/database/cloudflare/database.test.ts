@@ -13,7 +13,11 @@ import {
 	SQLiteTable,
 } from "drizzle-orm/sqlite-core";
 import { Miniflare } from "miniflare";
-import * as upstream from "../schema.ts";
+import * as canonicalDatabase from "../index.ts";
+import { db as legacyDb } from "../legacy/index.ts";
+import * as upstream from "../legacy/schema.ts";
+import * as canonicalSchema from "../schema.ts";
+import { db as applicationDb } from "./application.ts";
 import { createCloudflareDb } from "./index.ts";
 import * as schema from "./schema.ts";
 
@@ -25,6 +29,19 @@ const runtime = new Miniflare({
 });
 let binding: Awaited<ReturnType<typeof runtime.getD1Database>>;
 let database: ReturnType<typeof createCloudflareDb>;
+
+test("canonical exports use D1 while legacy MySQL cannot connect from Cloudflare", () => {
+	assert.equal(canonicalDatabase.db, applicationDb);
+	assert.equal(canonicalSchema.videos, schema.videos);
+	const previous = process.env.CAP_RUNTIME;
+	process.env.CAP_RUNTIME = "cloudflare";
+	try {
+		assert.throws(() => legacyDb(), /Legacy MySQL persistence is unavailable/);
+	} finally {
+		if (previous === undefined) delete process.env.CAP_RUNTIME;
+		else process.env.CAP_RUNTIME = previous;
+	}
+});
 
 before(async () => {
 	binding = await runtime.getD1Database("DB");

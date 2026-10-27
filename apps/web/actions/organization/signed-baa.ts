@@ -1,11 +1,11 @@
 "use server";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/legacy";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { sendEmail } from "@cap/database/emails/config";
 import { SignedBaa } from "@cap/database/emails/signed-baa";
 import { nanoId } from "@cap/database/helpers";
-import { organizations, signedBaas } from "@cap/database/schema";
+import { organizations, signedBaas } from "@cap/database/legacy/schema";
 import { serverEnv } from "@cap/env";
 import {
 	isProSubscription,

@@ -59,7 +59,6 @@ import {
 } from "drizzle-orm";
 import { Effect, Layer, Option } from "effect";
 import { revalidatePath } from "next/cache";
-import { start } from "workflow/api";
 import { downloadLoomVideo } from "@/actions/loom";
 import { getOrgAnalyticsData } from "@/app/(org)/dashboard/analytics/data";
 import {
@@ -72,6 +71,7 @@ import {
 	isEmailCodeSendLimited,
 	isEmailCodeVerifyLimited,
 } from "@/lib/email-code-rate-limit";
+import { startLoomImportWorkflow } from "@/lib/loom-import-start";
 import {
 	resolveMobileRequestOrigin,
 	resolveMobileWebResourceUrl,
@@ -82,7 +82,6 @@ import { apiToHandler } from "@/lib/server";
 import { enqueueVideoStorageNameSync } from "@/lib/sync-video-storage-names";
 import { getTranscriptObjectKey } from "@/lib/transcript-publication";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
-import { importLoomVideoWorkflow } from "@/workflows/import-loom-video";
 
 export const dynamic = "force-dynamic";
 
@@ -2530,15 +2529,13 @@ const importLoom = Effect.fn("Mobile.importLoom")(function* (
 	const rawFileKey = `${user.id}/${videoId}/raw-upload.mp4`;
 	yield* Effect.tryPromise({
 		try: () =>
-			start(importLoomVideoWorkflow, [
-				{
-					videoId,
-					userId: user.id,
-					rawFileKey,
-					bucketId: Option.getOrNull(writable.bucketId),
-					loomVideoId,
-				},
-			]),
+			startLoomImportWorkflow({
+				videoId,
+				userId: user.id,
+				rawFileKey,
+				bucketId: Option.getOrNull(writable.bucketId),
+				loomVideoId,
+			}),
 		catch: () => new HttpApiError.InternalServerError(),
 	});
 	yield* Effect.sync(() => revalidatePath("/dashboard/caps"));

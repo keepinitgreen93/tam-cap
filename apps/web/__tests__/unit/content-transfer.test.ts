@@ -189,6 +189,28 @@ describe("content transfer planning", () => {
 			}),
 		).toBeNull();
 	});
+	it("keeps linked Drive ownership changes closed while allowing same-owner folder moves", () => {
+		const input = {
+			sourceOwnerId: "source-user",
+			targetUserId: "target-user",
+			organizationId: "org",
+			bucketId: null,
+			bucketOwnerId: null,
+			bucketOrganizationId: null,
+			storageIntegrationId: "drive",
+			storageIntegrationOwnerId: "source-user",
+			storageIntegrationOrganizationId: "org",
+		};
+		expect(getContentTransferStorageBlockReason(input)).toBe(
+			"Ownership transfer for linked Drive storage is not supported",
+		);
+		expect(
+			getContentTransferStorageBlockReason({
+				...input,
+				targetUserId: "source-user",
+			}),
+		).toBeNull();
+	});
 });
 
 describe("content transfer safety contract", () => {
@@ -197,6 +219,7 @@ describe("content transfer safety contract", () => {
 			join(process.cwd(), "actions/organization/content-transfer.ts"),
 			"utf8",
 		);
+		expect(source.trimStart().startsWith('"use server";')).toBe(true);
 		expect(
 			source.match(/const user = await requireContentManager\(\)/g),
 		).toHaveLength(5);
@@ -206,8 +229,12 @@ describe("content transfer safety contract", () => {
 		);
 		expect(
 			startSource.indexOf("state.previewToken !== input.previewToken"),
-		).toBeLessThan(startSource.indexOf("tx.insert(agentApiOperations)"));
-		expect(startSource).toContain('.for("update")');
+		).toBeLessThan(startSource.indexOf(".insert(agentApiOperations)"));
+		expect(startSource).toContain("await atomic(database");
+		expect(startSource).toContain("await requireOrganizationManager(");
+		expect(startSource).toContain(
+			"buildTransferState({ user, ...input, reader })",
+		);
 		expect(startSource).toContain(
 			'inArray(agentApiOperations.state, ["queued", "running"])',
 		);
@@ -222,17 +249,21 @@ describe("content transfer safety contract", () => {
 			source.indexOf("async function transferOneVideo"),
 			source.indexOf("async function cleanupSourceFolders"),
 		);
-		expect(transferSource.indexOf("copyAndVerifyObjects")).toBeLessThan(
-			transferSource.indexOf(".update(Db.videos)"),
+		const helper = readFileSync(
+			join(process.cwd(), "lib/video-ownership-transfer.ts"),
+			"utf8",
 		);
-		expect(transferSource.indexOf(".update(Db.videos)")).toBeLessThan(
-			transferSource.indexOf(".deleteObjects("),
-		);
+		expect(
+			transferSource.indexOf("prepareVideoOwnershipTransfer"),
+		).toBeLessThan(transferSource.indexOf("planVideoOwnershipTransfer"));
 		expect(transferSource).toContain(
-			"sourceMembership.folderId !== item.sourceFolderId",
+			"membership.folderId !== item.sourceFolderId",
 		);
-		expect(transferSource).toContain("canManageContentTransfer");
-		expect(transferSource).toContain("eq(Db.folders.public, false)");
+		expect(transferSource).toContain("requireTransferAccess");
+		expect(helper).toContain("isDeepStrictEqual(locked, current)");
+		expect(helper).toContain("eq(Db.folders.public, false)");
+		expect(transferSource).toContain("retainedOwnershipTransferMediaReason");
+		expect(transferSource).not.toContain(".deleteObjects(");
 	});
 
 	it("revalidates the reviewed hierarchy before creating destination folders", () => {
@@ -248,7 +279,9 @@ describe("content transfer safety contract", () => {
 		expect(workflowSource.indexOf("verifySourceSnapshot")).toBeLessThan(
 			workflowSource.indexOf("createDestinationFolders"),
 		);
-		expect(source).toContain("current.uploadPhase !== item.sourceUploadPhase");
+		expect(source).toContain(
+			"(current.upload?.phase ?? null) !== item.sourceUploadPhase",
+		);
 		expect(source).toContain("current.public !== plan.sourcePublic");
 	});
 });

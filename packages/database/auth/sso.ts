@@ -33,6 +33,8 @@ export type SsoAuthContext = {
 };
 
 export function getWorkOS() {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error("SAML SSO is unavailable on this instance.");
 	const { WORKOS_API_KEY, WORKOS_CLIENT_ID } = serverEnv();
 	if (!WORKOS_API_KEY || !WORKOS_CLIENT_ID) {
 		throw new Error("SAML SSO is not configured. Please contact Cap support.");

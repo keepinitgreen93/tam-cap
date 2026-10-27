@@ -1,7 +1,19 @@
-import { db } from "@cap/database";
+import { randomUUID } from "node:crypto";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videoEdits, videos, videoUploads } from "@cap/database/schema";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import {
+	videoEdits,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
+import {
+	createTranscriptInvalidation,
+	getTranscriptPublication,
+	transcriptMediaRevision,
+} from "@cap/database/cloudflare/transcript-publication";
 import { Storage } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
@@ -38,58 +50,82 @@ export async function POST(request: NextRequest) {
 		decodeStorageVideo(video),
 	).pipe(runPromise);
 
-	const deleted: string[] = [];
-	for (const prefix of [
-		`${video.ownerId}/${video.id}/transcription`,
-		`${video.ownerId}/${video.id}/audio`,
-	]) {
-		const listed = await bucket.listObjects({ prefix }).pipe(runPromise);
-		const objects = (listed.Contents ?? [])
-			.map((object) => ({ Key: object.Key }))
-			.filter((object): object is { Key: string } => Boolean(object.Key));
-		if (objects.length > 0) {
-			await bucket.deleteObjects(objects).pipe(runPromise);
-			deleted.push(...objects.map((object) => object.Key));
-		}
-	}
-
 	const [edit] = await db()
 		.select()
 		.from(videoEdits)
 		.where(eq(videoEdits.videoId, videoId));
-	let restoredOriginal = false;
-	let restoredDuration: number | null = null;
-	if (edit) {
+	const restoredKey = edit
+		? `${video.ownerId}/${video.id}/.recording/reset/${randomUUID()}/result.mp4`
+		: null;
+	if (edit && restoredKey)
 		await bucket
-			.copyObject(
-				`${bucket.bucketName}/${edit.sourceKey}`,
-				`${video.ownerId}/${video.id}/result.mp4`,
-			)
+			.copyObject(`${bucket.bucketName}/${edit.sourceKey}`, restoredKey)
 			.pipe(runPromise);
-		await bucket.deleteObject(edit.sourceKey).pipe(runPromise);
-		deleted.push(edit.sourceKey);
-		restoredOriginal = true;
-		restoredDuration = edit.editSpec.sourceDuration;
-		await db().delete(videoEdits).where(eq(videoEdits.videoId, videoId));
-	}
-
-	const metadata = {
-		...((video.metadata as Record<string, unknown> | null) ?? {}),
-	};
-	delete metadata.summary;
-	delete metadata.chapters;
-	delete metadata.aiGenerationStatus;
-	delete metadata.editTranscriptBackfill;
-
-	await db()
-		.update(videos)
-		.set({
-			transcriptionStatus: null,
-			metadata,
-			...(restoredDuration === null ? {} : { duration: restoredDuration }),
-		})
-		.where(eq(videos.id, videoId));
-	await db().delete(videoUploads).where(eq(videoUploads.videoId, videoId));
+	const invalidation = createTranscriptInvalidation();
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const [current] = await snapshot.read((reader) =>
+			reader.select().from(videos).where(eq(videos.id, videoId)).limit(1),
+		);
+		const [currentEdit] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoEdits)
+				.where(eq(videoEdits.videoId, videoId))
+				.limit(1),
+		);
+		if (
+			!current ||
+			current.ownerId !== user.id ||
+			transcriptMediaRevision(current) !== transcriptMediaRevision(video) ||
+			getTranscriptPublication(current)?.id !==
+				getTranscriptPublication(video)?.id ||
+			JSON.stringify(currentEdit ?? null) !== JSON.stringify(edit ?? null)
+		)
+			throw new Error("Video changed during reset");
+		if (current.orgId) await requireActiveOrganization(snapshot, current.orgId);
+		const metadata = {
+			...current.metadata,
+			transcriptPublication: invalidation,
+		};
+		delete metadata.summary;
+		delete metadata.chapters;
+		delete metadata.aiGenerationStatus;
+		delete metadata.aiGenerationRun;
+		delete metadata.editTranscriptBackfill;
+		delete metadata.transcriptionRun;
+		delete metadata.liveTranscript;
+		delete metadata.completedVideoEdit;
+		delete metadata.editProcessing;
+		delete metadata.processingRun;
+		delete metadata.desktopRecordingUpload;
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({
+						transcriptionStatus: null,
+						metadata,
+						...(restoredKey && edit
+							? {
+									duration: edit.editSpec.sourceDuration,
+									source: {
+										type: "desktopMP4" as const,
+										outputKey: restoredKey,
+									},
+								}
+							: {}),
+					})
+					.where(eq(videos.id, videoId)),
+				database.delete(videoEdits).where(eq(videoEdits.videoId, videoId)),
+				database.delete(videoUploads).where(eq(videoUploads.videoId, videoId)),
+			],
+			result: undefined,
+		};
+	});
+	const deleted: string[] = [];
+	const restoredOriginal = Boolean(edit);
+	const restoredDuration = edit?.editSpec.sourceDuration ?? null;
 
 	return Response.json({
 		ok: true,

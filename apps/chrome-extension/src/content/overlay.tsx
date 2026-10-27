@@ -58,6 +58,8 @@ const createSecureToken = () => {
 };
 
 const PREVIEW_TOKEN = createSecureToken();
+const PANEL_TOKEN = createSecureToken();
+const PANEL_SRC = `${chrome.runtime.getURL("popup.html")}#${encodeURIComponent(PANEL_TOKEN)}`;
 const PREVIEW_URL = chrome.runtime.getURL("camera-preview.html");
 const PREVIEW_SRC = `${PREVIEW_URL}#${encodeURIComponent(PREVIEW_TOKEN)}`;
 const PREVIEW_ERROR_DELAY_MS = 1200;
@@ -78,7 +80,7 @@ let overlayTokensRegistration: Promise<boolean> | null = null;
 
 const ensureOverlayTokensRegistered = () => {
 	overlayTokensRegistration ??= Promise.all(
-		[PREVIEW_TOKEN].map((token) =>
+		[PREVIEW_TOKEN, PANEL_TOKEN].map((token) =>
 			sendServiceWorkerMessage({
 				target: "service-worker",
 				type: "register-overlay-token",
@@ -339,6 +341,8 @@ function OverlayApp() {
 	const [previewPointerInside, setPreviewPointerInside] = useState(false);
 	const [recordingPreviewActive, setRecordingPreviewActive] = useState(false);
 	const [recorderPanelOpen, setRecorderPanelOpen] = useState(false);
+	const [panelHeight, setPanelHeight] = useState(560);
+	const panelIframeRef = useRef<HTMLIFrameElement>(null);
 	const [previewTokenReady, setPreviewTokenReady] = useState(false);
 	const iframeRef = useRef<HTMLIFrameElement>(null);
 	const windowRef = useRef<HTMLDivElement>(null);
@@ -525,7 +529,7 @@ function OverlayApp() {
 	// worker knows this page's tokens; an unregistered frame is refused camera
 	// access.
 	useEffect(() => {
-		if (!previewEnabled || previewTokenReady) return;
+		if ((!previewEnabled && !recorderPanelOpen) || previewTokenReady) return;
 		let disposed = false;
 		void ensureOverlayTokensRegistered().then((registered) => {
 			if (!disposed && registered) setPreviewTokenReady(true);
@@ -533,7 +537,37 @@ function OverlayApp() {
 		return () => {
 			disposed = true;
 		};
-	}, [previewEnabled, previewTokenReady]);
+	}, [previewEnabled, previewTokenReady, recorderPanelOpen]);
+
+	useEffect(() => {
+		const handlePanelMessage = (event: MessageEvent<unknown>) => {
+			if (
+				event.source !== panelIframeRef.current?.contentWindow ||
+				!event.data ||
+				typeof event.data !== "object"
+			)
+				return;
+			const data = event.data as Record<string, unknown>;
+			if (data.source !== "cap-extension-panel" || data.token !== PANEL_TOKEN)
+				return;
+			if (
+				data.type === "size" &&
+				typeof data.height === "number" &&
+				Number.isFinite(data.height)
+			) {
+				setPanelHeight(
+					Math.max(120, Math.min(data.height, window.innerHeight - 32)),
+				);
+			} else if (data.type === "dismiss") {
+				void sendServiceWorkerMessage({
+					target: "service-worker",
+					type: "close-extension-ui",
+				}).catch(() => undefined);
+			}
+		};
+		window.addEventListener("message", handlePanelMessage);
+		return () => window.removeEventListener("message", handlePanelMessage);
+	}, []);
 
 	useEffect(() => {
 		let disposed = false;
@@ -791,6 +825,7 @@ function OverlayApp() {
 
 			if (message.type !== "overlay-settings") return false;
 
+			if (message.recorderOpen) previewDismissedRef.current = false;
 			if (previewDismissedRef.current) return false;
 
 			const webcamSettings = message.settings;
@@ -1618,6 +1653,41 @@ function OverlayApp() {
 
 	return (
 		<>
+			{recorderPanelOpen && previewTokenReady ? (
+				<>
+					<button
+						type="button"
+						tabIndex={-1}
+						className="cap-extension-panel-backdrop"
+						aria-label="Close Cap recorder"
+						onClick={() => {
+							void sendServiceWorkerMessage({
+								target: "service-worker",
+								type: "close-extension-ui",
+							}).catch(() => undefined);
+						}}
+					/>
+					<div
+						className="cap-extension-panel"
+						role="dialog"
+						aria-label="Cap recorder"
+						style={{
+							width: "332px",
+							height: `${panelHeight}px`,
+							maxWidth: "calc(100vw - 32px)",
+							maxHeight: "calc(100vh - 32px)",
+						}}
+					>
+						<iframe
+							ref={panelIframeRef}
+							src={PANEL_SRC}
+							title="Cap recorder"
+							allow="camera; microphone; autoplay"
+							className="cap-extension-panel-iframe"
+						/>
+					</div>
+				</>
+			) : null}
 			{cameraWindow}
 			<video
 				ref={pipVideoRef}

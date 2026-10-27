@@ -51,6 +51,10 @@ type UploadTargetInput = {
 type StorageObjectHead = RecordingObjectHead & {
 	ContentLength?: number;
 	ContentType?: string;
+	CacheControl?: string;
+	ContentDisposition?: string;
+	ContentEncoding?: string;
+	ContentLanguage?: string;
 	Metadata?: Record<string, string | undefined>;
 	RecordingContentSHA256?: string;
 };
@@ -456,6 +460,10 @@ const makeS3Access = (s3: S3BucketAccess, defaultBucket = false) => ({
 				(result): StorageObjectHead => ({
 					ContentLength: result.ContentLength,
 					ContentType: result.ContentType,
+					CacheControl: result.CacheControl,
+					ContentDisposition: result.ContentDisposition,
+					ContentEncoding: result.ContentEncoding,
+					ContentLanguage: result.ContentLanguage,
 					Metadata: result.Metadata,
 					ETag: result.ETag,
 				}),

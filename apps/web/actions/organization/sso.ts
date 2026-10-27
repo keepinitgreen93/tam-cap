@@ -71,6 +71,10 @@ async function requireSsoManager(organizationId: Organisation.OrganisationId) {
 }
 
 async function requireSsoOwner(organizationId: Organisation.OrganisationId) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor SSO billing is unavailable on this self-hosted instance",
+		);
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 	await requireOrganizationOwner(user.id, organizationId);
@@ -89,7 +93,9 @@ export async function getOrganizationSsoSettings(
 	const { user, access, organization } =
 		await requireSsoManager(organizationId);
 	const env = serverEnv();
-	const ssoAvailable = Boolean(env.WORKOS_API_KEY && env.WORKOS_CLIENT_ID);
+	const ssoAvailable =
+		process.env.CAP_RUNTIME !== "cloudflare" &&
+		Boolean(env.WORKOS_API_KEY && env.WORKOS_CLIENT_ID);
 	const [billing, prices, configuration] = await Promise.all([
 		refreshSsoBilling(organizationId),
 		getSsoPrices(organizationId).catch(() => []),
@@ -158,6 +164,10 @@ export async function openOrganizationSsoPortal(
 	domain?: string,
 	purpose: "sso" | "domain_verification" = "sso",
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Vendor SSO provisioning is unavailable on this self-hosted instance",
+		);
 	await requireSsoManager(organizationId);
 	if (purpose !== "sso" && purpose !== "domain_verification")
 		throw new Error("Invalid setup request.");

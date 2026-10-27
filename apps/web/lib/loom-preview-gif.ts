@@ -1,7 +1,7 @@
 import "server-only";
 
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import type { Storage } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
@@ -29,11 +29,6 @@ export function isLoomPreviewDue(
 	if (preview?.status !== "started") return false;
 	const startedAt = Date.parse(preview.startedAt ?? "");
 	return !Number.isFinite(startedAt) || now - startedAt > LOOM_PREVIEW_RETRY_MS;
-}
-
-function getAffectedRows(result: unknown) {
-	const header = Array.isArray(result) ? result[0] : result;
-	return (header as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
 }
 
 export async function startLoomPreviewGif({
@@ -68,12 +63,20 @@ export async function startLoomPreviewGif({
 		.where(
 			and(
 				eq(videos.id, video.id),
-				sql`(JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomPreviewGif.status')) = 'pending' OR (JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomPreviewGif.status')) = 'started' AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomPreviewGif.startedAt')), '') < ${retryBefore}))`,
+				sql`(json_extract(${videos.metadata}, '$.loomPreviewGif.status') = 'pending' OR (json_extract(${videos.metadata}, '$.loomPreviewGif.status') = 'started' AND COALESCE(json_extract(${videos.metadata}, '$.loomPreviewGif.startedAt'), '') < ${retryBefore}))`,
 			),
 		);
-	if (getAffectedRows(claim) !== 1) return "already-started" as const;
+	if (claim.meta.changes !== 1) return "already-started" as const;
 
 	const prefix = `${video.ownerId}/${video.id}`;
+	const outputKey =
+		video.source && "outputKey" in video.source
+			? video.source.outputKey
+			: undefined;
+	const previewKey =
+		video.source && "previewKey" in video.source
+			? video.source.previewKey
+			: undefined;
 	const response = await fetch(`${env.LOOM_IMPORTER_URL}/video/preview-gif`, {
 		method: "POST",
 		headers: {
@@ -82,11 +85,11 @@ export async function startLoomPreviewGif({
 		},
 		body: JSON.stringify({
 			videoUrl: await getVideoUrl(
-				`${prefix}/result.mp4`,
+				outputKey ?? `${prefix}/result.mp4`,
 				PREVIEW_URL_EXPIRES_SECONDS,
 			),
 			previewGifPresignedUrl: await getPreviewPutUrl(
-				`${prefix}/preview/animated-preview.gif`,
+				previewKey ?? `${prefix}/preview/animated-preview.gif`,
 				PREVIEW_URL_EXPIRES_SECONDS,
 			),
 			duration,
@@ -103,7 +106,7 @@ export async function startLoomPreviewGif({
 			.where(
 				and(
 					eq(videos.id, video.id),
-					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomPreviewGif.startedAt')) = ${startedAt}`,
+					sql`json_extract(${videos.metadata}, '$.loomPreviewGif.startedAt') = ${startedAt}`,
 				),
 			);
 		return "busy" as const;
@@ -117,7 +120,7 @@ export async function startLoomPreviewGif({
 		.where(
 			and(
 				eq(videos.id, video.id),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomPreviewGif.startedAt')) = ${startedAt}`,
+				sql`json_extract(${videos.metadata}, '$.loomPreviewGif.startedAt') = ${startedAt}`,
 			),
 		);
 	return "complete" as const;

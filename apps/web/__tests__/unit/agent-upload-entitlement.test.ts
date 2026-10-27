@@ -98,7 +98,7 @@ describe("agent upload entitlement", () => {
 			uploadSource.indexOf("storage.getWritableAccessForUser"),
 		);
 		expect(entitlementCheck).toBeLessThan(
-			uploadSource.indexOf("tx.insert(Db.videos)"),
+			uploadSource.indexOf("db.insert(Db.videos)"),
 		);
 	});
 
@@ -190,7 +190,7 @@ describe("agent upload entitlement", () => {
 			"payload.rawFileKey !== acceptedRawFileKey",
 		);
 		expect(cleanupSource.indexOf("bucket.deleteObjects")).toBeLessThan(
-			cleanupSource.indexOf("db.transaction"),
+			cleanupSource.indexOf("atomic(db"),
 		);
 		expect(completionSource).toContain(".delete(Db.agentApiIdempotency)");
 		expect(completionSource).toContain(".delete(Db.comments)");

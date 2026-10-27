@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { organizationSso } from "@cap/database/schema";
+import type { organizationSso } from "@cap/database/legacy/schema";
 import type Stripe from "stripe";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -30,8 +30,8 @@ vi.mock("@cap/utils", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@cap/utils")>();
 	return { ...actual, stripe: () => mocks.stripe };
 });
-vi.mock("@cap/database", () => ({ db: () => database }));
-vi.mock("@cap/database/schema", () => {
+vi.mock("@cap/database/legacy", () => ({ db: () => database }));
+vi.mock("@cap/database/legacy/schema", () => {
 	const table = (name: string, columns: string[]) => ({
 		_table: name,
 		...Object.fromEntries(

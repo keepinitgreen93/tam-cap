@@ -2,7 +2,7 @@ import "server-only";
 
 import { getCurrentUser } from "@cap/database/auth/session";
 import { db } from "@cap/database/cloudflare/application";
-import { atomic } from "@cap/database/cloudflare/atomic";
+import { type AtomicSnapshot, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	messengerConversations,
 	messengerMessages,
@@ -98,7 +98,10 @@ type LatestMessageSummary = {
 	createdAt: Date;
 };
 
-const appendLatestMessage = async (rows: ConversationSummaryRow[]) => {
+const appendLatestMessage = async (
+	rows: ConversationSummaryRow[],
+	snapshot: AtomicSnapshot,
+) => {
 	if (!rows.length) {
 		return [] as Array<
 			ConversationSummaryRow & {
@@ -107,18 +110,20 @@ const appendLatestMessage = async (rows: ConversationSummaryRow[]) => {
 		>;
 	}
 
-	const messages = await db()
-		.select({
-			conversationId: messengerMessages.conversationId,
-			content: messengerMessages.content,
-			role: messengerMessages.role,
-			createdAt: messengerMessages.createdAt,
-		})
-		.from(messengerMessages)
-		.where(
-			sql`${messengerMessages.conversationId} in (select value from json_each(${JSON.stringify(rows.map((row) => row.id))}))`,
-		)
-		.orderBy(desc(messengerMessages.createdAt));
+	const messages = await snapshot.read((reader) =>
+		reader
+			.select({
+				conversationId: messengerMessages.conversationId,
+				content: messengerMessages.content,
+				role: messengerMessages.role,
+				createdAt: messengerMessages.createdAt,
+			})
+			.from(messengerMessages)
+			.where(
+				sql`${messengerMessages.conversationId} in (select value from json_each(${JSON.stringify(rows.map((row) => row.id))}))`,
+			)
+			.orderBy(desc(messengerMessages.createdAt)),
+	);
 
 	const latestByConversation = new Map<string, LatestMessageSummary>();
 
@@ -163,47 +168,66 @@ export const listViewerMessengerConversations = async (limit = 30) => {
 		};
 	}
 
-	const conversations = await db()
-		.select()
-		.from(messengerConversations)
-		.where(whereClause)
-		.orderBy(desc(messengerConversations.lastMessageAt))
-		.limit(limit);
+	return atomic(db(), async (snapshot) => {
+		const conversations = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(messengerConversations)
+				.where(whereClause)
+				.orderBy(desc(messengerConversations.lastMessageAt))
+				.limit(limit),
+		);
 
-	return {
-		viewer,
-		conversations: await appendLatestMessage(conversations),
-	};
+		return {
+			statements: [],
+			result: {
+				viewer,
+				conversations: await appendLatestMessage(conversations, snapshot),
+			},
+		};
+	});
 };
 
 export const listAdminMessengerConversations = async (limit = 80) => {
 	const viewer = await getViewerContext();
 	if (!viewer.user || !viewer.isAdmin) throw new Error("Unauthorized");
 
-	const rows = await db()
-		.select({
-			id: messengerConversations.id,
-			agent: messengerConversations.agent,
-			mode: messengerConversations.mode,
-			userId: messengerConversations.userId,
-			anonymousId: messengerConversations.anonymousId,
-			takeoverByUserId: messengerConversations.takeoverByUserId,
-			takeoverAt: messengerConversations.takeoverAt,
-			createdAt: messengerConversations.createdAt,
-			updatedAt: messengerConversations.updatedAt,
-			lastMessageAt: messengerConversations.lastMessageAt,
-			userName: users.name,
-			userEmail: users.email,
-		})
-		.from(messengerConversations)
-		.leftJoin(users, eq(messengerConversations.userId, users.id))
-		.orderBy(desc(messengerConversations.lastMessageAt))
-		.limit(limit);
+	const userId = viewer.user.id;
+	return atomic(db(), async (snapshot) => {
+		const [currentUser] = await snapshot.read((reader) =>
+			reader.select().from(users).where(eq(users.id, userId)).limit(1),
+		);
+		if (!isInstanceAdmin(currentUser)) throw new Error("Unauthorized");
+		const rows = await snapshot.read((reader) =>
+			reader
+				.select({
+					id: messengerConversations.id,
+					agent: messengerConversations.agent,
+					mode: messengerConversations.mode,
+					userId: messengerConversations.userId,
+					anonymousId: messengerConversations.anonymousId,
+					takeoverByUserId: messengerConversations.takeoverByUserId,
+					takeoverAt: messengerConversations.takeoverAt,
+					createdAt: messengerConversations.createdAt,
+					updatedAt: messengerConversations.updatedAt,
+					lastMessageAt: messengerConversations.lastMessageAt,
+					userName: users.name,
+					userEmail: users.email,
+				})
+				.from(messengerConversations)
+				.leftJoin(users, eq(messengerConversations.userId, users.id))
+				.orderBy(desc(messengerConversations.lastMessageAt))
+				.limit(limit),
+		);
 
-	return {
-		viewer,
-		conversations: await appendLatestMessage(rows),
-	};
+		return {
+			statements: [],
+			result: {
+				viewer,
+				conversations: await appendLatestMessage(rows, snapshot),
+			},
+		};
+	});
 };
 
 export const getMessengerConversationForViewer = async ({
@@ -221,61 +245,77 @@ export const getMessengerConversationForViewer = async ({
 		});
 	}
 
-	const [conversation] = await db()
-		.select({
-			id: messengerConversations.id,
-			agent: messengerConversations.agent,
-			mode: messengerConversations.mode,
-			userId: messengerConversations.userId,
-			anonymousId: messengerConversations.anonymousId,
-			takeoverByUserId: messengerConversations.takeoverByUserId,
-			takeoverAt: messengerConversations.takeoverAt,
-			createdAt: messengerConversations.createdAt,
-			updatedAt: messengerConversations.updatedAt,
-			lastMessageAt: messengerConversations.lastMessageAt,
-			userName: users.name,
-			userEmail: users.email,
-		})
-		.from(messengerConversations)
-		.leftJoin(users, eq(messengerConversations.userId, users.id))
-		.where(eq(messengerConversations.id, conversationId));
+	return atomic(db(), async (snapshot) => {
+		const [conversation] = await snapshot.read((reader) =>
+			reader
+				.select({
+					id: messengerConversations.id,
+					agent: messengerConversations.agent,
+					mode: messengerConversations.mode,
+					userId: messengerConversations.userId,
+					anonymousId: messengerConversations.anonymousId,
+					takeoverByUserId: messengerConversations.takeoverByUserId,
+					takeoverAt: messengerConversations.takeoverAt,
+					createdAt: messengerConversations.createdAt,
+					updatedAt: messengerConversations.updatedAt,
+					lastMessageAt: messengerConversations.lastMessageAt,
+					userName: users.name,
+					userEmail: users.email,
+				})
+				.from(messengerConversations)
+				.leftJoin(users, eq(messengerConversations.userId, users.id))
+				.where(eq(messengerConversations.id, conversationId)),
+		);
 
-	if (!conversation) return null;
+		if (!conversation) return { statements: [], result: null };
 
-	const adminAllowed = allowAdmin && viewer.isAdmin;
-	const matchesUser = Boolean(
-		viewer.user && conversation.userId === viewer.user.id,
-	);
-	const matchesAnonymous = Boolean(
-		viewer.anonymousId && conversation.anonymousId === viewer.anonymousId,
-	);
-	const matchesAnonymousAsSignedInUser = Boolean(
-		viewer.user && !conversation.userId && matchesAnonymous,
-	);
-	const matchesAnonymousAsVisitor = Boolean(
-		!viewer.user && !conversation.userId && matchesAnonymous,
-	);
+		let adminAllowed = false;
+		if (allowAdmin && viewer.isAdmin && viewer.user) {
+			const userId = viewer.user.id;
+			const [currentUser] = await snapshot.read((reader) =>
+				reader.select().from(users).where(eq(users.id, userId)).limit(1),
+			);
+			adminAllowed = isInstanceAdmin(currentUser);
+		}
+		const matchesUser = Boolean(
+			viewer.user && conversation.userId === viewer.user.id,
+		);
+		const matchesAnonymous = Boolean(
+			viewer.anonymousId && conversation.anonymousId === viewer.anonymousId,
+		);
+		const matchesAnonymousAsSignedInUser = Boolean(
+			viewer.user && !conversation.userId && matchesAnonymous,
+		);
+		const matchesAnonymousAsVisitor = Boolean(
+			!viewer.user && !conversation.userId && matchesAnonymous,
+		);
 
-	if (
-		!adminAllowed &&
-		!matchesUser &&
-		!matchesAnonymousAsSignedInUser &&
-		!matchesAnonymousAsVisitor
-	) {
-		return null;
-	}
+		if (
+			!adminAllowed &&
+			!matchesUser &&
+			!matchesAnonymousAsSignedInUser &&
+			!matchesAnonymousAsVisitor
+		) {
+			return { statements: [], result: null };
+		}
 
-	const messages = await db()
-		.select()
-		.from(messengerMessages)
-		.where(eq(messengerMessages.conversationId, conversation.id))
-		.orderBy(asc(messengerMessages.createdAt));
+		const messages = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(messengerMessages)
+				.where(eq(messengerMessages.conversationId, conversation.id))
+				.orderBy(asc(messengerMessages.createdAt)),
+		);
 
-	return {
-		viewer,
-		conversation,
-		messages,
-	};
+		return {
+			statements: [],
+			result: {
+				viewer,
+				conversation,
+				messages,
+			},
+		};
+	});
 };
 
 export const requireAdminViewer = async (): Promise<AdminViewerContext> => {

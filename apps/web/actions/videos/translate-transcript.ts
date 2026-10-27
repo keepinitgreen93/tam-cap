@@ -12,6 +12,11 @@ import { runWithAiProviders } from "@/lib/ai/run";
 import { isRateLimited, RATE_LIMIT_IDS } from "@/lib/rate-limit";
 import * as EffectRuntime from "@/lib/server";
 import { runPromise } from "@/lib/server";
+import { readTranscriptVtt } from "@/lib/transcript-publication";
+import {
+	isSameTranscriptSource,
+	translationCachePrefix,
+} from "@/lib/translation-cache";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import {
 	type LanguageCode,
@@ -80,63 +85,64 @@ export async function translateTranscript(
 
 	const { video } = query[0];
 
-	const translatedKey = `${video.ownerId}/${videoId}/transcription.${targetLanguage}.vtt`;
-
-	const originalVtt = await Effect.gen(function* () {
-		const [bucket] = yield* Storage.getAccessForVideo(
-			decodeStorageVideo(video),
-		);
-		return yield* bucket.getObject(
-			`${video.ownerId}/${videoId}/transcription.vtt`,
-		);
-	}).pipe(runPromise);
-
-	if (Option.isNone(originalVtt)) {
+	if (video.transcriptionStatus !== "COMPLETE")
+		return { success: false, message: "Original transcript not ready" };
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(video),
+	).pipe(runPromise);
+	const originalVtt = await readTranscriptVtt(video, {
+		getText: async (key) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runPromise)),
+	});
+	if (originalVtt === null)
 		return { success: false, message: "Original transcript not found" };
-	}
-
+	const translatedKey = `${translationCachePrefix(video, originalVtt)}${targetLanguage}.vtt`;
 	try {
-		const existingTranslation = await Effect.gen(function* () {
-			const [bucket] = yield* Storage.getAccessForVideo(
-				decodeStorageVideo(video),
-			);
-			return yield* bucket.getObject(translatedKey);
-		}).pipe(runPromise);
-
-		const cachedTranslation = Option.isSome(existingTranslation)
-			? readCachedTranslation(originalVtt.value, existingTranslation.value)
-			: null;
+		const existing = Option.getOrNull(
+			await bucket.getObject(translatedKey).pipe(runPromise),
+		);
+		const cachedTranslation =
+			existing === null ? null : readCachedTranslation(originalVtt, existing);
 		if (cachedTranslation) {
+			const [current] = await db()
+				.select()
+				.from(videos)
+				.where(eq(videos.id, videoId))
+				.limit(1);
+			if (!isSameTranscriptSource(video, current))
+				return {
+					success: false,
+					message: "Transcript changed; retry translation",
+				};
 			return {
 				success: true,
 				translatedVtt: cachedTranslation,
 				message: "Retrieved cached translation",
 			};
 		}
-	} catch (e) {
-		console.debug("[translateTranscript] No cached translation found:", e);
+	} catch (error) {
+		console.debug("[translateTranscript] No cached translation found:", error);
 	}
 
-	const translatedVtt = await translateVttContent(
-		originalVtt.value,
-		targetLanguage,
-	);
+	const translatedVtt = await translateVttContent(originalVtt, targetLanguage);
 
 	if (!translatedVtt) {
 		return { success: false, message: "Translation failed" };
 	}
 
-	const cacheBody = withSourceFingerprint(originalVtt.value, translatedVtt);
+	const [current] = await db()
+		.select()
+		.from(videos)
+		.where(eq(videos.id, videoId))
+		.limit(1);
+	if (!isSameTranscriptSource(video, current))
+		return { success: false, message: "Transcript changed; retry translation" };
+	const cacheBody = withSourceFingerprint(originalVtt, translatedVtt);
 	if (cacheBody) {
 		try {
-			await Effect.gen(function* () {
-				const [bucket] = yield* Storage.getAccessForVideo(
-					decodeStorageVideo(video),
-				);
-				yield* bucket.putObject(translatedKey, cacheBody, {
-					contentType: "text/vtt",
-				});
-			}).pipe(runPromise);
+			await bucket
+				.putObject(translatedKey, cacheBody, { contentType: "text/vtt" })
+				.pipe(runPromise);
 		} catch (error) {
 			console.error(
 				"[translateTranscript] Failed to cache translation:",

@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
 	captureException: vi.fn(),
 	searchParams: new URLSearchParams(),
 }));
+vi.mock("@cap/env", () => ({ buildEnv: { NEXT_PUBLIC_IS_CAP: "true" } }));
 vi.mock("next-auth/react", () => ({ signIn: mocks.signIn }));
 vi.mock("@sentry/nextjs", () => ({ captureException: mocks.captureException }));
 vi.mock("sonner", () => ({ toast: { error: mocks.error } }));

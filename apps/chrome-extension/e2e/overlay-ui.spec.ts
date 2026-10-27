@@ -57,7 +57,8 @@ type ChromeGlobal = typeof globalThis & {
 };
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const extensionPath = path.resolve(__dirname, "../dist");
+const extensionPath =
+	process.env.CAP_EXTENSION_DIST ?? path.resolve(__dirname, "../dist");
 const SETTINGS_KEY = "cap-extension-settings";
 const AUTH_KEY = "cap-extension-auth";
 const BOOTSTRAP_CACHE_KEY = "cap-extension-bootstrap-cache";
@@ -247,7 +248,11 @@ const configureExtension = async (
 			await new Promise<void>((resolve) =>
 				chromeApi.storage.local.set(
 					{
-						[authKey]: { authApiKey: "auth-e2e", userId: "user-e2e" },
+						[authKey]: {
+							authApiKey: "auth-e2e",
+							userId: "user-e2e",
+							apiOrigin: new URL(apiBaseUrl).origin,
+						},
 						[bootstrapKey]: {
 							bootstrap: {
 								user: { id: "user-e2e", email: "e2e@cap.test" },
@@ -379,6 +384,7 @@ const getClosedShadowNodeId = async (
 			for (let index = 0; index < attributes.length; index += 2) {
 				if (attributes[index] !== attribute) continue;
 				if (!classToken) return true;
+				if (attribute !== "class") return attributes[index + 1] === classToken;
 				return (
 					attributes[index + 1]?.split(/\s+/).includes(classToken) === true
 				);
@@ -421,8 +427,9 @@ const getClosedShadowComputedStyle = async (
 	session: CDPSession,
 	attribute: string,
 	property: string,
+	value?: string,
 ) => {
-	const nodeId = await getClosedShadowNodeId(session, attribute);
+	const nodeId = await getClosedShadowNodeId(session, attribute, value);
 	if (nodeId === null) return null;
 	await session.send("CSS.enable");
 	const { computedStyle } = (await session.send("CSS.getComputedStyleForNode", {
@@ -608,7 +615,7 @@ test("an abandoned recording start clears without leaving controls behind", asyn
 			await getClosedShadowElementBox(
 				devtools,
 				"class",
-				"cap-extension-recording-rail",
+				"cap-extension-active-recording-container",
 			),
 		).toBeNull();
 
@@ -631,7 +638,7 @@ test("an abandoned recording start clears without leaving controls behind", asyn
 			await getClosedShadowElementBox(
 				devtools,
 				"class",
-				"cap-extension-recording-rail",
+				"cap-extension-active-recording-container",
 			),
 		).toBeNull();
 	} finally {
@@ -894,72 +901,112 @@ test("recording controls stay stable and the camera resizes directly", async () 
 					(await getClosedShadowElementBox(
 						devtools,
 						"class",
-						"cap-extension-recording-rail",
+						"cap-extension-active-recording-container",
 					)) !== null,
 				{ timeout: 10_000 },
 			)
 			.toBe(true);
+		await expect
+			.poll(() =>
+				getClosedShadowComputedStyle(
+					devtools,
+					"class",
+					"transform",
+					"cap-extension-active-recording-container",
+				),
+			)
+			.toBe("none");
 		const initialBox = await getClosedShadowElementBox(
 			devtools,
 			"class",
-			"cap-extension-recording-rail",
+			"cap-extension-active-recording-container",
 		);
 		if (!initialBox) throw new Error("recording bar missing");
 		expect(initialBox.x).toBeLessThanOrEqual(20);
-		expect(initialBox.width).toBeGreaterThan(100);
-		expect(initialBox.width).toBeLessThanOrEqual(128);
-		expect(initialBox.height).toBeLessThanOrEqual(44);
+		expect(initialBox.width).toBeGreaterThan(80);
+		expect(initialBox.width).toBeLessThanOrEqual(160);
+		expect(initialBox.height).toBeCloseTo(48, 0);
 		const handleBox = await getClosedShadowElementBox(
 			devtools,
-			"data-drag-handle",
+			"class",
+			"cap-extension-recording-badge",
 		);
-		if (!handleBox) throw new Error("recording bar drag handle missing");
+		if (!handleBox) throw new Error("recording badge drag target missing");
 		const timeBox = await getClosedShadowElementBox(
 			devtools,
-			"data-recording-time",
+			"class",
+			"cap-extension-recording-badge-time",
 		);
-		if (!timeBox || timeBox.width < 30) {
+		if (!timeBox || timeBox.width < 20)
 			throw new Error("recording time is not visible at rest");
-		}
+		const timeNode = await getClosedShadowNodeId(
+			devtools,
+			"class",
+			"cap-extension-recording-badge-time",
+		);
+		if (timeNode === null) throw new Error("recording timer missing");
+		const timer = await devtools.send("DOM.getOuterHTML", { nodeId: timeNode });
+		expect(timer.outerHTML).toMatch(/>\d{1,2}:\d{2}</);
 		expect(
 			await getClosedShadowComputedStyle(
 				devtools,
-				"data-recording-actions",
-				"opacity",
+				"class",
+				"font-size",
+				"cap-extension-recording-badge-time",
 			),
-		).toBe("0");
-
+		).toBe("13px");
+		expect(
+			await getClosedShadowElementBox(
+				devtools,
+				"class",
+				"cap-extension-vertical-dock",
+			),
+		).toBeNull();
 		await targetPage.mouse.move(
 			handleBox.x + handleBox.width / 2,
 			handleBox.y + handleBox.height / 2,
 		);
 		await expect
+			.poll(
+				async () =>
+					(await getClosedShadowElementBox(
+						devtools,
+						"class",
+						"cap-extension-vertical-dock",
+					)) !== null,
+			)
+			.toBe(true);
+		await expect
 			.poll(() =>
 				getClosedShadowComputedStyle(
 					devtools,
-					"data-recording-actions",
-					"opacity",
+					"class",
+					"transform",
+					"cap-extension-vertical-dock",
 				),
 			)
-			.toBe("1");
+			.toBe("none");
 		const actionsBox = await getClosedShadowElementBox(
 			devtools,
-			"data-recording-actions",
+			"class",
+			"cap-extension-vertical-dock",
 		);
-		if (!actionsBox) throw new Error("recording action capsule missing");
-		const actionGap = actionsBox.x - (initialBox.x + initialBox.width);
-		expect(actionGap).toBeGreaterThanOrEqual(4);
-		expect(actionGap).toBeLessThanOrEqual(8);
+		if (!actionsBox) throw new Error("recording controls dock missing");
 		expect(
 			await getClosedShadowComputedStyle(
 				devtools,
-				"data-recording-actions",
+				"class",
 				"border-top-left-radius",
+				"cap-extension-vertical-dock",
 			),
-		).toBe("14px");
+		).toBe("28px");
+		const actionGap = initialBox.y - (actionsBox.y + actionsBox.height);
+		expect(actionGap).toBeGreaterThanOrEqual(4);
+		expect(actionGap).toBeLessThanOrEqual(12);
 		const pauseBox = await getClosedShadowElementBox(
 			devtools,
-			"data-recording-pause",
+			"aria-label",
+			"Pause recording",
 		);
 		if (!pauseBox) throw new Error("pause action missing on hover");
 		await targetPage.mouse.move(
@@ -968,12 +1015,12 @@ test("recording controls stay stable and the camera resizes directly", async () 
 		);
 		await targetPage.waitForTimeout(300);
 		expect(
-			await getClosedShadowComputedStyle(
+			await getClosedShadowElementBox(
 				devtools,
-				"data-recording-actions",
-				"opacity",
+				"class",
+				"cap-extension-vertical-dock",
 			),
-		).toBe("1");
+		).not.toBeNull();
 		await targetPage.screenshot({
 			path: "test-results/recording-bar-expanded.png",
 		});
@@ -991,12 +1038,12 @@ test("recording controls stay stable and the camera resizes directly", async () 
 			})
 			.toBe("paused");
 		expect(
-			await getClosedShadowComputedStyle(
+			await getClosedShadowElementBox(
 				devtools,
-				"data-recording-actions",
-				"opacity",
+				"aria-label",
+				"Resume recording",
 			),
-		).toBe("1");
+		).not.toBeNull();
 		await targetPage.mouse.click(
 			pauseBox.x + pauseBox.width / 2,
 			pauseBox.y + pauseBox.height / 2,
@@ -1027,7 +1074,7 @@ test("recording controls stay stable and the camera resizes directly", async () 
 				const movedBox = await getClosedShadowElementBox(
 					devtools,
 					"class",
-					"cap-extension-recording-rail",
+					"cap-extension-active-recording-container",
 				);
 				return (
 					movedBox !== null &&
@@ -1066,14 +1113,15 @@ test("recording controls stay stable and the camera resizes directly", async () 
 
 		await targetPage.mouse.move(760, 40);
 		await expect
-			.poll(() =>
-				getClosedShadowComputedStyle(
-					devtools,
-					"data-recording-actions",
-					"opacity",
-				),
+			.poll(
+				async () =>
+					(await getClosedShadowElementBox(
+						devtools,
+						"class",
+						"cap-extension-vertical-dock",
+					)) === null,
 			)
-			.toBe("0");
+			.toBe(true);
 		await targetPage.waitForTimeout(500);
 		await targetPage.screenshot({
 			path: "test-results/recording-bar-visible.png",
@@ -1085,7 +1133,7 @@ test("recording controls stay stable and the camera resizes directly", async () 
 		);
 		if (!initialCameraBox) throw new Error("camera preview missing");
 		await targetPage.mouse.move(
-			initialCameraBox.x + initialCameraBox.width / 2,
+			initialCameraBox.x + initialCameraBox.width / 4,
 			initialCameraBox.y + initialCameraBox.height / 2,
 		);
 		await expect

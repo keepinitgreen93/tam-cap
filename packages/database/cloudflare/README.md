@@ -1,6 +1,8 @@
-# Cloudflare persistence staging
+# Cloudflare persistence
 
-This is a staged D1 port. Authentication and selected team callers now use explicit Cloudflare imports; the canonical `@cap/database` entrypoint still selects MySQL while other caller groups are being ported. This intermediate source state must not be deployed as a working application or run against mixed production databases. Complete the remaining callers and verify the affected flows before the coordinated canonical cutover.
+The canonical `@cap/database` and `@cap/database/schema` exports use native D1 persistence. The application requires `CAP_RUNTIME=cloudflare` and `DATABASE_PROVIDER=d1`; it has no MySQL fallback. The original MySQL connection and schema remain available through explicit `@cap/database/legacy` and `@cap/database/legacy/schema` exports for migration tooling and disabled hosted vendor implementations. The legacy connection refuses Cloudflare execution before opening a connection.
+
+`bun run db:generate` targets the D1 schema. Original MySQL generation remains available as `bun run --cwd packages/database db:generate:mysql`; its configuration and migration backfills reference the preserved legacy schema. Legacy push, studio, check, up and drop commands also have explicit `:mysql` aliases; their configuration refuses a Cloudflare environment before reading connection settings. D1 application never uses Drizzle MySQL push. Cloudflare migrations are applied through the controlled deployment process, never application startup. The canonical source cutover does not establish staging acceptance or production readiness; live recording, editing, sharing, recovery and deployment gates remain separate.
 
 ## Implemented and verified
 
@@ -125,3 +127,8 @@ node scripts/cloudflare/validation-preflight.mjs
 ```
 
 The preflight is read-only and uses authenticated Wrangler. It verifies all 49 table results, reports invalid-row counts, and exits unsuccessfully when any invalid rows exist. Migration `0002` is generated from the committed original MySQL snapshot so it remains reproducible after the canonical schema module switches to D1.
+
+
+## Import publication
+
+Cloudflare Loom imports capture the current owner, storage and source revision before dispatch. Workflow and media attempts record durable receipts; completion, errors and capacity changes cannot update a newer source or run. Each attempt writes media under its own `.recording/outputs/loom-<attempt hash>/` prefix. The current receipt publishes the output, thumbnail and preview references, invalidating obsolete transcript and AI generation state when media changes. Raw source media is retained on Cloudflare. Ownership transfers retain old media copies until cleanup can fence a later transfer back to the same owner; progress reports the retained-copy warning. Retained copies add storage usage and require future controlled garbage collection.

@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoId } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	folders,
 	importedVideos,
@@ -13,8 +13,9 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { Storage } from "@cap/web-backend";
 import {
@@ -24,7 +25,7 @@ import {
 	type User,
 	Video,
 } from "@cap/web-domain";
-import { and, asc, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull } from "drizzle-orm";
 import { Effect, Option, Schedule } from "effect";
 import { revalidatePath } from "next/cache";
 import { getRun } from "workflow/api";
@@ -42,6 +43,9 @@ import {
 } from "@/lib/loom-concierge";
 import {
 	addImportOwnerToSpace,
+	assertConciergeLease,
+	assertLoomImportDestination,
+	conciergeImportStatements,
 	extractLoomVideoId,
 	fetchLoomOEmbed,
 	fetchVideoName,
@@ -599,51 +603,67 @@ async function prepareConciergeLoomFileUpload({
 				);
 			}
 			if (!mapped || !existing.rawFileKey) {
-				await db().transaction(async (tx) => {
-					const [reservation] = await tx
-						.select({
-							activeOrganizationId: loomMigrationRequests.activeOrganizationId,
-							leaseToken: loomMigrationRequests.activeImportLeaseToken,
-							leaseUntil: loomMigrationRequests.activeImportLeaseUntil,
-						})
-						.from(loomMigrationRequests)
-						.where(eq(loomMigrationRequests.id, requestId))
-						.limit(1)
-						.for("update");
-					if (
-						!reservation?.activeOrganizationId ||
-						reservation.leaseToken !== leaseToken ||
-						!reservation.leaseUntil ||
-						reservation.leaseUntil <= new Date()
-					) {
-						throw new LoomMigrationError(
-							"The concierge import expired. Retry this video.",
-						);
-					}
-					if (!existing.rawFileKey) {
-						await tx
-							.update(videoUploads)
-							.set({ rawFileKey: existingRawFileKey, updatedAt: new Date() })
-							.where(
-								and(
-									eq(videoUploads.videoId, Video.VideoId.make(existing.id)),
-									eq(videoUploads.phase, "error"),
-									isNull(videoUploads.rawFileKey),
-								),
-							);
-					}
-					if (mapped) return;
-					await tx.insert(loomMigrationImports).values({
-						videoId: Video.VideoId.make(existing.id),
+				const database = db();
+				await atomic(database, async (snapshot) => {
+					await assertConciergeLease(
+						snapshot,
 						requestId,
-					});
-					await tx
-						.update(loomMigrationRequests)
-						.set({
-							queuedVideoCount: sql`${loomMigrationRequests.queuedVideoCount} + 1`,
-							updatedAt: new Date(),
-						})
-						.where(eq(loomMigrationRequests.id, requestId));
+						leaseToken,
+						request.organizationId,
+					);
+					const [current] = await snapshot.read((reader) =>
+						reader
+							.select({ video: videos, upload: videoUploads })
+							.from(videos)
+							.innerJoin(videoUploads, eq(videoUploads.videoId, videos.id))
+							.where(eq(videos.id, Video.VideoId.make(existing.id)))
+							.limit(1),
+					);
+					if (
+						!current ||
+						current.video.ownerId !== existing.ownerId ||
+						current.video.orgId !== request.organizationId ||
+						current.video.bucket !== existing.bucket ||
+						current.video.storageIntegrationId !==
+							existing.storageIntegrationId ||
+						(current.upload.phase !== "error" &&
+							(current.upload.phase !== "uploading" ||
+								current.upload.processingMessage !==
+									"Uploading Loom video...")) ||
+						(current.upload.rawFileKey &&
+							current.upload.rawFileKey !== existingRawFileKey)
+					)
+						throw new LoomMigrationError(
+							"The Loom upload changed. Refresh and retry.",
+						);
+					const [currentMapping] = await snapshot.read((reader) =>
+						reader
+							.select({ requestId: loomMigrationImports.requestId })
+							.from(loomMigrationImports)
+							.where(eq(loomMigrationImports.videoId, current.video.id))
+							.limit(1),
+					);
+					if (currentMapping && currentMapping.requestId !== requestId)
+						throw new LoomMigrationError(
+							"This Loom import belongs to another migration request.",
+						);
+					const statements: AtomicStatement[] = [];
+					if (!current.upload.rawFileKey)
+						statements.push(
+							database
+								.update(videoUploads)
+								.set({ rawFileKey: existingRawFileKey, updatedAt: new Date() })
+								.where(eq(videoUploads.videoId, current.video.id)),
+						);
+					if (!currentMapping)
+						statements.push(
+							...conciergeImportStatements(
+								database,
+								current.video.id,
+								requestId,
+							),
+						);
+					return { statements, result: undefined };
 				});
 			}
 			return {
@@ -673,7 +693,11 @@ async function prepareConciergeLoomFileUpload({
 				})
 			: null;
 		if (space) {
-			await addImportOwnerToSpace({ spaceId: space.id, userId: member.userId });
+			await addImportOwnerToSpace({
+				spaceId: space.id,
+				userId: member.userId,
+				actorId: request.ownerId,
+			});
 		}
 		const videoId = Video.VideoId.make(nanoId());
 		const rawFileKey = `${member.userId}/${videoId}/raw-upload.mp4`;
@@ -688,68 +712,80 @@ async function prepareConciergeLoomFileUpload({
 			},
 			request.organizationId,
 		).pipe(runPromise);
-		const isPublic = await getNewVideoPublic(request.organizationId);
-		await db().transaction(async (tx) => {
-			const [reservation] = await tx
-				.select({
-					activeOrganizationId: loomMigrationRequests.activeOrganizationId,
-					leaseToken: loomMigrationRequests.activeImportLeaseToken,
-					leaseUntil: loomMigrationRequests.activeImportLeaseUntil,
-				})
-				.from(loomMigrationRequests)
-				.where(eq(loomMigrationRequests.id, requestId))
-				.limit(1)
-				.for("update");
-			if (
-				!reservation?.activeOrganizationId ||
-				reservation.leaseToken !== leaseToken ||
-				!reservation.leaseUntil ||
-				reservation.leaseUntil <= new Date()
-			) {
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			await assertConciergeLease(
+				snapshot,
+				requestId,
+				leaseToken,
+				request.organizationId,
+			);
+			const organization = await assertLoomImportDestination(
+				snapshot,
+				request.organizationId,
+				member.userId,
+				space ? { spaceId: space.id } : {},
+				request.ownerId,
+			);
+			const [currentMapping] = await snapshot.read((reader) =>
+				reader
+					.select({ id: importedVideos.id })
+					.from(importedVideos)
+					.where(
+						and(
+							eq(importedVideos.orgId, request.organizationId),
+							eq(importedVideos.source, "loom"),
+							eq(importedVideos.sourceId, loomVideoId),
+						),
+					)
+					.limit(1),
+			);
+			if (currentMapping)
 				throw new LoomMigrationError(
-					"The concierge import expired. Retry this video.",
+					"This Loom video is already in the Cap import inventory.",
 				);
-			}
-			await tx.insert(videos).values({
-				id: videoId,
-				name: normalizedTitle,
-				ownerId: member.userId,
-				orgId: request.organizationId,
-				source: { type: "webMP4" as const },
-				bucket: Option.getOrNull(upload.bucketId),
-				storageIntegrationId: Option.getOrNull(upload.storageIntegrationId),
-				public: isPublic,
-			});
-			await tx.insert(videoUploads).values({
-				videoId,
-				mode: "singlepart",
-				phase: "uploading",
-				processingProgress: 0,
-				processingMessage: "Uploading Loom video...",
-				rawFileKey,
-			});
-			await tx.insert(importedVideos).values({
-				id: videoId,
-				orgId: request.organizationId,
-				source: "loom",
-				sourceId: loomVideoId,
-			});
-			await tx.insert(loomMigrationImports).values({ videoId, requestId });
-			await tx
-				.update(loomMigrationRequests)
-				.set({
-					queuedVideoCount: sql`${loomMigrationRequests.queuedVideoCount} + 1`,
-					updatedAt: new Date(),
-				})
-				.where(eq(loomMigrationRequests.id, requestId));
-			if (space) {
-				await tx.insert(spaceVideos).values({
-					id: nanoId(),
-					videoId,
-					spaceId: space.id,
-					addedById: request.ownerId,
-				});
-			}
+			return {
+				statements: [
+					database.insert(videos).values({
+						id: videoId,
+						name: normalizedTitle,
+						ownerId: member.userId,
+						orgId: request.organizationId,
+						source: { type: "webMP4" as const },
+						bucket: Option.getOrNull(upload.bucketId),
+						storageIntegrationId: Option.getOrNull(upload.storageIntegrationId),
+						public:
+							organization.defaultVideoVisibility !== "private" &&
+							serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC,
+					}),
+					database.insert(videoUploads).values({
+						videoId,
+						mode: "singlepart",
+						phase: "uploading",
+						processingProgress: 0,
+						processingMessage: "Uploading Loom video...",
+						rawFileKey,
+					}),
+					database.insert(importedVideos).values({
+						id: videoId,
+						orgId: request.organizationId,
+						source: "loom",
+						sourceId: loomVideoId,
+					}),
+					...conciergeImportStatements(database, videoId, requestId),
+					...(space
+						? [
+								database.insert(spaceVideos).values({
+									id: nanoId(),
+									videoId,
+									spaceId: space.id,
+									addedById: request.ownerId,
+								}),
+							]
+						: []),
+				],
+				result: undefined,
+			};
 		});
 		revalidatePath("/dashboard/admin/loom-migrations");
 		return { videoId, uploadTarget: upload.upload };
