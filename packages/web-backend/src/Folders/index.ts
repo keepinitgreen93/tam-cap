@@ -1,8 +1,7 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
 import {
 	CurrentUser,
-	type DatabaseError,
 	Folder,
 	Organisation,
 	Policy,
@@ -12,7 +11,7 @@ import {
 import * as Dz from "drizzle-orm";
 import { Effect, Option } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { FoldersPolicy } from "./FoldersPolicy.ts";
 import { FoldersRepo } from "./FoldersRepo.ts";
 
@@ -47,55 +46,6 @@ export class Folders extends Effect.Service<Folders>()("Folders", {
 					return yield* new Policy.PolicyDeniedError({
 						reason: "Upgrade to Cap Pro to create a public collection link",
 					});
-			});
-
-		const deleteFolder = (folder: {
-			id: Folder.FolderId;
-			parentId: Folder.FolderId | null;
-			spaceId: Space.SpaceIdOrOrganisationId | null;
-		}): Effect.Effect<void, DatabaseError, Database> =>
-			Effect.gen(function* () {
-				const children = yield* db.use((db) =>
-					db
-						.select({
-							id: Db.folders.id,
-							parentId: Db.folders.parentId,
-							spaceId: Db.folders.spaceId,
-						})
-						.from(Db.folders)
-						.where(Dz.eq(Db.folders.parentId, folder.id)),
-				);
-
-				for (const child of children) {
-					yield* deleteFolder(child);
-				}
-
-				// Folders can't be both in the root and in a space
-				if (folder.spaceId) {
-					const { spaceId } = folder;
-					yield* db.use((db) =>
-						db
-							.update(Db.spaceVideos)
-							.set({ folderId: folder.parentId })
-							.where(
-								Dz.and(
-									Dz.eq(Db.spaceVideos.folderId, folder.id),
-									Dz.eq(Db.spaceVideos.spaceId, spaceId),
-								),
-							),
-					);
-				} else {
-					yield* db.use((db) =>
-						db
-							.update(Db.videos)
-							.set({ folderId: folder.parentId })
-							.where(Dz.eq(Db.videos.folderId, folder.id)),
-					);
-				}
-
-				yield* db.use((db) =>
-					db.delete(Db.folders).where(Dz.eq(Db.folders.id, folder.id)),
-				);
 			});
 
 		return {
@@ -164,7 +114,8 @@ export class Folders extends Effect.Service<Folders>()("Folders", {
 
 				if (!folder) return yield* new Folder.NotFoundError();
 
-				yield* deleteFolder(folder);
+				const user = yield* CurrentUser;
+				yield* repo.delete(folder.id, user.id);
 			}),
 
 			update: Effect.fn("Folders.update")(function* (
@@ -222,9 +173,11 @@ export class Folders extends Effect.Service<Folders>()("Folders", {
 
 					// Check for circular references in the folder hierarchy
 					let currentParentId = parentFolder.parentId;
+					const visitedParents = new Set<string>([data.id, parentId]);
 					while (currentParentId) {
-						if (currentParentId === data.id)
+						if (visitedParents.has(currentParentId))
 							return yield* new Folder.RecursiveDefinitionError();
+						visitedParents.add(currentParentId);
 
 						const parentId = currentParentId;
 						const nextParent = yield* repo.getById(parentId, {
@@ -238,28 +191,14 @@ export class Folders extends Effect.Service<Folders>()("Folders", {
 					}
 				}
 
-				yield* db.use((db) =>
-					db
-						.update(Db.folders)
-						.set({
-							name: data.name,
-							color: data.color,
-							public: data.public,
-							// Atomic merge so concurrent patches (and the logo upload
-							// action, which also writes settings.publicPage) can't
-							// overwrite each other's keys.
-							settings:
-								data.publicPage !== undefined
-									? Dz.sql`JSON_MERGE_PATCH(COALESCE(${Db.folders.settings}, '{}'), CAST(${JSON.stringify(
-											{ publicPage: data.publicPage },
-										)} AS JSON))`
-									: undefined,
-							parentId: data.parentId
-								? Option.getOrNull(data.parentId)
-								: undefined,
-						})
-						.where(Dz.eq(Db.folders.id, data.id)),
-				);
+				const user = yield* CurrentUser;
+				yield* repo.update(data.id, user.id, {
+					name: data.name,
+					color: data.color,
+					public: data.public,
+					publicPage: data.publicPage,
+					parentId: data.parentId ? Option.getOrNull(data.parentId) : undefined,
+				});
 			}),
 		};
 	}),

@@ -1,27 +1,34 @@
-import { db } from "@cap/database";
-import { sendEmail } from "@cap/database/emails/config";
-import { FirstShareableLink } from "@cap/database/emails/first-shareable-link";
-import { nanoId } from "@cap/database/helpers";
+import { requireOrganizationMember } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	organizationMembers,
 	organizations,
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { sendEmail } from "@cap/database/emails/config";
+import { FirstShareableLink } from "@cap/database/emails/first-shareable-link";
+import { nanoId } from "@cap/database/helpers";
 import type { VideoMetadata } from "@cap/database/types";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { makeCurrentUserLayer, Storage, Videos } from "@cap/web-backend";
+import {
+	activeVideo,
+	createVideo,
+	requireWritableVideo,
+} from "@cap/web-backend/src/Videos/persistence";
 import { Organisation, Video } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
-import { and, count, eq, lte } from "drizzle-orm";
+import { and, count, eq, isNull, lte } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { Hono } from "hono";
 import { after } from "next/server";
 import { z } from "zod";
 import { readInstantCleanupReport } from "@/lib/desktop-instant-cleanup";
+import { ensureRecordingOrganization } from "@/lib/desktop-recording-organization";
 import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota";
 import { maybeStartLiveTranscription } from "@/lib/live-transcribe";
 import { runPromise } from "@/lib/server";
@@ -137,26 +144,36 @@ app.get(
 				const [video] = await db()
 					.select()
 					.from(videos)
-					.where(eq(videos.id, Video.VideoId.make(videoId)));
+					.where(and(activeVideo, eq(videos.id, Video.VideoId.make(videoId))));
 
 				if (video) {
 					if (video.ownerId !== user.id)
 						return c.json({ error: "forbidden" }, { status: 403 });
 
 					if (isScreenshot || video.isScreenshot) {
-						await db().transaction(async (tx) => {
-							if (isScreenshot && !video.isScreenshot) {
-								await tx
-									.update(videos)
-									.set({ isScreenshot: true })
-									.where(
-										and(eq(videos.id, video.id), eq(videos.ownerId, user.id)),
-									);
-							}
-
-							await tx
-								.delete(videoUploads)
-								.where(eq(videoUploads.videoId, video.id));
+						const database = db();
+						await atomic(database, async (snapshot) => {
+							const current = await requireWritableVideo(
+								snapshot,
+								video.id,
+								user.id,
+							);
+							return {
+								statements: [
+									...(isScreenshot && !current.isScreenshot
+										? [
+												database
+													.update(videos)
+													.set({ isScreenshot: true })
+													.where(eq(videos.id, current.id)),
+											]
+										: []),
+									database
+										.delete(videoUploads)
+										.where(eq(videoUploads.videoId, current.id)),
+								],
+								result: undefined,
+							};
 						});
 					}
 
@@ -194,7 +211,12 @@ app.get(
 						createdAt: organizations.createdAt,
 					})
 					.from(organizations)
-					.where(eq(organizations.ownerId, user.id)),
+					.where(
+						and(
+							eq(organizations.ownerId, user.id),
+							isNull(organizations.tombstoneAt),
+						),
+					),
 				db()
 					.select({
 						id: organizations.id,
@@ -206,7 +228,12 @@ app.get(
 						organizations,
 						eq(organizations.id, organizationMembers.organizationId),
 					)
-					.where(eq(organizationMembers.userId, user.id)),
+					.where(
+						and(
+							eq(organizationMembers.userId, user.id),
+							isNull(organizations.tombstoneAt),
+						),
+					),
 			]);
 			const userOrganizations = mergeUserOrganizationSelections(
 				ownedOrganizations,
@@ -216,29 +243,17 @@ app.get(
 			// Accounts can end up org-less (e.g. after declining a team invite or
 			// being removed from their last org); provision a personal org like
 			// signup does instead of failing every upload.
+			let defaultOrganizationId = user.defaultOrgId;
 			if (userOrganizations.length === 0) {
 				const organizationId = Organisation.OrganisationId.make(nanoId());
-				await db().transaction(async (tx) => {
-					await tx.insert(organizations).values({
-						id: organizationId,
-						ownerId: user.id,
-						name: "My Organization",
-					});
-					await tx.insert(organizationMembers).values({
-						id: nanoId(),
-						organizationId,
-						userId: user.id,
-						role: "owner",
-					});
-					await tx
-						.update(users)
-						.set({
-							activeOrganizationId: organizationId,
-							defaultOrgId: organizationId,
-						})
-						.where(eq(users.id, user.id));
-				});
-				userOrganizations.push({ id: organizationId, name: "My Organization" });
+				const { created, ...organization } = await ensureRecordingOrganization(
+					db(),
+					user.id,
+					organizationId,
+					nanoId(),
+				);
+				userOrganizations.push(organization);
+				if (created) defaultOrganizationId = organization.id;
 			}
 
 			const userOrgIds = userOrganizations.map((org) => org.id);
@@ -249,22 +264,31 @@ app.get(
 			// default/first org below instead of hard-failing every upload.
 			if (orgId && userOrgIds.includes(orgId)) {
 				videoOrgId = orgId;
-			} else if (user.defaultOrgId) {
+			} else if (defaultOrganizationId) {
 				// User's defaultOrgId is no longer valid, switch to first available org
-				if (!userOrgIds.includes(user.defaultOrgId)) {
+				if (!userOrgIds.includes(defaultOrganizationId)) {
 					if (!userOrganizations[0])
 						return c.json({ error: "no_valid_org" }, { status: 403 });
 
 					videoOrgId = userOrganizations[0].id;
 
 					// Update user's defaultOrgId to the new valid org
-					await db()
-						.update(users)
-						.set({
-							defaultOrgId: videoOrgId,
-						})
-						.where(eq(users.id, user.id));
-				} else videoOrgId = user.defaultOrgId;
+					const database = db();
+					await atomic(database, async (snapshot) => {
+						await requireOrganizationMember(snapshot, videoOrgId, user.id);
+						return {
+							statements: [
+								database
+									.update(users)
+									.set({
+										defaultOrgId: videoOrgId,
+									})
+									.where(eq(users.id, user.id)),
+							],
+							result: undefined,
+						};
+					});
+				} else videoOrgId = defaultOrganizationId;
 			} else {
 				// No orgId provided and no defaultOrgId, use first available org
 				if (!userOrganizations[0])
@@ -311,8 +335,9 @@ app.get(
 				UPLOAD_PROGRESS_VERSION,
 			);
 
-			await db().transaction(async (tx) => {
-				await tx.insert(videos).values({
+			await createVideo(
+				db(),
+				{
 					id: idToUse,
 					name: videoName,
 					ownerId: user.id,
@@ -328,20 +353,21 @@ app.get(
 					isScreenshot,
 					bucket: Option.getOrNull(writable.bucketId),
 					storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
-					public: await getNewVideoPublic(videoOrgId),
+					public: serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC,
 					duration: durationInSecs,
 					width,
 					height,
 					fps,
 					...(metadata ? { metadata } : {}),
-				});
-
-				if (clientSupportsUploadProgress && !isScreenshot)
-					await tx.insert(videoUploads).values({
-						videoId: idToUse,
-						mode: "singlepart",
-					});
-			});
+				},
+				{
+					defaultPublic: serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC,
+					initialUpload:
+						clientSupportsUploadProgress && !isScreenshot
+							? { mode: "singlepart" }
+							: undefined,
+				},
+			);
 
 			if (recordingMode === "desktopSegments" && !isScreenshot) {
 				// Off the response path: this endpoint gates recording start on the

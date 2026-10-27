@@ -1,7 +1,13 @@
-import { db } from "@cap/database";
-import * as Db from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { Organisations } from "@cap/web-backend/src/Organisations/index";
 import { Storage } from "@cap/web-backend/src/Storage/index";
+import {
+	deleteVideoStatements,
+	prepareVideoDeletion,
+	requireOwnedVideo,
+} from "@cap/web-backend/src/Videos/persistence";
 import {
 	CurrentUser,
 	Folder,
@@ -87,28 +93,37 @@ const storageVideo = (snapshot: CapSnapshot) =>
 
 async function claimOperation(operationId: string) {
 	"use step";
+	const database = db();
 
-	return db().transaction(async (tx) => {
-		const [operation] = await tx
-			.select()
-			.from(Db.agentApiOperations)
-			.where(eq(Db.agentApiOperations.id, operationId))
-			.limit(1)
-			.for("update");
+	const operationTime1 = new Date();
+	return atomic<Pick<
+		typeof Db.agentApiOperations.$inferSelect,
+		"kind" | "payload"
+	> | null>(database, async (view) => {
+		const statements: AtomicStatement[] = [];
+		const [operation] = await view.read((reader) =>
+			reader
+				.select()
+				.from(Db.agentApiOperations)
+				.where(eq(Db.agentApiOperations.id, operationId))
+				.limit(1),
+		);
 		if (!operation) throw new FatalError("Agent operation not found");
-		if (operation.state !== "queued") return null;
-		await tx
-			.update(Db.agentApiOperations)
-			.set({ state: "running", updatedAt: new Date() })
-			.where(
-				and(
-					eq(Db.agentApiOperations.id, operationId),
-					eq(Db.agentApiOperations.state, "queued"),
+		if (operation.state !== "queued") return { statements: [], result: null };
+		statements.push(
+			database
+				.update(Db.agentApiOperations)
+				.set({ state: "running", updatedAt: operationTime1 })
+				.where(
+					and(
+						eq(Db.agentApiOperations.id, operationId),
+						eq(Db.agentApiOperations.state, "queued"),
+					),
 				),
-			);
+		);
 		return {
-			kind: operation.kind,
-			payload: operation.payload,
+			statements,
+			result: { kind: operation.kind, payload: operation.payload },
 		};
 	});
 }
@@ -154,69 +169,88 @@ async function copyCapObjects(payload: OperationPayload) {
 
 async function createDuplicate(operationId: string, payload: OperationPayload) {
 	"use step";
+	const database = db();
 
 	if (!payload.destinationId)
 		throw new FatalError("Duplicate destination missing");
 	const snapshot = payload.snapshot;
 	const destinationId = Video.VideoId.make(payload.destinationId);
-	await db().transaction(async (tx) => {
-		const [existing] = await tx
-			.select({ ownerId: Db.videos.ownerId })
-			.from(Db.videos)
-			.where(eq(Db.videos.id, destinationId))
-			.limit(1)
-			.for("update");
+	const operationTime2 = new Date();
+	await atomic(database, async (view) => {
+		const statements: AtomicStatement[] = [];
+		const [existing] = await view.read((reader) =>
+			reader
+				.select({ ownerId: Db.videos.ownerId })
+				.from(Db.videos)
+				.where(eq(Db.videos.id, destinationId))
+				.limit(1),
+		);
 		if (existing && existing.ownerId !== snapshot.ownerId) {
 			throw new FatalError("Duplicate destination conflicts with another Cap");
 		}
 		if (!existing) {
-			await tx.insert(Db.videos).values({
-				id: destinationId,
-				ownerId: User.UserId.make(snapshot.ownerId),
-				orgId: Organisation.OrganisationId.make(snapshot.orgId),
-				name: snapshot.name,
-				bucket: snapshot.bucket
-					? S3Bucket.S3BucketId.make(snapshot.bucket)
-					: null,
-				storageIntegrationId: snapshot.storageIntegrationId
-					? StorageDomain.StorageIntegrationId.make(
-							snapshot.storageIntegrationId,
-						)
-					: null,
-				duration: snapshot.duration,
-				width: snapshot.width,
-				height: snapshot.height,
-				fps: snapshot.fps,
-				metadata: snapshot.metadata,
-				public: snapshot.public,
-				settings: snapshot.settings,
-				transcriptionStatus: snapshot.transcriptionStatus as
-					| "PROCESSING"
-					| "COMPLETE"
-					| "ERROR"
-					| "SKIPPED"
-					| "NO_AUDIO"
-					| null,
-				source: snapshot.source,
-				folderId: snapshot.folderId
-					? Folder.FolderId.make(snapshot.folderId)
-					: null,
-				isScreenshot: snapshot.isScreenshot,
-				skipProcessing: snapshot.skipProcessing,
-			});
+			statements.push(
+				database.insert(Db.videos).values({
+					id: destinationId,
+					ownerId: User.UserId.make(snapshot.ownerId),
+					orgId: Organisation.OrganisationId.make(snapshot.orgId),
+					name: snapshot.name,
+					bucket: snapshot.bucket
+						? S3Bucket.S3BucketId.make(snapshot.bucket)
+						: null,
+					storageIntegrationId: snapshot.storageIntegrationId
+						? StorageDomain.StorageIntegrationId.make(
+								snapshot.storageIntegrationId,
+							)
+						: null,
+					duration: snapshot.duration,
+					width: snapshot.width,
+					height: snapshot.height,
+					fps: snapshot.fps,
+					metadata: snapshot.metadata,
+					public: snapshot.public,
+					settings: snapshot.settings,
+					transcriptionStatus: snapshot.transcriptionStatus as
+						| "PROCESSING"
+						| "COMPLETE"
+						| "ERROR"
+						| "SKIPPED"
+						| "NO_AUDIO"
+						| null,
+					source: snapshot.source,
+					folderId: snapshot.folderId
+						? Folder.FolderId.make(snapshot.folderId)
+						: null,
+					isScreenshot: snapshot.isScreenshot,
+					skipProcessing: snapshot.skipProcessing,
+				}),
+			);
 		}
-		const now = new Date();
-		await tx
-			.update(Db.agentApiOperations)
-			.set({
-				state: "succeeded",
-				result: { id: destinationId },
-				updatedAt: now,
-				completedAt: now,
-			})
-			.where(eq(Db.agentApiOperations.id, operationId));
+		const now = operationTime2;
+		statements.push(
+			database
+				.update(Db.agentApiOperations)
+				.set({
+					state: "succeeded",
+					result: { id: destinationId },
+					updatedAt: now,
+					completedAt: now,
+				})
+				.where(eq(Db.agentApiOperations.id, operationId)),
+		);
+
+		return { statements, result: undefined };
 	});
 	await enqueueVideoStorageNameSync(destinationId);
+}
+
+async function prepareCapDeletion(payload: OperationPayload) {
+	"use step";
+	await prepareVideoDeletion(
+		db(),
+		Video.VideoId.make(payload.snapshot.id),
+		User.UserId.make(payload.snapshot.ownerId),
+	);
 }
 
 async function deleteCapObjects(payload: OperationPayload) {
@@ -237,33 +271,42 @@ async function deleteCapDatabase(
 	payload: OperationPayload,
 ) {
 	"use step";
+	const database = db();
 
 	const videoId = Video.VideoId.make(payload.snapshot.id);
-	await db().transaction(async (tx) => {
-		await tx.delete(Db.comments).where(eq(Db.comments.videoId, videoId));
-		await tx
-			.delete(Db.notifications)
-			.where(eq(Db.notifications.videoId, videoId));
-		await tx
-			.delete(Db.videoUploads)
-			.where(eq(Db.videoUploads.videoId, videoId));
-		await tx.delete(Db.importedVideos).where(eq(Db.importedVideos.id, videoId));
-		await tx
-			.delete(Db.sharedVideos)
-			.where(eq(Db.sharedVideos.videoId, videoId));
-		await tx.delete(Db.spaceVideos).where(eq(Db.spaceVideos.videoId, videoId));
-		await tx.delete(Db.videoEdits).where(eq(Db.videoEdits.videoId, videoId));
-		await tx.delete(Db.videos).where(eq(Db.videos.id, videoId));
-		const now = new Date();
-		await tx
-			.update(Db.agentApiOperations)
-			.set({
-				state: "succeeded",
-				result: { deleted: true },
-				updatedAt: now,
-				completedAt: now,
-			})
-			.where(eq(Db.agentApiOperations.id, operationId));
+	const operationTime3 = new Date();
+	await atomic(database, async (view) => {
+		const [video] = await view.read((reader) =>
+			reader
+				.select({ id: Db.videos.id })
+				.from(Db.videos)
+				.where(eq(Db.videos.id, videoId))
+				.limit(1),
+		);
+		if (video)
+			await requireOwnedVideo(
+				view,
+				videoId,
+				User.UserId.make(payload.snapshot.ownerId),
+			);
+		const statements: AtomicStatement[] = deleteVideoStatements(
+			database,
+			videoId,
+		);
+		const now = operationTime3;
+		statements.push(
+			database
+				.update(Db.agentApiOperations)
+				.set({
+					state: "succeeded",
+					result: { deleted: true },
+					updatedAt: now,
+					completedAt: now,
+				})
+				.where(eq(Db.agentApiOperations.id, operationId)),
+		);
+
+		return { statements, result: undefined };
 	});
 }
 
@@ -358,11 +401,7 @@ async function getOrganizationDomainContext(
 		)
 		.limit(1);
 	if (!row) throw new FatalError("Organization domain target not found");
-	if (
-		row.userId !== row.ownerId &&
-		row.memberRole !== "owner" &&
-		row.memberRole !== "admin"
-	) {
+	if (row.userId !== row.ownerId && row.memberRole !== "admin") {
 		throw new FatalError("Organization domain access was revoked");
 	}
 	return row;
@@ -383,6 +422,10 @@ async function addOrganizationDomain(domain: string) {
 
 async function removeOrganizationDomainFromVercel(domain: string) {
 	"use step";
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new FatalError(
+			"Domains on this self-hosted server are managed by the deployment operator",
+		);
 
 	const response = await fetch(
 		`https://api.vercel.com/v9/projects/${process.env.VERCEL_PROJECT_ID}/domains/${domain.toLowerCase()}?teamId=${process.env.VERCEL_TEAM_ID}`,
@@ -410,29 +453,36 @@ async function finishOrganizationDomain(
 	result: { domain: string | null; verified: boolean },
 ) {
 	"use step";
+	const database = db();
 	const organizationId = Organisation.OrganisationId.make(
 		payload.organizationId,
 	);
 
-	await db().transaction(async (tx) => {
-		const [organization] = await tx
-			.select({ customDomain: Db.organizations.customDomain })
-			.from(Db.organizations)
-			.where(eq(Db.organizations.id, organizationId))
-			.limit(1)
-			.for("update");
-		if (!organization) throw new FatalError("Organization not found");
-		if (result.domain) {
-			const [conflict] = await tx
-				.select({ id: Db.organizations.id })
+	const operationTime4 = new Date();
+	await atomic(database, async (view) => {
+		const statements: AtomicStatement[] = [];
+		const [organization] = await view.read((reader) =>
+			reader
+				.select({ customDomain: Db.organizations.customDomain })
 				.from(Db.organizations)
-				.where(
-					and(
-						eq(Db.organizations.customDomain, result.domain),
-						ne(Db.organizations.id, organizationId),
-					),
-				)
-				.limit(1);
+				.where(eq(Db.organizations.id, organizationId))
+				.limit(1),
+		);
+		if (!organization) throw new FatalError("Organization not found");
+		const domain = result.domain;
+		if (domain) {
+			const [conflict] = await view.read((reader) =>
+				reader
+					.select({ id: Db.organizations.id })
+					.from(Db.organizations)
+					.where(
+						and(
+							eq(Db.organizations.customDomain, domain),
+							ne(Db.organizations.id, organizationId),
+						),
+					)
+					.limit(1),
+			);
 			if (conflict) throw new FatalError("Domain is already in use");
 		} else if (
 			payload.domain &&
@@ -441,24 +491,30 @@ async function finishOrganizationDomain(
 		) {
 			throw new FatalError("Organization domain changed during removal");
 		}
-		const now = new Date();
-		await tx
-			.update(Db.organizations)
-			.set({
-				customDomain: result.domain,
-				domainVerified: result.verified ? now : null,
-				updatedAt: now,
-			})
-			.where(eq(Db.organizations.id, organizationId));
-		await tx
-			.update(Db.agentApiOperations)
-			.set({
-				state: "succeeded",
-				result,
-				updatedAt: now,
-				completedAt: now,
-			})
-			.where(eq(Db.agentApiOperations.id, operationId));
+		const now = operationTime4;
+		statements.push(
+			database
+				.update(Db.organizations)
+				.set({
+					customDomain: result.domain,
+					domainVerified: result.verified ? now : null,
+					updatedAt: now,
+				})
+				.where(eq(Db.organizations.id, organizationId)),
+		);
+		statements.push(
+			database
+				.update(Db.agentApiOperations)
+				.set({
+					state: "succeeded",
+					result,
+					updatedAt: now,
+					completedAt: now,
+				})
+				.where(eq(Db.agentApiOperations.id, operationId)),
+		);
+
+		return { statements, result: undefined };
 	});
 }
 
@@ -522,7 +578,12 @@ async function failOperation(operationId: string, error: unknown) {
 			updatedAt: now,
 			completedAt: now,
 		})
-		.where(eq(Db.agentApiOperations.id, operationId));
+		.where(
+			and(
+				eq(Db.agentApiOperations.id, operationId),
+				ne(Db.agentApiOperations.state, "succeeded"),
+			),
+		);
 }
 
 export async function agentCapOperationWorkflow(input: {
@@ -541,6 +602,7 @@ export async function agentCapOperationWorkflow(input: {
 		}
 		if (operation.kind === "delete_cap") {
 			const payload = operation.payload as OperationPayload;
+			await prepareCapDeletion(payload);
 			await deleteCapObjects(payload);
 			await deleteCapDatabase(input.operationId, payload);
 			return;

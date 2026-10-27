@@ -13,7 +13,17 @@ function createServerEnv() {
 	return createEnv({
 		server: {
 			/// General configuration
-			DATABASE_URL: z.string().describe("MySQL database URL"),
+			DATABASE_URL: z
+				.string()
+				.optional()
+				.refine(
+					(value) => process.env.DATABASE_PROVIDER === "d1" || Boolean(value),
+					"DATABASE_URL is required for the MySQL provider",
+				)
+				.describe("MySQL database URL; unused with D1"),
+			DATABASE_PROVIDER: z.enum(["mysql", "d1"]).default("mysql"),
+			CAP_OWNER_EMAIL: z.string().email().optional(),
+			CAP_INVITE_ONLY: z.enum(["true", "false"]).default("true"),
 			WEB_URL: z
 				.string()
 				.describe("Public URL of the server eg. https://cap.so"),

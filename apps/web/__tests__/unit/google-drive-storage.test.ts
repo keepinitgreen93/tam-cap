@@ -136,6 +136,9 @@ const makeRepoHarness = (videos: VideoForNameSync[] = []): RepoHarness => {
 	};
 
 	const repo = {
+		assertVideoAccess: () => Effect.void,
+		assertWritableVideo: () => Effect.void,
+		assertOrganizationAccess: () => Effect.void,
 		getIntegrationById: (id: Storage.StorageIntegrationId) =>
 			Effect.succeed(
 				id === integrationId
@@ -2247,6 +2250,36 @@ describe("Google Drive rate limits", () => {
 			{ error: { code: 403, errors: [{ reason, domain: "usageLimits" }] } },
 			{ status: 403 },
 		);
+
+	it.each([false, true])(
+		"cleans unpublished copies while retaining committed copies after a lost response: %s",
+		async (committed) => {
+			const harness = copyHarness();
+			const save = harness.repo.upsertObject;
+			vi.spyOn(harness.repo, "upsertObject").mockImplementation((input) =>
+				Effect.gen(function* () {
+					if (committed) yield* save(input);
+					return yield* Effect.fail(
+						new Storage.StorageError({
+							cause: new Error("Metadata publication failed"),
+						}),
+					);
+				}),
+			);
+			const fetchMock = vi.fn(
+				async (_input: string | URL | Request, init?: RequestInit) =>
+					init?.method === "DELETE" ? response(204) : copied(),
+			);
+			vi.stubGlobal("fetch", fetchMock);
+			expect(Exit.isFailure(await copy(harness))).toBe(true);
+			const deleted = fetchMock.mock.calls.filter(
+				([, init]) => init?.method === "DELETE",
+			);
+			expect(deleted).toHaveLength(committed ? 0 : 1);
+			if (!committed)
+				expect(String(deleted[0]?.[0])).toContain("/files/copied-file-id?");
+		},
+	);
 
 	afterEach(() => {
 		vi.useRealTimers();

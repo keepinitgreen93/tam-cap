@@ -1,8 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { importedVideos, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	importedVideos,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import type { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import {
@@ -116,9 +120,7 @@ export async function retryVideoProcessing({
 					eq(videoUploads.updatedAt, upload.updatedAt),
 				),
 			);
-		const affectedRows = Array.isArray(claim)
-			? (claim[0] as { affectedRows?: number } | undefined)?.affectedRows
-			: (claim as { affectedRows?: number }).affectedRows;
+		const affectedRows = claim.meta.changes;
 		if (affectedRows !== 1) {
 			return { success: true, status: "already-processing" };
 		}
@@ -161,6 +163,8 @@ export async function retryVideoProcessing({
 		processingMessage: "Retrying video processing...",
 		startFailureMessage: "Video processing could not restart.",
 		forceRestart: shouldForceRetryProcessing(upload),
+		expectedUpdatedAt: upload.updatedAt,
+		expectedProcessingToken: video.metadata?.processingRun?.token ?? null,
 	});
 
 	return { success: true, status };

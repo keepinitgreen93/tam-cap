@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { spaces } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { spaces } from "@cap/database/cloudflare/schema";
 import { PublicCollection, Space } from "@cap/web-domain";
 import { eq, type SQL, sql } from "drizzle-orm";
 import { Either, Schema } from "effect";
@@ -86,9 +86,9 @@ export async function setSpaceCollectionVisibility(input: {
 	if (settingsPatch !== undefined) {
 		// Atomic merge so concurrent patches (and the logo upload action, which
 		// also writes settings.publicPage) can't overwrite each other's keys.
-		update.settings = sql`JSON_MERGE_PATCH(COALESCE(${spaces.settings}, '{}'), CAST(${JSON.stringify(
+		update.settings = sql`json_patch(COALESCE(${spaces.settings}, '{}'), ${JSON.stringify(
 			{ publicPage: settingsPatch },
-		)} AS JSON))`;
+		)})`;
 	}
 
 	if (Object.keys(update).length > 0)

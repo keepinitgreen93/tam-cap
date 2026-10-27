@@ -1,14 +1,14 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { encrypt } from "@cap/database/crypto";
-import { nanoId, nanoIdLong } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	developerApiKeys,
 	developerApps,
 	developerCreditAccounts,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { encrypt } from "@cap/database/crypto";
+import { nanoId, nanoIdLong } from "@cap/database/helpers";
 import { hashKey } from "@/lib/developer-key-hash";
 
 export async function createDeveloperApp(data: {
@@ -18,6 +18,9 @@ export async function createDeveloperApp(data: {
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 
+	if (data.name.trim().length > 255) throw new Error("App name is too long");
+	if (!["development", "production"].includes(data.environment))
+		throw new Error("Invalid environment");
 	if (!data.name.trim()) throw new Error("App name is required");
 
 	const appId = nanoId();
@@ -29,15 +32,16 @@ export async function createDeveloperApp(data: {
 	const encryptedPublicKey = await encrypt(publicKeyRaw);
 	const encryptedSecretKey = await encrypt(secretKeyRaw);
 
-	await db().transaction(async (tx) => {
-		await tx.insert(developerApps).values({
+	const database = db();
+	await database.batch([
+		database.insert(developerApps).values({
 			id: appId,
 			ownerId: user.id,
 			name: data.name.trim(),
 			environment: data.environment,
-		});
+		}),
 
-		await tx.insert(developerApiKeys).values([
+		database.insert(developerApiKeys).values([
 			{
 				id: nanoId(),
 				appId,
@@ -54,14 +58,14 @@ export async function createDeveloperApp(data: {
 				keyHash: secretKeyHash,
 				encryptedKey: encryptedSecretKey,
 			},
-		]);
+		]),
 
-		await tx.insert(developerCreditAccounts).values({
+		database.insert(developerCreditAccounts).values({
 			id: nanoId(),
 			appId,
 			ownerId: user.id,
-		});
-	});
+		}),
+	]);
 
 	return {
 		appId,

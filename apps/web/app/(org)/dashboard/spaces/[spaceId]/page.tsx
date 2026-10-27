@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	comments,
 	folders,
@@ -12,10 +12,10 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	ImageUploads,
 	makeCurrentUserLayer,
 	resolveEffectiveVideoRules,
@@ -28,7 +28,16 @@ import {
 	type User,
 	Video,
 } from "@cap/web-domain";
-import { and, count, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import {
+	and,
+	countDistinct,
+	desc,
+	eq,
+	inArray,
+	isNull,
+	or,
+	sql,
+} from "drizzle-orm";
 import { Effect } from "effect";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
@@ -75,7 +84,7 @@ async function fetchOrganizationSettings(orgId: Organisation.OrganisationId) {
 	const [row] = await db()
 		.select({ settings: organizations.settings })
 		.from(organizations)
-		.where(eq(organizations.id, orgId))
+		.where(and(eq(organizations.id, orgId), isNull(organizations.tombstoneAt)))
 		.limit(1);
 	return row?.settings ?? null;
 }
@@ -201,7 +210,13 @@ async function fetchSharedSpacesForVideos(
 			})
 			.from(spaceVideos)
 			.innerJoin(spaces, eq(spaceVideos.spaceId, spaces.id))
-			.where(inArray(spaceVideos.videoId, videoIds)),
+			.innerJoin(organizations, eq(spaces.organizationId, organizations.id))
+			.where(
+				and(
+					inArray(spaceVideos.videoId, videoIds),
+					isNull(organizations.tombstoneAt),
+				),
+			),
 		db()
 			.select({
 				videoId: sharedVideos.videoId,
@@ -218,6 +233,7 @@ async function fetchSharedSpacesForVideos(
 			.where(
 				and(
 					inArray(sharedVideos.videoId, videoIds),
+					isNull(organizations.tombstoneAt),
 					or(
 						eq(sharedVideos.organizationId, viewer.organizationId),
 						inArray(
@@ -287,8 +303,16 @@ export default async function SharedCapsPage(props: {
 }) {
 	const searchParams = await props.searchParams;
 	const params = await props.params;
-	const page = Number(searchParams.page) || 1;
-	const limit = Number(searchParams.limit) || 15;
+	const requestedPage = Number(searchParams.page);
+	const page =
+		Number.isSafeInteger(requestedPage) && requestedPage > 0
+			? requestedPage
+			: 1;
+	const requestedLimit = Number(searchParams.limit);
+	const limit =
+		Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+			? Math.min(requestedLimit, 80)
+			: 15;
 	const user = await getCurrentUser();
 	if (!user) notFound();
 
@@ -363,10 +387,14 @@ export default async function SharedCapsPage(props: {
 					.limit(limit)
 					.offset(offset),
 				db()
-					.select({ count: count() })
+					.select({ count: countDistinct(videos.id) })
 					.from(spaceVideos)
 					.where(
-						and(eq(spaceVideos.spaceId, spaceId), isNull(spaceVideos.folderId)),
+						and(
+							eq(spaceVideos.spaceId, spaceId),
+							isNull(spaceVideos.folderId),
+							isNull(organizations.tombstoneAt),
+						),
 					),
 			]);
 			return {
@@ -476,6 +504,7 @@ export default async function SharedCapsPage(props: {
 					})
 					.from(sharedVideos)
 					.innerJoin(videos, eq(sharedVideos.videoId, videos.id))
+					.leftJoin(organizations, eq(videos.orgId, organizations.id))
 					.leftJoin(comments, eq(videos.id, comments.videoId))
 					.leftJoin(users, eq(videos.ownerId, users.id))
 					.leftJoin(videoUploads, eq(videos.id, videoUploads.videoId))
@@ -483,6 +512,7 @@ export default async function SharedCapsPage(props: {
 						and(
 							eq(sharedVideos.organizationId, orgId),
 							isNull(sharedVideos.folderId),
+							isNull(organizations.tombstoneAt),
 						),
 					)
 					.groupBy(
@@ -502,13 +532,15 @@ export default async function SharedCapsPage(props: {
 					.limit(limit)
 					.offset(offset),
 				db()
-					.select({ count: count() })
+					.select({ count: countDistinct(videos.id) })
 					.from(sharedVideos)
 					.innerJoin(videos, eq(sharedVideos.videoId, videos.id))
+					.leftJoin(organizations, eq(videos.orgId, organizations.id))
 					.where(
 						and(
 							eq(sharedVideos.organizationId, orgId),
 							isNull(sharedVideos.folderId),
+							isNull(organizations.tombstoneAt),
 						),
 					),
 			]);

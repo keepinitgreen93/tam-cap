@@ -1,60 +1,88 @@
-import { db } from "@cap/database";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
-import { eq } from "drizzle-orm";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
+import { Video } from "@cap/web-domain";
+import { and, eq } from "drizzle-orm";
 import type { NextRequest } from "next/server";
+
+const serverMetadataKeys = new Set([
+	"agentUpload",
+	"processingRun",
+	"editProcessing",
+	"completedVideoEdit",
+	"desktopRecordingUpload",
+	"loomImportRun",
+	"loomImportUpload",
+	"loomDeferredProcessing",
+	"loomPreviewGif",
+	"liveTranscript",
+	"aiGenerationStatus",
+	"enhancedAudioStatus",
+	"transcribeOnView",
+	"__proto__",
+	"constructor",
+	"prototype",
+]);
+const isServerMetadataKey = (key: string) =>
+	serverMetadataKeys.has(key) || key.startsWith("transcript");
 
 export async function PUT(request: NextRequest) {
 	const user = isCrossSiteCookieWrite(request) ? null : await getCurrentUser();
-	const { videoId, metadata } = await request.json();
-	const userId = user?.id as string;
-
-	if (!user || !videoId || !metadata) {
-		console.error("Missing required data in /api/video/metadata/route.ts");
-
+	const input: unknown = await request.json();
+	if (
+		!user ||
+		!input ||
+		typeof input !== "object" ||
+		!("videoId" in input) ||
+		!("metadata" in input) ||
+		!input.videoId ||
+		!input.metadata
+	)
 		return Response.json({ error: true }, { status: 401 });
-	}
-
-	const query = await db().select().from(videos).where(eq(videos.id, videoId));
-
-	if (query.length === 0) {
-		return Response.json({ error: true }, { status: 401 });
-	}
-
-	const result = query[0];
-	if (!result) {
-		return Response.json({ error: true }, { status: 401 });
-	}
-
-	if (result.ownerId !== userId) {
-		return Response.json({ error: true }, { status: 401 });
-	}
-
-	if (typeof metadata !== "object" || Array.isArray(metadata)) {
+	if (
+		typeof input.videoId !== "string" ||
+		typeof input.metadata !== "object" ||
+		Array.isArray(input.metadata)
+	)
 		return Response.json({ error: true }, { status: 400 });
-	}
-
-	const { agentUpload: _agentUpload, ...clientMetadata } = metadata;
-
-	await db().transaction(async (tx) => {
-		const [locked] = await tx
-			.select({ metadata: videos.metadata })
-			.from(videos)
-			.where(eq(videos.id, videoId))
-			.for("update");
-
-		const storedAgentUpload = locked?.metadata?.agentUpload;
-
-		await tx
-			.update(videos)
-			.set({
-				metadata: storedAgentUpload
-					? { ...clientMetadata, agentUpload: storedAgentUpload }
-					: clientMetadata,
-			})
-			.where(eq(videos.id, videoId));
+	const videoId = Video.VideoId.make(input.videoId);
+	const clientMetadata = Object.fromEntries(
+		Object.entries(input.metadata).filter(([key]) => !isServerMetadataKey(key)),
+	);
+	const database = db();
+	const updated = await atomic(database, async (snapshot) => {
+		const [locked] = await snapshot.read((reader) =>
+			reader
+				.select({ metadata: videos.metadata })
+				.from(videos)
+				.where(
+					and(
+						writableVideo,
+						eq(videos.id, videoId),
+						eq(videos.ownerId, user.id),
+					),
+				)
+				.limit(1),
+		);
+		if (!locked) return { statements: [], result: false };
+		const protectedMetadata = { ...locked.metadata };
+		for (const key of Object.keys(protectedMetadata))
+			if (!isServerMetadataKey(key))
+				Reflect.deleteProperty(protectedMetadata, key);
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({ metadata: { ...clientMetadata, ...protectedMetadata } })
+					.where(eq(videos.id, videoId)),
+			],
+			result: true,
+		};
 	});
-
-	return Response.json(true, { status: 200 });
+	return updated
+		? Response.json(true, { status: 200 })
+		: Response.json({ error: true }, { status: 401 });
 }

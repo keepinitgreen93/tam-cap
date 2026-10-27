@@ -1,4 +1,4 @@
-import type { videos } from "@cap/database/schema";
+import type { videos } from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
 import { getRecordingObjectIdentity } from "@cap/web-backend/src/Storage/recording-object-identity";
 import { Video } from "@cap/web-domain";

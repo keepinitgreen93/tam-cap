@@ -1,9 +1,11 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
+import { requireWritableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
 import { and, eq, sql } from "drizzle-orm";
 import {
@@ -40,24 +42,40 @@ export async function updateVideoCallToAction(
 	}
 
 	if (input === null) {
-		await db()
-			.update(videos)
-			.set({
-				settings: sql`JSON_MERGE_PATCH(COALESCE(${videos.settings}, JSON_OBJECT()), CAST('{"callToAction":null}' AS JSON))`,
-			})
-			.where(and(eq(videos.id, videoId), eq(videos.ownerId, user.id)));
+		await atomic(db(), async (snapshot) => {
+			await requireWritableVideo(snapshot, videoId, user.id);
+			return {
+				statements: [
+					db()
+						.update(videos)
+						.set({
+							settings: sql`json_patch(COALESCE(${videos.settings}, JSON_OBJECT()), '{"callToAction":null}')`,
+						})
+						.where(and(eq(videos.id, videoId), eq(videos.ownerId, user.id))),
+				],
+				result: undefined,
+			};
+		});
 		return { success: true, callToAction: null };
 	}
 
 	const result = validateCallToAction(input);
 	if (!result.ok) return { success: false, errors: result.errors };
 
-	await db()
-		.update(videos)
-		.set({
-			settings: sql`JSON_MERGE_PATCH(JSON_MERGE_PATCH(COALESCE(${videos.settings}, JSON_OBJECT()), CAST('{"callToAction":null}' AS JSON)), CAST(${JSON.stringify({ callToAction: toStoredCallToAction(result.value) })} AS JSON))`,
-		})
-		.where(and(eq(videos.id, videoId), eq(videos.ownerId, user.id)));
+	await atomic(db(), async (snapshot) => {
+		await requireWritableVideo(snapshot, videoId, user.id);
+		return {
+			statements: [
+				db()
+					.update(videos)
+					.set({
+						settings: sql`json_patch(json_patch(COALESCE(${videos.settings}, JSON_OBJECT()), '{"callToAction":null}'), ${JSON.stringify({ callToAction: toStoredCallToAction(result.value) })})`,
+					})
+					.where(and(eq(videos.id, videoId), eq(videos.ownerId, user.id))),
+			],
+			result: undefined,
+		};
+	});
 
 	return { success: true, callToAction: result.value };
 }

@@ -5,6 +5,7 @@ import { userIsPro } from "@cap/utils";
 import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { notFound } from "next/navigation";
+import { getSilenceSourceRevision } from "@/actions/videos/silence-analysis";
 import { isEditSourceKey } from "@/lib/video-edit-processing";
 import {
 	areEditSpecsEquivalent,
@@ -102,6 +103,11 @@ export default async function EditVideoPage(props: {
 
 	return (
 		<EditVideoClient
+			silenceSourceRevision={
+				process.env.CAP_RUNTIME === "cloudflare"
+					? await getSilenceSourceRevision(videoId)
+					: null
+			}
 			hasExistingEdits={hasExistingEdits}
 			video={{
 				id: video.id,

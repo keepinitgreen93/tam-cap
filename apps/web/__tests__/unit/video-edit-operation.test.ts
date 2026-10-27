@@ -1,46 +1,101 @@
+import * as Db from "@cap/database/cloudflare/schema";
 import { User } from "@cap/web-domain";
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	databaseRevision,
+	snapshotGuard,
+} from "../../../../packages/database/cloudflare/concurrency-schema";
 
 const mocks = vi.hoisted(() => ({
 	video: undefined as Record<string, unknown> | undefined,
 	upload: undefined as Record<string, unknown> | undefined,
 	writes: [] as { table: string; data: Record<string, unknown> }[],
 }));
-vi.mock("@cap/database/schema", () => ({
-	videos: { id: "video.id", name: "video" },
-	videoUploads: { videoId: "upload.videoId", name: "upload" },
-}));
-vi.mock("@cap/database", () => {
-	const tx = {
-		select: () => ({
-			from: (table: { name: "video" | "upload" }) => ({
-				where: () => {
-					const rows = mocks[table.name] ? [mocks[table.name]] : [];
-					return Object.assign(Promise.resolve(rows), {
-						for: async () => rows,
-					});
-				},
-			}),
-		}),
-		update: (table: { name: "video" | "upload" }) => ({
-			set: (data: Record<string, unknown>) => ({
-				where: async () => {
-					mocks.writes.push({ table: table.name, data });
-					Object.assign(mocks[table.name] ?? {}, data);
-				},
-			}),
-		}),
-		delete: (table: { name: "video" | "upload" }) => ({
-			where: async () => {
-				mocks.writes.push({ table: table.name, data: { deleted: true } });
-				mocks[table.name] = undefined;
-			},
-		}),
+vi.mock("@cap/database/cloudflare/application", () => {
+	type Mutation = {
+		table: unknown;
+		operation: "insert" | "update" | "delete";
+		data?: Record<string, unknown>;
+	};
+	let revision = 0;
+	let signature = "";
+	const currentRevision = () => {
+		const next = JSON.stringify([mocks.video, mocks.upload]);
+		if (next !== signature) {
+			signature = next;
+			revision++;
+		}
+		return revision;
 	};
 	return {
 		db: () => ({
-			...tx,
-			transaction: (run: (value: typeof tx) => unknown) => run(tx),
+			select: () => ({
+				from: (table: unknown) => ({
+					where: () => {
+						const rows =
+							table === databaseRevision
+								? [{ revision: currentRevision() }]
+								: table === Db.videos
+									? mocks.video
+										? [structuredClone(mocks.video)]
+										: []
+									: table === Db.videoUploads
+										? mocks.upload
+											? [structuredClone(mocks.upload)]
+											: []
+										: [];
+						return Object.assign(Promise.resolve(rows), {
+							limit: async () => rows,
+						});
+					},
+				}),
+			}),
+			selectDistinct: () => {
+				throw new Error("Unexpected distinct read");
+			},
+			query: {},
+			insert: (table: unknown) => ({
+				values: (data: Record<string, unknown>) => ({
+					table,
+					operation: "insert",
+					data,
+				}),
+			}),
+			update: (table: unknown) => ({
+				set: (data: Record<string, unknown>) => ({
+					where: () => ({ table, operation: "update", data }),
+				}),
+			}),
+			delete: (table: unknown) => ({
+				where: () => ({ table, operation: "delete" }),
+			}),
+			batch: async (statements: Mutation[]) => {
+				const guard = statements.find(
+					(statement) =>
+						statement.table === snapshotGuard &&
+						statement.operation === "insert",
+				);
+				if (
+					guard &&
+					new SQLiteSyncDialect().sqlToQuery(guard.data?.valid as SQL)
+						.params[0] !== currentRevision()
+				)
+					throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+				for (const statement of statements) {
+					if (statement.table === snapshotGuard) continue;
+					const table = statement.table === Db.videos ? "video" : "upload";
+					if (statement.operation === "delete") {
+						mocks.writes.push({ table, data: { deleted: true } });
+						mocks[table] = undefined;
+					} else {
+						mocks.writes.push({ table, data: statement.data ?? {} });
+						Object.assign(mocks[table] ?? {}, statement.data);
+					}
+				}
+				return [];
+			},
 		}),
 	};
 });

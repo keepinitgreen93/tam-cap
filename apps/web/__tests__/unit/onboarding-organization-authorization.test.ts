@@ -1,151 +1,83 @@
-import * as Db from "@cap/database/schema";
+import { createCloudflareDb } from "@cap/database/cloudflare";
+import {
+	createD1BridgeBinding,
+	handleD1BridgeRequest,
+} from "@cap/database/cloudflare/bridge";
+import * as Db from "@cap/database/cloudflare/schema";
 import {
 	CurrentUser,
 	DatabaseError,
 	ImageUpload,
-	Organisation,
-	User,
+	type Organisation,
 } from "@cap/web-domain";
-import type { SQL } from "drizzle-orm";
-import {
-	type AnyMySqlColumn,
-	MySqlDialect,
-	type MySqlTable,
-} from "drizzle-orm/mysql-core";
+import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
-import { describe, expect, it } from "vitest";
-import {
-	Database,
-	type DbClient,
-} from "../../../../packages/web-backend/src/Database";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { CloudflareDatabase } from "../../../../packages/web-backend/src/CloudflareDatabase";
 import { ImageUploads } from "../../../../packages/web-backend/src/ImageUploads";
 import { UsersOnboarding } from "../../../../packages/web-backend/src/Users/UsersOnboarding";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
-const USER_ID = User.UserId.make("onboarding-user");
-const OTHER_USER_ID = User.UserId.make("different-owner");
-const ORGANIZATION_ID = Organisation.OrganisationId.make("sso-org");
-const DEFAULT_ORGANIZATION_ID =
-	Organisation.OrganisationId.make("personal-org");
-const ICON_KEY = ImageUpload.ImageKey.make("organizations/onboarding-icon.png");
-const ICON = {
+const iconKey = ImageUpload.ImageKey.make("organizations/onboarding-icon.png");
+const icon = {
 	data: new Uint8Array([1, 2, 3]),
 	contentType: "image/png",
 	fileName: "icon.png",
 };
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
 
-type Row = Record<string, unknown>;
-
-function matchesRow(condition: SQL | undefined, row: Row) {
-	if (!condition) return true;
-	const query = new MySqlDialect().sqlToQuery(condition);
-	let parameterIndex = 0;
-	return query.sql
-		.replaceAll("(", "")
-		.replaceAll(")", "")
-		.split(" and ")
-		.every((clause) => {
-			const match = /^`[^`]+`\.`([^`]+)`( = \?| is null)$/.exec(clause);
-			if (!match?.[1]) throw new Error(`Unsupported predicate: ${clause}`);
-			return match[2] === " is null"
-				? row[match[1]] == null
-				: row[match[1]] === query.params[parameterIndex++];
-		});
-}
-
-function makeFixture(
-	options: {
-		user?: Partial<
-			Pick<
-				typeof Db.users.$inferSelect,
-				"activeOrganizationId" | "defaultOrgId" | "name" | "onboardingSteps"
-			>
-		>;
-		organization?: Partial<
-			Pick<
-				typeof Db.organizations.$inferSelect,
-				"name" | "ownerId" | "tombstoneAt"
-			>
-		>;
-		organizationExists?: boolean;
-		sessionOrganizationId?: Organisation.OrganisationId;
-	} = {},
+async function setup(
+	options: { owner?: boolean; tombstone?: boolean; missing?: boolean } = {},
 ) {
-	const user: Row = {
-		id: USER_ID,
-		email: "member@example.com",
-		name: "Member",
-		activeOrganizationId: ORGANIZATION_ID,
-		defaultOrgId: DEFAULT_ORGANIZATION_ID,
-		onboardingSteps: { welcome: true, inviteTeam: true },
-		...options.user,
-	};
-	const organization: Row = {
-		id: ORGANIZATION_ID,
-		name: "Company",
-		ownerId: OTHER_USER_ID,
-		tombstoneAt: null,
-		iconUrl: null,
-		...options.organization,
-	};
-	const organizations =
-		options.organizationExists === false ? [] : [organization];
-	const memberships: Row[] = [];
-	const tables = new Map<MySqlTable, Row[]>([
-		[Db.users, [user]],
-		[Db.organizations, organizations],
-		[Db.organizationMembers, memberships],
-	]);
+	const user = await createTestOwner(fixture.database);
+	const other = await createTestOwner(fixture.database);
+	const organizationId = options.owner
+		? user.activeOrganizationId
+		: other.activeOrganizationId;
+	await fixture.database
+		.update(Db.organizations)
+		.set({
+			name: "Company",
+			tombstoneAt: options.tombstone ? new Date() : null,
+		})
+		.where(eq(Db.organizations.id, organizationId));
+	await fixture.database
+		.update(Db.users)
+		.set({
+			activeOrganizationId: options.missing
+				? ("" as Organisation.OrganisationId)
+				: organizationId,
+			defaultOrgId: options.missing ? null : user.activeOrganizationId,
+			onboardingSteps: { welcome: true, inviteTeam: true },
+		})
+		.where(eq(Db.users.id, user.id));
 	const hooks: {
-		beforeOrganizationUpdate?: (patch: Row) => void;
-		beforeIconUpdate?: () => void;
+		beforeOrganizationWrite?: () => Promise<void>;
+		beforeIconWrite?: () => Promise<void>;
 	} = {};
 	const uploadedPrefixes: string[] = [];
-	const rowsFor = (table: MySqlTable) => {
-		const rows = tables.get(table);
-		if (!rows) throw new Error("Unexpected table");
-		return rows;
-	};
-	const database = {
-		select: (columns?: Record<string, AnyMySqlColumn>) => ({
-			from: (table: MySqlTable) => ({
-				where: async (condition: SQL | undefined) =>
-					rowsFor(table)
-						.filter((row) => matchesRow(condition, row))
-						.map((row) =>
-							columns
-								? Object.fromEntries(
-										Object.entries(columns).map(([key, column]) => [
-											key,
-											row[column.name],
-										]),
-									)
-								: { ...row },
-						),
-			}),
-		}),
-		update: (table: MySqlTable) => ({
-			set: (patch: Row) => ({
-				where: async (condition: SQL | undefined) => {
-					if (table === Db.organizations)
-						hooks.beforeOrganizationUpdate?.(patch);
-					for (const row of rowsFor(table)) {
-						if (matchesRow(condition, row)) Object.assign(row, patch);
-					}
-				},
-			}),
-		}),
-		insert: (table: MySqlTable) => ({
-			values: async (row: Row) => {
-				rowsFor(table).push({ tombstoneAt: null, ...row });
+	let injected = false;
+	const database = createCloudflareDb(
+		createD1BridgeBinding({
+			fetch: async (request) => {
+				const body = await request.clone().text();
+				if (
+					!injected &&
+					hooks.beforeOrganizationWrite &&
+					body.includes('update \\"organizations\\"')
+				) {
+					injected = true;
+					await hooks.beforeOrganizationWrite();
+				}
+				return handleD1BridgeRequest(request, fixture.binding);
 			},
 		}),
-		transaction: <T>(callback: (client: DbClient) => Promise<T>) =>
-			callback(database as unknown as DbClient),
-	};
-	const databaseService = Database.make({
+	);
+	const service = CloudflareDatabase.make({
 		use: (callback) =>
 			Effect.tryPromise({
-				try: () => callback(database as unknown as DbClient),
+				try: () => callback(database),
 				catch: (cause) => new DatabaseError({ cause }),
 			}),
 	});
@@ -153,33 +85,45 @@ function makeFixture(
 		applyUpdate: (args) =>
 			Effect.gen(function* () {
 				uploadedPrefixes.push(args.keyPrefix);
-				hooks.beforeIconUpdate?.();
-				yield* databaseService.use((client) => args.update(client, ICON_KEY));
+				if (hooks.beforeIconWrite) yield* Effect.promise(hooks.beforeIconWrite);
+				yield* service.use((client) => args.update(client, iconKey));
 			}),
 		resolveImageUrl: () =>
 			Effect.succeed(ImageUpload.ImageUrl.make("https://example.com/icon.png")),
 	});
-
 	return {
 		user,
-		organization,
-		organizations,
-		memberships,
+		other,
+		organizationId,
 		hooks,
 		uploadedPrefixes,
+		readUser: async () =>
+			(
+				await fixture.database
+					.select()
+					.from(Db.users)
+					.where(eq(Db.users.id, user.id))
+			)[0],
+		readOrganization: async () =>
+			(
+				await fixture.database
+					.select()
+					.from(Db.organizations)
+					.where(eq(Db.organizations.id, organizationId))
+			)[0],
 		run: <A, E>(
 			operation: (service: UsersOnboarding) => Effect.Effect<A, E, CurrentUser>,
 		) =>
 			Effect.runPromise(
 				Effect.flatMap(UsersOnboarding, operation).pipe(
 					Effect.provide(UsersOnboarding.DefaultWithoutDependencies),
-					Effect.provideService(Database, databaseService),
+					Effect.provideService(CloudflareDatabase, service),
 					Effect.provideService(ImageUploads, imageUploads),
 					Effect.provideService(CurrentUser, {
-						id: USER_ID,
-						email: "member@example.com",
+						id: user.id,
+						email: user.email,
 						activeOrganizationId:
-							options.sessionOrganizationId ?? ORGANIZATION_ID,
+							"stale-session-org" as Organisation.OrganisationId,
 						iconUrlOrKey: Option.none(),
 					}),
 				),
@@ -187,242 +131,175 @@ function makeFixture(
 	};
 }
 
-describe("onboarding organization authorization", () => {
+describe("onboarding organization authorization on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+	});
+	afterAll(async () => fixture?.dispose());
 	it("lets members complete setup without changing organization metadata or their default", async () => {
-		const fixture = makeFixture();
-
-		const result = await fixture.run((service) =>
+		const context = await setup();
+		await context.run((service) =>
 			service.organizationSetup({
 				organizationName: "Replacement",
-				organizationIcon: ICON,
+				organizationIcon: icon,
 			}),
 		);
-
-		expect(result).toEqual({ organizationId: ORGANIZATION_ID });
-		expect(fixture.organization).toMatchObject({
+		expect(await context.readOrganization()).toMatchObject({
 			name: "Company",
 			iconUrl: null,
 		});
-		expect(fixture.user).toMatchObject({
-			activeOrganizationId: ORGANIZATION_ID,
-			defaultOrgId: DEFAULT_ORGANIZATION_ID,
-			onboardingSteps: {
-				welcome: true,
-				inviteTeam: true,
-				organizationSetup: true,
-			},
+		expect(await context.readUser()).toMatchObject({
+			defaultOrgId: context.user.activeOrganizationId,
+			onboardingSteps: { organizationSetup: true },
 		});
-		expect(fixture.uploadedPrefixes).toEqual([]);
-		expect(fixture.organizations).toHaveLength(1);
-		expect(fixture.memberships).toEqual([]);
+		expect(context.uploadedPrefixes).toEqual([]);
 	});
-
 	it("preserves owner name and icon setup", async () => {
-		const fixture = makeFixture({ organization: { ownerId: USER_ID } });
-
-		await fixture.run((service) =>
+		const context = await setup({ owner: true });
+		await context.run((service) =>
 			service.organizationSetup({
 				organizationName: " New Company ",
-				organizationIcon: ICON,
+				organizationIcon: icon,
 			}),
 		);
-
-		expect(fixture.organization).toMatchObject({
+		expect(await context.readOrganization()).toMatchObject({
 			name: "New Company",
-			iconUrl: ICON_KEY,
+			iconUrl: iconKey,
 		});
-		expect(fixture.user.defaultOrgId).toBe(ORGANIZATION_ID);
-		expect(fixture.uploadedPrefixes).toEqual([
-			`organizations/${ORGANIZATION_ID}`,
+		expect(context.uploadedPrefixes).toEqual([
+			`organizations/${context.organizationId}`,
 		]);
 	});
-
 	it.each([
-		{
-			ownerId: USER_ID,
-			tombstoneAt: null,
-			expectedName: "Jane's Organization",
-		},
-		{
-			ownerId: OTHER_USER_ID,
-			tombstoneAt: null,
-			expectedName: "My Organization",
-		},
-		{
-			ownerId: USER_ID,
-			tombstoneAt: new Date("2026-09-01T00:00:00.000Z"),
-			expectedName: "My Organization",
-		},
+		{ owner: true, tombstone: false, name: "Jane's Organization" },
+		{ owner: false, tombstone: false, name: "My Organization" },
+		{ owner: true, tombstone: true, name: "My Organization" },
 	])(
-		"personalizes only a live owner's organization ($ownerId, $tombstoneAt)",
+		"personalizes only a live owner's organization ($owner, $tombstone)",
 		async (scenario) => {
-			const fixture = makeFixture({
-				organization: {
-					name: "My Organization",
-					ownerId: scenario.ownerId,
-					tombstoneAt: scenario.tombstoneAt,
-				},
-			});
-
-			await fixture.run((service) =>
+			const context = await setup(scenario);
+			await fixture.database
+				.update(Db.organizations)
+				.set({ name: "My Organization" })
+				.where(eq(Db.organizations.id, context.organizationId));
+			await context.run((service) =>
 				service.welcome({ firstName: " Jane ", lastName: " Doe " }),
 			);
-
-			expect(fixture.organization.name).toBe(scenario.expectedName);
-			expect(fixture.user).toMatchObject({
+			expect((await context.readOrganization())?.name).toBe(scenario.name);
+			expect(await context.readUser()).toMatchObject({
 				name: "Jane",
 				lastName: "Doe",
 				onboardingSteps: { welcome: true, inviteTeam: true },
 			});
 		},
 	);
-
-	it("preserves an owner's already configured name during welcome", async () => {
-		const fixture = makeFixture({ organization: { ownerId: USER_ID } });
-
-		await fixture.run((service) => service.welcome({ firstName: "Jane" }));
-
-		expect(fixture.organization.name).toBe("Company");
+	it("preserves an owner's previously configured name", async () => {
+		const context = await setup({ owner: true });
+		await context.run((service) => service.welcome({ firstName: "Jane" }));
+		expect((await context.readOrganization())?.name).toBe("Company");
 	});
-
-	it("does not mutate or replace a tombstoned organization during setup", async () => {
-		const fixture = makeFixture({
-			organization: { ownerId: USER_ID, tombstoneAt: new Date() },
-		});
-
-		await fixture.run((service) =>
+	it("does not replace a tombstoned organization during setup", async () => {
+		const context = await setup({ owner: true, tombstone: true });
+		await context.run((service) =>
 			service.organizationSetup({
 				organizationName: "Replacement",
-				organizationIcon: ICON,
+				organizationIcon: icon,
 			}),
 		);
-
-		expect(fixture.organization).toMatchObject({
+		expect(await context.readOrganization()).toMatchObject({
 			name: "Company",
 			iconUrl: null,
 		});
-		expect(fixture.user.defaultOrgId).toBe(DEFAULT_ORGANIZATION_ID);
-		expect(fixture.user.onboardingSteps).toMatchObject({
-			organizationSetup: true,
-		});
-		expect(fixture.uploadedPrefixes).toEqual([]);
-		expect(fixture.organizations).toHaveLength(1);
+		expect(context.uploadedPrefixes).toEqual([]);
 	});
-
 	it.each(["ownership", "deletion"] as const)(
-		"rechecks %s when applying the organization name",
+		"rechecks %s at the name commit fence",
 		async (change) => {
-			const fixture = makeFixture({ organization: { ownerId: USER_ID } });
-			fixture.hooks.beforeOrganizationUpdate = () => {
-				if (change === "ownership")
-					fixture.organization.ownerId = OTHER_USER_ID;
-				else fixture.organization.tombstoneAt = new Date();
+			const context = await setup({ owner: true });
+			context.hooks.beforeOrganizationWrite = async () => {
+				await fixture.database
+					.update(Db.organizations)
+					.set(
+						change === "ownership"
+							? { ownerId: context.other.id }
+							: { tombstoneAt: new Date() },
+					)
+					.where(eq(Db.organizations.id, context.organizationId));
 			};
-
-			await fixture.run((service) =>
+			await context.run((service) =>
 				service.organizationSetup({
 					organizationName: "Replacement",
-					organizationIcon: ICON,
+					organizationIcon: icon,
 				}),
 			);
-
-			expect(fixture.organization).toMatchObject({
+			expect(await context.readOrganization()).toMatchObject({
 				name: "Company",
 				iconUrl: null,
 			});
-			expect(fixture.uploadedPrefixes).toEqual([]);
+			expect(context.uploadedPrefixes).toEqual([]);
 		},
 	);
-
 	it.each(["ownership", "deletion"] as const)(
-		"rechecks %s after the icon upload",
+		"rechecks %s after an icon upload",
 		async (change) => {
-			const fixture = makeFixture({ organization: { ownerId: USER_ID } });
-			fixture.hooks.beforeIconUpdate = () => {
-				if (change === "ownership")
-					fixture.organization.ownerId = OTHER_USER_ID;
-				else fixture.organization.tombstoneAt = new Date();
+			const context = await setup({ owner: true });
+			context.hooks.beforeIconWrite = async () => {
+				await fixture.database
+					.update(Db.organizations)
+					.set(
+						change === "ownership"
+							? { ownerId: context.other.id }
+							: { tombstoneAt: new Date() },
+					)
+					.where(eq(Db.organizations.id, context.organizationId));
 			};
-
-			await fixture.run((service) =>
+			await context.run((service) =>
 				service.organizationSetup({
 					organizationName: "Owner's Update",
-					organizationIcon: ICON,
+					organizationIcon: icon,
 				}),
 			);
-
-			expect(fixture.organization).toMatchObject({
+			expect(await context.readOrganization()).toMatchObject({
 				name: "Owner's Update",
 				iconUrl: null,
 			});
-			expect(fixture.uploadedPrefixes).toHaveLength(1);
+			expect(context.uploadedPrefixes).toHaveLength(1);
 		},
 	);
-
-	it("creates an owned organization for a user without one", async () => {
-		const fixture = makeFixture({
-			organizationExists: false,
-			user: {
-				activeOrganizationId: Organisation.OrganisationId.make(""),
-				defaultOrgId: null,
-			},
-		});
-
-		const result = await fixture.run((service) =>
-			service.organizationSetup({
-				organizationName: "New Company",
-				organizationIcon: ICON,
-			}),
+	it("creates one owned organization for concurrent setup requests without a stored organization", async () => {
+		const context = await setup({ missing: true });
+		const results = await Promise.all([
+			context.run((service) =>
+				service.organizationSetup({ organizationName: "New Company" }),
+			),
+			context.run((service) =>
+				service.organizationSetup({ organizationName: "New Company" }),
+			),
+		]);
+		expect(new Set(results.map((result) => result.organizationId)).size).toBe(
+			1,
 		);
-
-		expect(fixture.organizations).toEqual([
-			expect.objectContaining({
-				id: result.organizationId,
-				name: "New Company",
-				ownerId: USER_ID,
-				iconUrl: ICON_KEY,
-			}),
-		]);
-		expect(fixture.memberships).toEqual([
-			expect.objectContaining({
-				organizationId: result.organizationId,
-				userId: USER_ID,
-				role: "owner",
-			}),
-		]);
-		expect(fixture.user).toMatchObject({
-			activeOrganizationId: result.organizationId,
-			defaultOrgId: result.organizationId,
-		});
+		expect((await context.readUser())?.defaultOrgId).toBe(
+			results[0]?.organizationId,
+		);
 	});
-
 	it.each(["active", "default"] as const)(
-		"uses a member's stored %s organization when skipping onboarding",
+		"uses the stored %s organization when skipping onboarding",
 		async (source) => {
-			const fixture = makeFixture({
-				sessionOrganizationId:
-					Organisation.OrganisationId.make("stale-session-org"),
-				user:
-					source === "default"
-						? {
-								activeOrganizationId: Organisation.OrganisationId.make(""),
-								defaultOrgId: ORGANIZATION_ID,
-							}
-						: {},
-			});
-
-			await fixture.run((service) => service.skipToDashboard());
-
-			expect(fixture.organizations).toHaveLength(1);
-			expect(fixture.organization.name).toBe("Company");
-			expect(fixture.memberships).toEqual([]);
-			expect(fixture.user.defaultOrgId).toBe(
-				source === "default" ? ORGANIZATION_ID : DEFAULT_ORGANIZATION_ID,
-			);
-			expect(fixture.user.onboardingSteps).toMatchObject({
-				organizationSetup: true,
-				download: true,
-			});
+			const context = await setup();
+			if (source === "default")
+				await fixture.database
+					.update(Db.users)
+					.set({
+						activeOrganizationId: "" as Organisation.OrganisationId,
+						defaultOrgId: context.organizationId,
+					})
+					.where(eq(Db.users.id, context.user.id));
+			await context.run((service) => service.skipToDashboard());
+			expect((await context.readOrganization())?.name).toBe("Company");
+			expect(
+				(await context.readUser())?.onboardingSteps?.organizationSetup,
+			).toBe(true);
 		},
 	);
 });

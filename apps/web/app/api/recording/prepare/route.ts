@@ -1,5 +1,5 @@
-import { videoProcessingJobs, videos } from "@cap/database/schema";
-import { Database } from "@cap/web-backend";
+import { videoProcessingJobs, videos } from "@cap/database/cloudflare/schema";
+import { CloudflareDatabase as Database } from "@cap/web-backend";
 import { CurrentUser, HttpAuthMiddleware, Video } from "@cap/web-domain";
 import {
 	HttpApi,

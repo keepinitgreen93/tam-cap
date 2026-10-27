@@ -2,7 +2,10 @@
 	"rules": [
 		{
 			"allowed": {
-				"origins": ["https://videos.trulyauthenticmarketing.com"],
+				"origins": [
+					"https://videos.trulyauthenticmarketing.com",
+					"https://tam-cap-app.ciglesia.workers.dev"
+				],
 				"methods": ["GET", "HEAD", "PUT", "POST"],
 				"headers": ["*"]
 			},

@@ -1,10 +1,16 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { requireOrganizationMember } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import {
+	organizationMembers,
+	spaceMembers,
+	spaces,
+} from "@cap/database/cloudflare/schema";
 import { hashPassword } from "@cap/database/crypto";
 import { nanoId } from "@cap/database/helpers";
-import { spaceMembers, spaces } from "@cap/database/schema";
 import { userIsPro } from "@cap/utils";
 import {
 	type ImageUpload,
@@ -14,7 +20,7 @@ import {
 	type SpaceMemberRole,
 	User,
 } from "@cap/web-domain";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { isOrganizationOwnerPro } from "@/lib/org-pro";
 import {
@@ -91,24 +97,6 @@ export async function createSpace(
 			};
 		}
 
-		const existingSpace = await db()
-			.select({ id: spaces.id })
-			.from(spaces)
-			.where(
-				and(
-					eq(spaces.organizationId, user.activeOrganizationId),
-					eq(spaces.name, name),
-				),
-			)
-			.limit(1);
-
-		if (existingSpace.length > 0) {
-			return {
-				success: false,
-				error: "A space with this name already exists.",
-			};
-		}
-
 		const spaceId = Space.SpaceId.make(nanoId());
 		let iconUrl: ImageUpload.ImageUrlOrKey | null = null;
 		const hashedPassword =
@@ -116,42 +104,89 @@ export async function createSpace(
 				? await hashPassword(password.trim())
 				: null;
 
-		await db().transaction(async (tx) => {
-			await tx.insert(spaces).values({
-				id: spaceId,
-				name,
-				organizationId: user.activeOrganizationId,
-				createdById: user.id,
-				iconUrl: null,
-				settings,
-				password: hashedPassword,
-				public: publicEnabled,
-			});
-
-			const memberUserIds: string[] = [];
-			for (const entry of formData.getAll("members[]")) {
-				if (typeof entry === "string" && entry.length > 0) {
-					memberUserIds.push(entry);
-				}
+		const selectedMembers = [
+			...new Set([
+				...formData
+					.getAll("members[]")
+					.filter(
+						(value): value is string =>
+							typeof value === "string" && value.length > 0,
+					),
+				user.id,
+			]),
+		];
+		if (selectedMembers.length > 900)
+			throw new Error("Select at most 900 space members per request.");
+		if (name.length > 255)
+			throw new Error("Space name must contain at most 255 characters.");
+		const members = selectedMembers.map((userId) => ({
+			id: SpaceMemberId.make(nanoId()),
+			spaceId,
+			userId: User.UserId.make(userId),
+			role: (userId === user.id ? "admin" : "member") as SpaceMemberRole,
+		}));
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			const { organization } = await requireOrganizationMember(
+				snapshot,
+				user.activeOrganizationId,
+				user.id,
+			);
+			const existingSpaces = await snapshot.read((reader) =>
+				reader
+					.select({ name: spaces.name })
+					.from(spaces)
+					.where(eq(spaces.organizationId, organization.id)),
+			);
+			if (
+				existingSpaces.some(
+					(space) =>
+						space.name.normalize("NFC").toLowerCase() ===
+						name.normalize("NFC").toLowerCase(),
+				)
+			)
+				throw new Error("A space with this name already exists.");
+			const allowed = new Set<string>([organization.ownerId]);
+			for (let offset = 0; offset < members.length; offset += 80) {
+				const present = await snapshot.read((reader) =>
+					reader
+						.select({ id: organizationMembers.userId })
+						.from(organizationMembers)
+						.where(
+							and(
+								eq(organizationMembers.organizationId, organization.id),
+								inArray(
+									organizationMembers.userId,
+									members
+										.slice(offset, offset + 80)
+										.map((member) => member.userId),
+								),
+							),
+						),
+				);
+				for (const member of present) allowed.add(member.id);
 			}
-
-			if (!memberUserIds.includes(user.id)) {
-				memberUserIds.push(user.id);
-			}
-
-			if (memberUserIds.length > 0) {
-				const spaceMembersToInsert = memberUserIds.map((userId) => {
-					const role: SpaceMemberRole = userId === user.id ? "admin" : "member";
-					return {
-						id: SpaceMemberId.make(nanoId()),
-						spaceId,
-						userId: User.UserId.make(userId),
-						role,
-					};
-				});
-
-				await tx.insert(spaceMembers).values(spaceMembersToInsert);
-			}
+			if (selectedMembers.some((id) => !allowed.has(id)))
+				throw new Error("Space members must belong to the organization.");
+			const statements: AtomicStatement[] = [
+				database.insert(spaces).values({
+					id: spaceId,
+					name,
+					organizationId: organization.id,
+					createdById: user.id,
+					iconUrl: null,
+					settings,
+					password: hashedPassword,
+					public: publicEnabled,
+				}),
+			];
+			for (let offset = 0; offset < members.length; offset += 20)
+				statements.push(
+					database
+						.insert(spaceMembers)
+						.values(members.slice(offset, offset + 20)),
+				);
+			return { statements, result: undefined };
 		});
 
 		const iconFile = formData.get("icon") as File | null;

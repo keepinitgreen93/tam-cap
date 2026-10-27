@@ -22,48 +22,130 @@ const mocks = vi.hoisted(() => ({
 	} as Store,
 	rejectUpload: false,
 	transactionCalls: 0,
+	cloudflareDb: null as (() => unknown) | null,
 	currentUser: vi.fn(),
 	organizationAccess: vi.fn(),
+	getWritableAccessForUser: vi.fn(),
 	createUploadTargetForUser: vi.fn(),
 	createUploadTargetForVideo: vi.fn(),
 	revalidatePath: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => {
-	type Table = { name: "video" | "upload" | "folder" };
+vi.mock("@cap/database", async () => {
+	const { databaseRevision, snapshotGuard } = await import(
+		"../../../../packages/database/cloudflare/concurrency-schema"
+	);
+	const { SQLiteSyncDialect } = await import("drizzle-orm/sqlite-core");
+	type Table =
+		| { name?: string }
+		| typeof databaseRevision
+		| typeof snapshotGuard;
+	type Statement = { table: Table; values: Row | Row[] };
 	type Client = {
-		insert: (table: Table) => { values: (row: Row | Row[]) => Promise<void> };
+		insert: (table: Table) => {
+			values: (values: Row | Row[]) => Promise<void> & Statement;
+		};
+		delete: (table: Table) => { where: () => Statement };
 		select: () => {
 			from: (table: Table) => {
-				where: (predicate: Predicate) => Promise<Row[]>;
+				where: (
+					predicate: Predicate,
+				) => Promise<Row[]> & { limit: () => Promise<Row[]> };
 			};
 		};
+		selectDistinct: () => never;
+		query: Record<string, never>;
+		batch: (statements: Statement[]) => Promise<unknown[]>;
 		transaction: (run: (tx: Client) => Promise<unknown>) => Promise<unknown>;
 	};
-
-	function makeClient(store: Store): Client {
-		return {
-			insert: (table) => ({
-				values: async (value) => {
-					if (table.name === "upload" && mocks.rejectUpload)
-						throw new Error("Injected upload insert failure");
-					const rows = table.name === "video" ? store.videos : store.uploads;
-					for (const row of Array.isArray(value) ? value : [value]) {
-						const key = String(table.name === "video" ? row.id : row.videoId);
-						rows.set(key, { ...row });
-					}
-				},
+	const revision = () => mocks.store.videos.size + mocks.store.uploads.size;
+	function makeClient(store: Store, lazy = false): Client {
+		const write = (table: Table, value: Row | Row[]) => {
+			if (table === snapshotGuard) return;
+			if ("name" in table && table.name === "upload" && mocks.rejectUpload)
+				throw new Error("Injected upload insert failure");
+			const rows =
+				"name" in table && table.name === "video"
+					? store.videos
+					: store.uploads;
+			for (const row of Array.isArray(value) ? value : [value])
+				rows.set(
+					String(
+						"name" in table && table.name === "video" ? row.id : row.videoId,
+					),
+					{ ...row },
+				);
+		};
+		const client: Client = {
+			insert: (table: Table) => ({
+				values: (values: Row | Row[]) =>
+					Object.assign(
+						lazy
+							? Promise.resolve()
+							: Promise.resolve().then(() => write(table, values)),
+						{ table, values },
+					),
 			}),
+			delete: (table: Table) => ({ where: () => ({ table, values: {} }) }),
 			select: () => ({
-				from: (table) => ({
-					where: async (predicate) => {
-						const rows = table.name === "folder" ? store.folders : store.videos;
-						return [...rows.values()].filter(predicate);
+				from: (table: Table) => ({
+					where: (predicate: Predicate) => {
+						const read = () => {
+							if (table === databaseRevision) return [{ revision: revision() }];
+							if ("name" in table && table.name === "organization")
+								return [
+									{
+										id: "fixture-org",
+										ownerId: "fixture-user",
+										tombstoneAt: null,
+									},
+								];
+							if ("name" in table && table.name === "membership") return [];
+							const rows =
+								"name" in table && table.name === "folder"
+									? store.folders
+									: store.videos;
+							return [...rows.values()].filter(predicate);
+						};
+						return Object.assign(Promise.resolve().then(read), {
+							limit: async () => read(),
+						});
 					},
 				}),
 			}),
-			transaction: async (run) => {
-				mocks.transactionCalls += 1;
+			selectDistinct: () => {
+				throw new Error("Unexpected distinct selection");
+			},
+			query: {},
+			batch: async (statements: Statement[]) => {
+				mocks.transactionCalls++;
+				const guard = statements.find(
+					(statement) =>
+						statement.table === snapshotGuard &&
+						!Array.isArray(statement.values) &&
+						statement.values.valid,
+				);
+				if (guard && !Array.isArray(guard.values)) {
+					const expected = new SQLiteSyncDialect().sqlToQuery(
+						guard.values.valid as import("drizzle-orm").SQL,
+					).params[0];
+					if (expected !== revision())
+						throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+				}
+				const candidate = {
+					videos: new Map(store.videos),
+					uploads: new Map(store.uploads),
+					folders: new Map(store.folders),
+				};
+				const writer = makeClient(candidate);
+				for (const statement of statements)
+					if (statement.table !== snapshotGuard)
+						await writer.insert(statement.table).values(statement.values);
+				mocks.store = candidate;
+				return [];
+			},
+			transaction: async (run: (tx: Client) => Promise<unknown>) => {
+				mocks.transactionCalls++;
 				const candidate = {
 					videos: new Map(store.videos),
 					uploads: new Map(store.uploads),
@@ -74,10 +156,39 @@ vi.mock("@cap/database", () => {
 				return result;
 			},
 		};
+		return client;
 	}
-
+	mocks.cloudflareDb = () => makeClient(mocks.store, true);
 	return { db: () => makeClient(mocks.store) };
 });
+vi.mock("@cap/database/cloudflare/application", async () => {
+	await import("@cap/database");
+	return {
+		db: () => {
+			if (!mocks.cloudflareDb) throw new Error("Missing D1 fixture");
+			return mocks.cloudflareDb();
+		},
+	};
+});
+vi.mock("@cap/database/cloudflare/schema", async () => ({
+	...(await import("@cap/database/schema")),
+	videoProcessingJobs: {
+		name: "job",
+		videoId: "videoId",
+		errorCode: "errorCode",
+	},
+	organizations: {
+		name: "organization",
+		id: "id",
+		ownerId: "ownerId",
+		tombstoneAt: "tombstoneAt",
+	},
+	organizationMembers: {
+		name: "membership",
+		userId: "userId",
+		organizationId: "organizationId",
+	},
+}));
 
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.currentUser,
@@ -103,12 +214,18 @@ vi.mock("@cap/env", () => ({
 	serverEnv: () => ({ CAP_VIDEOS_DEFAULT_PUBLIC: true }),
 }));
 vi.mock("@cap/utils", () => ({ userIsPro: () => true }));
-vi.mock("@cap/web-backend", () => ({
-	Storage: {
-		createUploadTargetForUser: mocks.createUploadTargetForUser,
-		createUploadTargetForVideo: mocks.createUploadTargetForVideo,
-	},
-}));
+vi.mock("@cap/web-backend", async () => {
+	const { Context, Layer } = await import("effect");
+	return {
+		makeCurrentUserLayer: () => Layer.empty,
+		Videos: Context.GenericTag("FixtureVideos"),
+		Storage: {
+			getWritableAccessForUser: mocks.getWritableAccessForUser,
+			createUploadTargetForUser: mocks.createUploadTargetForUser,
+			createUploadTargetForVideo: mocks.createUploadTargetForVideo,
+		},
+	};
+});
 vi.mock("@/actions/organization/authorization", () => ({
 	requireOrganizationAccess: mocks.organizationAccess,
 }));
@@ -116,20 +233,27 @@ vi.mock("@/lib/server", async () => ({
 	runPromise: (await import("effect")).Effect.runPromise,
 }));
 vi.mock("next/cache", () => ({ revalidatePath: mocks.revalidatePath }));
-vi.mock("drizzle-orm", () => ({
-	eq:
-		(field: string, value: unknown): Predicate =>
-		(row) =>
-			row[field] === value,
-	and:
-		(...predicates: Predicate[]): Predicate =>
-		(row) =>
-			predicates.every((predicate) => predicate(row)),
-	isNull:
-		(field: string): Predicate =>
-		(row) =>
-			row[field] === null,
-}));
+vi.mock("drizzle-orm", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("drizzle-orm")>();
+	return {
+		...actual,
+		eq: (field: string | Parameters<typeof actual.eq>[0], value: unknown) =>
+			typeof field === "string"
+				? (row: Row) => row[field] === value
+				: actual.eq(field, value),
+		and: (
+			...predicates: Array<Predicate | import("drizzle-orm").SQL | undefined>
+		) =>
+			predicates.every((predicate) => typeof predicate === "function")
+				? (row: Row) =>
+						(predicates as Predicate[]).every((predicate) => predicate(row))
+				: actual.and(...(predicates as import("drizzle-orm").SQL[])),
+		isNull: (field: string | Parameters<typeof actual.isNull>[0]) =>
+			typeof field === "string"
+				? (row: Row) => row[field] === null
+				: actual.isNull(field),
+	};
+});
 
 import { createVideoForServerProcessing } from "@/actions/video/create-for-processing";
 import { createVideoAndGetUploadUrl } from "@/actions/video/upload";
@@ -176,6 +300,12 @@ beforeEach(() => {
 	mocks.transactionCalls = 0;
 	mocks.currentUser.mockResolvedValue({ id: "fixture-user" });
 	mocks.organizationAccess.mockResolvedValue(undefined);
+	mocks.getWritableAccessForUser.mockReturnValue(
+		Effect.succeed({
+			bucketId: Option.none(),
+			storageIntegrationId: Option.none(),
+		}),
+	);
 	mocks.createUploadTargetForUser.mockReturnValue(
 		Effect.succeed({
 			bucketId: Option.none(),
@@ -383,13 +513,15 @@ describe.each([
 		const result = await create(folderId);
 
 		expect(mocks.store.videos.get(result.id)?.folderId).toBe(folderId);
-		expect(mocks.createUploadTargetForUser).toHaveBeenCalledOnce();
+		expect(mocks.getWritableAccessForUser).toHaveBeenCalledOnce();
+		expect(mocks.createUploadTargetForVideo).toHaveBeenCalledOnce();
 	});
 
 	it("accepts an import without a folder", async () => {
 		const result = await create();
 
 		expect(mocks.store.videos.get(result.id)?.folderId).toBeUndefined();
-		expect(mocks.createUploadTargetForUser).toHaveBeenCalledOnce();
+		expect(mocks.getWritableAccessForUser).toHaveBeenCalledOnce();
+		expect(mocks.createUploadTargetForVideo).toHaveBeenCalledOnce();
 	});
 });

@@ -1,8 +1,10 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
+import { requireWritableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
 import { eq, sql } from "drizzle-orm";
 import { normalizePlaybackSpeed } from "@/lib/playback-speed";
@@ -58,12 +60,21 @@ export async function updateVideoSettings(
 		);
 	}
 
-	await db()
-		.update(videos)
-		.set({
-			settings: sql`JSON_MERGE_PATCH(COALESCE(${videos.settings}, JSON_OBJECT()), CAST(${JSON.stringify(settingsToSave)} AS JSON))`,
-		})
-		.where(eq(videos.id, videoId));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireWritableVideo(snapshot, videoId, user.id);
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({
+						settings: sql`json_patch(coalesce(${videos.settings}, json_object()), ${JSON.stringify(settingsToSave)})`,
+					})
+					.where(eq(videos.id, videoId)),
+			],
+			result: undefined,
+		};
+	});
 
 	return { success: true };
 }

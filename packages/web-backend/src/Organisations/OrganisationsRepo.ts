@@ -1,9 +1,9 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import type { Organisation, User, Video } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Array, Effect, Option } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 
 export class OrganisationsRepo extends Effect.Service<OrganisationsRepo>()(
 	"OrganisationsRepo",
@@ -63,6 +63,7 @@ export class OrganisationsRepo extends Effect.Service<OrganisationsRepo>()(
 								.select({
 									membershipId: Db.organizationMembers.id,
 									ownerId: Db.organizations.ownerId,
+									tombstoneAt: Db.organizations.tombstoneAt,
 									role: Db.organizationMembers.role,
 								})
 								.from(Db.organizations)
@@ -91,6 +92,7 @@ export class OrganisationsRepo extends Effect.Service<OrganisationsRepo>()(
 							Effect.map(
 								Option.map((row) => ({
 									membershipId: row.membershipId,
+									tombstoneAt: row.tombstoneAt,
 									role:
 										row.ownerId === userId
 											? ("owner" as const)

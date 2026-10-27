@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { folders, spaces } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { folders, spaces } from "@cap/database/cloudflare/schema";
 import { ImageUploads } from "@cap/web-backend";
 import {
 	type Folder,
@@ -128,14 +128,14 @@ async function setSpaceLogo(
 					.set({
 						// Atomic merge (a JSON null deletes the key per RFC 7396) so
 						// concurrent settings patches can't overwrite the logo write.
-						settings: sql`JSON_MERGE_PATCH(COALESCE(${spaces.settings}, '{}'), CAST(${JSON.stringify(
+						settings: sql`json_patch(COALESCE(${spaces.settings}, '{}'), ${JSON.stringify(
 							{
 								publicPage: {
 									logoUrl: key ?? null,
 									logoMode: key ? "custom" : "cap",
 								},
 							},
-						)} AS JSON))`,
+						)})`,
 					})
 					.where(eq(spaces.id, id)),
 		});
@@ -200,14 +200,14 @@ async function setFolderLogo(
 					.set({
 						// Atomic merge (a JSON null deletes the key per RFC 7396) so
 						// concurrent settings patches can't overwrite the logo write.
-						settings: sql`JSON_MERGE_PATCH(COALESCE(${folders.settings}, '{}'), CAST(${JSON.stringify(
+						settings: sql`json_patch(COALESCE(${folders.settings}, '{}'), ${JSON.stringify(
 							{
 								publicPage: {
 									logoUrl: key ?? null,
 									logoMode: key ? "custom" : "cap",
 								},
 							},
-						)} AS JSON))`,
+						)})`,
 					})
 					.where(eq(folders.id, id)),
 		});

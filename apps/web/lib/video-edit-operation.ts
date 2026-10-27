@@ -1,13 +1,24 @@
 import { isDeepStrictEqual } from "node:util";
-import { db } from "@cap/database";
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	type AtomicPlan,
+	type AtomicSnapshot,
+	type AtomicStatement,
+	atomic,
+} from "@cap/database/cloudflare/atomic";
 import {
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
+import {
+	requireOwnedVideo,
+	writableVideo,
+} from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { FatalError } from "workflow";
 import { z } from "zod";
 
@@ -37,9 +48,6 @@ const stateSchema = z.object({
 		.optional(),
 });
 export type EditProcessingState = z.infer<typeof stateSchema>;
-type Transaction = Parameters<
-	Parameters<ReturnType<typeof db>["transaction"]>[0]
->[0];
 
 export function getEditProcessingState(metadata: VideoMetadata | null) {
 	if (
@@ -95,42 +103,45 @@ export async function withEditOperation<T>(
 	videoId: string,
 	sourceKey: string,
 	operation: EditOperation,
-	run: (
-		tx: Transaction,
+	plan: (
+		database: CloudflareDatabase,
+		snapshot: AtomicSnapshot,
 		video: typeof videos.$inferSelect,
 		upload: typeof videoUploads.$inferSelect,
 		state: EditProcessingState,
-	) => Promise<T>,
-	lockRecordingJob = false,
+	) => Promise<AtomicPlan<T>>,
 ): Promise<T> {
-	return db().transaction(async (tx) => {
-		if (lockRecordingJob) {
-			await tx
-				.select({ videoId: videoProcessingJobs.videoId })
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const [video] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(and(eq(videos.id, videoId as Video.VideoId), writableVideo)),
+		);
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, videoId as Video.VideoId)),
+		);
+		const [job] = await snapshot.read((reader) =>
+			reader
+				.select({ errorCode: videoProcessingJobs.errorCode })
 				.from(videoProcessingJobs)
-				.where(eq(videoProcessingJobs.videoId, videoId as Video.VideoId))
-				.for("update");
-		}
-		const [video] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, videoId as Video.VideoId))
-			.for("update");
-		const [upload] = await tx
-			.select()
-			.from(videoUploads)
-			.where(eq(videoUploads.videoId, videoId as Video.VideoId))
-			.for("update");
+				.where(eq(videoProcessingJobs.videoId, videoId as Video.VideoId)),
+		);
 		const state = getEditProcessingState(video?.metadata ?? null);
 		if (
 			!video ||
 			!upload ||
 			!state ||
+			job?.errorCode === "video-deleting" ||
 			!matchesEditOperation(video, upload, sourceKey, operation)
-		) {
+		)
 			throw new FatalError("Edit operation has been replaced");
-		}
-		return run(tx, video, upload, state);
+		await requireOwnedVideo(snapshot, video.id, video.ownerId);
+		return plan(database, snapshot, video, upload, state);
 	});
 }
 
@@ -156,26 +167,35 @@ export async function clearPendingEdit(
 	sourceKey: string,
 	operation: EditOperation,
 ): Promise<void> {
-	await db().transaction(async (tx) => {
-		const [video] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, videoId as Video.VideoId))
-			.for("update");
-		const [upload] = await tx
-			.select()
-			.from(videoUploads)
-			.where(eq(videoUploads.videoId, videoId as Video.VideoId))
-			.for("update");
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [video] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(and(writableVideo, eq(videos.id, videoId as Video.VideoId))),
+		);
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, videoId as Video.VideoId)),
+		);
 		if (!video || !matchesEditOperation(video, upload, sourceKey, operation))
-			return;
+			return { statements, result: undefined };
 		const state = getEditProcessingState(video.metadata);
-		if (state?.dispatch !== "pending") return;
-		await tx
-			.update(videos)
-			.set({ metadata: withoutEditProcessing(video.metadata) })
-			.where(eq(videos.id, video.id));
-		await tx.delete(videoUploads).where(eq(videoUploads.videoId, video.id));
+		if (state?.dispatch !== "pending") return { statements, result: undefined };
+		statements.push(
+			database
+				.update(videos)
+				.set({ metadata: withoutEditProcessing(video.metadata) })
+				.where(eq(videos.id, video.id)),
+		);
+		statements.push(
+			database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
+		);
+		return { statements, result: undefined };
 	});
 }
 
@@ -197,27 +217,36 @@ export async function clearFailedEdit(
 	sourceKey: string,
 	operation: EditOperation,
 ): Promise<void> {
-	await db().transaction(async (tx) => {
-		const [video] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, videoId as Video.VideoId))
-			.for("update");
-		const [upload] = await tx
-			.select()
-			.from(videoUploads)
-			.where(eq(videoUploads.videoId, videoId as Video.VideoId))
-			.for("update");
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [video] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(and(writableVideo, eq(videos.id, videoId as Video.VideoId))),
+		);
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, videoId as Video.VideoId)),
+		);
 		if (!video || !matchesEditOperation(video, upload, sourceKey, operation))
-			return;
+			return { statements, result: undefined };
 		const state = getEditProcessingState(video.metadata);
-		await tx
-			.update(videos)
-			.set({
-				metadata: withoutEditProcessing(video.metadata),
-				...(state?.resultCommitted ? { transcriptionStatus: null } : {}),
-			})
-			.where(eq(videos.id, video.id));
-		await tx.delete(videoUploads).where(eq(videoUploads.videoId, video.id));
+		statements.push(
+			database
+				.update(videos)
+				.set({
+					metadata: withoutEditProcessing(video.metadata),
+					...(state?.resultCommitted ? { transcriptionStatus: null } : {}),
+				})
+				.where(eq(videos.id, video.id)),
+		);
+		statements.push(
+			database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
+		);
+		return { statements, result: undefined };
 	});
 }

@@ -465,7 +465,7 @@ describe("agent API contract", () => {
 		);
 
 		expect(updateSource).toContain("AgentCollectionPublicPageInput");
-		expect(updateSource).toContain("JSON_MERGE_PATCH");
+		expect(updateSource).toContain("json_patch");
 		expect(updateSource).toContain("Cap Pro is required");
 		expect(updateSource).toContain("getFolderAccess");
 		expect(updateSource).toContain("getSpaceAccess");

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { db } from "@cap/database";
-import { users, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users, videos } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend/src/Storage/index";
 import { type User, Video } from "@cap/web-domain";

@@ -1,9 +1,11 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { comments, notifications } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import { comments, notifications } from "@cap/database/cloudflare/schema";
 import { Storage, VideosRepo } from "@cap/web-backend";
+import { requireLiveVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Comment, Video } from "@cap/web-domain";
 import { and, eq, sql } from "drizzle-orm";
 import { Effect, Option } from "effect";
@@ -12,7 +14,7 @@ import * as EffectRuntime from "@/lib/server";
 
 export async function deleteComment({
 	commentId,
-	parentId,
+	parentId: _parentId,
 	videoId,
 }: {
 	commentId: Comment.CommentId;
@@ -30,24 +32,31 @@ export async function deleteComment({
 	}
 
 	try {
-		let deletedMedia: {
-			videoId: Video.VideoId;
-			mediaKey: string;
-			thumbnailKey: string | null;
-		} | null = null;
+		const database = db();
+		const deletedMedia = await atomic(database, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			let media: {
+				videoId: Video.VideoId;
+				mediaKey: string;
+				thumbnailKey: string | null;
+			} | null = null;
 
-		await db().transaction(async (tx) => {
 			// First, verify the comment exists and belongs to the current user
-			const [existingComment] = await tx
-				.select({
-					id: comments.id,
-					videoId: comments.videoId,
-					mediaKey: comments.mediaKey,
-					mediaMeta: comments.mediaMeta,
-				})
-				.from(comments)
-				.where(and(eq(comments.id, commentId), eq(comments.authorId, user.id)))
-				.limit(1);
+			const [existingComment] = await snapshot.read((reader) =>
+				reader
+					.select({
+						id: comments.id,
+						parentCommentId: comments.parentCommentId,
+						videoId: comments.videoId,
+						mediaKey: comments.mediaKey,
+						mediaMeta: comments.mediaMeta,
+					})
+					.from(comments)
+					.where(
+						and(eq(comments.id, commentId), eq(comments.authorId, user.id)),
+					)
+					.limit(1),
+			);
 
 			if (!existingComment) {
 				throw new Error(
@@ -55,8 +64,9 @@ export async function deleteComment({
 				);
 			}
 
+			await requireLiveVideo(snapshot, existingComment.videoId);
 			if (existingComment.mediaKey) {
-				deletedMedia = {
+				media = {
 					// The comment's own videoId, not the client-supplied one, decides
 					// which bucket the objects are deleted from.
 					videoId: existingComment.videoId,
@@ -65,39 +75,50 @@ export async function deleteComment({
 				};
 			}
 
-			await tx
-				.delete(comments)
-				.where(and(eq(comments.id, commentId), eq(comments.authorId, user.id)));
+			statements.push(
+				database
+					.delete(comments)
+					.where(
+						and(eq(comments.id, commentId), eq(comments.authorId, user.id)),
+					),
+			);
 
 			// Delete related notifications
-			if (parentId) {
-				await tx
-					.delete(notifications)
-					.where(
-						and(
-							eq(notifications.type, "reply"),
-							sql`JSON_EXTRACT(${notifications.data}, '$.comment.id') = ${commentId}`,
+			if (existingComment.parentCommentId) {
+				statements.push(
+					database
+						.delete(notifications)
+						.where(
+							and(
+								eq(notifications.type, "reply"),
+								sql`JSON_EXTRACT(${notifications.data}, '$.comment.id') = ${commentId}`,
+							),
 						),
-					);
+				);
 			} else {
-				await tx
-					.delete(notifications)
-					.where(
-						and(
-							eq(notifications.type, "comment"),
-							sql`JSON_EXTRACT(${notifications.data}, '$.comment.id') = ${commentId}`,
+				statements.push(
+					database
+						.delete(notifications)
+						.where(
+							and(
+								eq(notifications.type, "comment"),
+								sql`JSON_EXTRACT(${notifications.data}, '$.comment.id') = ${commentId}`,
+							),
 						),
-					);
+				);
 
-				await tx
-					.delete(notifications)
-					.where(
-						and(
-							eq(notifications.type, "reply"),
-							sql`JSON_EXTRACT(${notifications.data}, '$.comment.parentCommentId') = ${commentId}`,
+				statements.push(
+					database
+						.delete(notifications)
+						.where(
+							and(
+								eq(notifications.type, "reply"),
+								sql`JSON_EXTRACT(${notifications.data}, '$.comment.parentCommentId') = ${commentId}`,
+							),
 						),
-					);
+				);
 			}
+			return { statements, result: media };
 		});
 
 		// After the row is gone, best-effort delete of the media objects; a

@@ -176,6 +176,9 @@ const storageUploadSchema = z.discriminatedUnion("type", [
 ]);
 
 const processSchema = z.object({
+	processingToken: z.string().uuid().optional(),
+	processingInputKey: z.string().min(1).max(1024).optional(),
+	processingOutputKey: z.string().min(1).max(1024).optional(),
 	audioLevels: z.boolean().optional(),
 	videoId: z.string(),
 	userId: z.string(),
@@ -845,6 +848,61 @@ video.on("POST", ["/process", "/import"], async (c) => {
 			400,
 		);
 	}
+	const processingToken = result.data.processingToken;
+	const processingIdentity = processingToken
+		? createHash("sha256")
+				.update(
+					JSON.stringify({
+						videoId: result.data.videoId,
+						userId: result.data.userId,
+						inputKey: result.data.processingInputKey,
+						outputKey: result.data.processingOutputKey,
+					}),
+				)
+				.digest("hex")
+		: undefined;
+	if (processingToken) {
+		const prefix = `${result.data.userId}/${result.data.videoId}/`;
+		if (
+			!result.data.processingInputKey?.startsWith(prefix) ||
+			!result.data.processingOutputKey?.startsWith(
+				`${prefix}.recording/outputs/process-`,
+			) ||
+			!result.data.processingOutputKey.endsWith(
+				`/${processingToken}/result.mp4`,
+			) ||
+			[result.data.processingInputKey, result.data.processingOutputKey].some(
+				(key) =>
+					key.split("/").some((part) => part === ".." || part === ".") ||
+					key.includes("\\"),
+			)
+		)
+			return c.json(
+				{
+					error: "Invalid processing object identity",
+					code: "INVALID_REQUEST",
+				},
+				400,
+			);
+		const existing = getJob(`process_${processingToken}`);
+		if (existing) {
+			if (existing.recordingRequestKey !== processingIdentity)
+				return c.json(
+					{
+						error: "Processing token was already used for another request",
+						code: "CONFLICT",
+					},
+					409,
+				);
+			if (["complete", "error", "cancelled"].includes(existing.phase))
+				void sendWebhook(existing);
+			return c.json({
+				jobId: existing.jobId,
+				status: existing.phase,
+				message: "Video processing already accepted",
+			});
+		}
+	}
 	const capacity = getVideoCapacitySnapshot();
 	if (isDraining()) {
 		c.header("Retry-After", VIDEO_BUSY_RETRY_AFTER_SECONDS.toString());
@@ -873,8 +931,12 @@ video.on("POST", ["/process", "/import"], async (c) => {
 		webhookSecret,
 	} = result.data;
 
-	const jobId = generateJobId();
+	const jobId = processingToken
+		? `process_${processingToken}`
+		: generateJobId();
 	const job = createJob(jobId, videoId, userId, webhookUrl, webhookSecret);
+	if (processingIdentity)
+		updateJob(jobId, { recordingRequestKey: processingIdentity });
 
 	void trackBackgroundTask(
 		withMediaTransfers(32 * 1024 ** 3, () =>
@@ -1788,7 +1850,9 @@ async function processVideoAsync(
 				videoId: options.videoId,
 				userId: options.userId,
 				jobId,
-				sourceKey: `${options.userId}/${options.videoId}/result.mp4`,
+				sourceKey:
+					options.processingOutputKey ??
+					`${options.userId}/${options.videoId}/result.mp4`,
 				sourceIdentity: uploadReceipt?.objectIdentity,
 				duration: metadata.duration,
 				webhookUrl: options.webhookUrl,

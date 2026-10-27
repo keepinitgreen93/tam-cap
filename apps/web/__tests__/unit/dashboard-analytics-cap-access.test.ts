@@ -15,8 +15,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const client = drizzle(mocks.query);
 	return { db: () => client };
 });
@@ -38,15 +38,15 @@ vi.mock("@/lib/server", async () => {
 	const { Tinybird } = (await import("@cap/web-backend")) as unknown as {
 		Tinybird: import("effect").Context.Tag<TinybirdStub, TinybirdStub>;
 	};
-	const { Database } = await import(
-		"../../../../packages/web-backend/src/Database"
+	const { CloudflareDatabase } = await import(
+		"../../../../packages/web-backend/src/CloudflareDatabase"
 	);
 	return {
 		runPromise: <A, E>(
 			effect: import("effect").Effect.Effect<
 				A,
 				E,
-				InstanceType<typeof Database> | TinybirdStub
+				InstanceType<typeof CloudflareDatabase> | TinybirdStub
 			>,
 		) =>
 			Effect.runPromise(
@@ -59,7 +59,7 @@ vi.mock("@/lib/server", async () => {
 									: [],
 							}),
 					}),
-					Effect.provide(Database.Default),
+					Effect.provide(CloudflareDatabase.Default),
 				),
 			),
 	};
@@ -82,16 +82,16 @@ const spaceRow = (organizationId: string, organizationRole: string) => [
 ];
 
 const expectOrganizationScope = (statement: string, params: unknown[]) => {
-	expect(statement).toContain("`videos`.`orgId` = ?");
-	expect(statement).toContain("exists (select `id` from `shared_videos` where");
+	expect(statement).toContain('"videos"."orgId" = ?');
+	expect(statement).toContain('exists (select "id" from "shared_videos" where');
 	expect(statement).toContain(
-		"`shared_videos`.`videoId` = `videos`.`id` and `shared_videos`.`organizationId` = ?",
+		'"shared_videos"."videoId" = "videos"."id" and "shared_videos"."organizationId" = ?',
 	);
 	expect(statement).toContain(
-		"left join `spaces` on `spaces`.`id` = `space_videos`.`spaceId`",
+		'left join "spaces" on "spaces"."id" = "space_videos"."spaceId"',
 	);
 	expect(statement).toContain(
-		"`space_videos`.`videoId` = `videos`.`id` and (`space_videos`.`spaceId` = ? or `spaces`.`organizationId` = ?)",
+		'"space_videos"."videoId" = "videos"."id" and ("space_videos"."spaceId" = ? or "spaces"."organizationId" = ?)',
 	);
 	expect(params.filter((value) => value === "org-1")).toHaveLength(4);
 };
@@ -120,8 +120,8 @@ describe("dashboard analytics cap access", () => {
 			string,
 			unknown[],
 		];
-		expect(statement).toContain("`videos`.`id` = ?");
-		expect(statement).toContain("`videos`.`ownerId` = ?");
+		expect(statement).toContain('"videos"."id" = ?');
+		expect(statement).toContain('"videos"."ownerId" = ?');
 		expectOrganizationScope(statement, params);
 		expect(params).toContain("cap-1");
 		expect(params).toContain("user-1");
@@ -195,7 +195,7 @@ describe("dashboard analytics top cap names", () => {
 			{ pathname: "/s/cap-elsewhere", views: 1 },
 		];
 		mocks.query.mockImplementation(async (statement: string) => ({
-			rows: statement.startsWith("select `id`, `name` from `videos`")
+			rows: statement.startsWith('select "id", "name" from "videos"')
 				? [["cap-in-org", "Org cap"]]
 				: [],
 		}));
@@ -203,9 +203,9 @@ describe("dashboard analytics top cap names", () => {
 		const data = await getOrgAnalyticsData("org-1", "7d");
 
 		const nameQuery = mocks.query.mock.calls.find(([statement]) =>
-			(statement as string).startsWith("select `id`, `name` from `videos`"),
+			(statement as string).startsWith('select "id", "name" from "videos"'),
 		) as [string, unknown[]];
-		expect(nameQuery[0]).toContain("`videos`.`id` in (?, ?)");
+		expect(nameQuery[0]).toContain('"videos"."id" in (?, ?)');
 		expectOrganizationScope(nameQuery[0], nameQuery[1]);
 		expect(
 			data.breakdowns.topCaps.map(({ id, name }) => ({ id, name })),

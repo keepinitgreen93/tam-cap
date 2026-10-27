@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
-import { db } from "@cap/database";
-import { mediaProcessingBudgets } from "@cap/database/schema";
-import { asc, inArray, lt, sql } from "drizzle-orm";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import {
+	mediaProcessingBudgets,
+	videoProcessingJobs,
+} from "@cap/database/cloudflare/schema";
+import { requireOwnedVideo } from "@cap/web-backend/src/Videos/persistence";
+import { Video } from "@cap/web-domain";
+import { eq, inArray, lt } from "drizzle-orm";
 
 const MiB = 1024 ** 2;
 export class MediaProcessingBudgetError extends Error {
@@ -39,6 +45,7 @@ export async function reserveMediaProcessingBudget(input: {
 	generation: string;
 	attemptId: string;
 	sourceBytes: number;
+	purpose?: "recording" | "audio-level";
 	now?: Date;
 }) {
 	const now = input.now ?? new Date();
@@ -53,66 +60,92 @@ export async function reserveMediaProcessingBudget(input: {
 	]);
 	const recordingKey = recordingBudgetKey(input.videoId, input.generation);
 	const expiresAt = new Date(now.getTime() + 30 * 24 * 60 * 60_000);
-	return db().transaction(async (tx) => {
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const videoId = Video.VideoId.make(input.videoId);
+		await requireOwnedVideo(snapshot, videoId);
+		const [job] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(eq(videoProcessingJobs.videoId, videoId))
+				.limit(1),
+		);
+		if (
+			input.purpose !== "audio-level" &&
+			(!job ||
+				job.generation !== input.generation ||
+				job.attemptId !== input.attemptId ||
+				!job.leaseExpiresAt ||
+				job.leaseExpiresAt <= now ||
+				!["processing", "committing", "queued"].includes(job.state))
+		)
+			throw new Error("Processing attempt is no longer current");
+		if (job?.errorCode === "video-deleting")
+			throw new Error("Recording is being deleted");
 		const limits = [
 			{ id: attemptKey, limitBytes: attemptBytes },
 			{ id: recordingKey, limitBytes: recordingBytes },
-		].sort((left, right) => left.id.localeCompare(right.id));
-		await tx
-			.insert(mediaProcessingBudgets)
-			.values(limits.map((limit) => ({ ...limit, expiresAt })))
-			.onDuplicateKeyUpdate({
-				set: {
-					id: sql`${mediaProcessingBudgets.id}`,
-					expiresAt: sql`GREATEST(${mediaProcessingBudgets.expiresAt}, ${expiresAt})`,
-				},
-			});
-		const locked = await tx
-			.select()
-			.from(mediaProcessingBudgets)
-			.where(
-				inArray(
-					mediaProcessingBudgets.id,
-					limits.map((limit) => limit.id),
+		];
+		const existing = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(mediaProcessingBudgets)
+				.where(
+					inArray(
+						mediaProcessingBudgets.id,
+						limits.map((limit) => limit.id),
+					),
 				),
-			)
-			.orderBy(asc(mediaProcessingBudgets.id))
-			.for("update");
-		const rows = new Map(locked.map((row) => [row.id, row]));
-		if (rows.size !== limits.length)
-			throw new Error("Processing budget is unavailable");
-
+		);
+		const rows = new Map(existing.map((row) => [row.id, row]));
 		const attempt = rows.get(attemptKey);
-		if (attempt?.reservedBytes) {
-			if (attempt.reservedBytes !== attemptBytes)
-				throw new Error("Processing reservation changed");
-			return attemptBytes;
-		}
-		for (const [id, scope] of [[recordingKey, "recording"]] as const) {
-			const row = rows.get(id);
-			if (!row || row.reservedBytes + attemptBytes > row.limitBytes)
-				throw new MediaProcessingBudgetError(scope);
-		}
-		await tx
-			.update(mediaProcessingBudgets)
-			.set({
-				reservedBytes: sql`${mediaProcessingBudgets.reservedBytes} + ${attemptBytes}`,
-			})
-			.where(
-				inArray(
-					mediaProcessingBudgets.id,
-					limits.map((limit) => limit.id),
-				),
-			);
-
-		return attemptBytes;
+		if (
+			attempt?.reservedBytes &&
+			(attempt.reservedBytes !== attemptBytes ||
+				attempt.limitBytes !== attemptBytes)
+		)
+			throw new Error("Processing reservation changed");
+		const recording = rows.get(recordingKey);
+		const alreadyReserved = Boolean(attempt?.reservedBytes && recording);
+		if (
+			!alreadyReserved &&
+			(recording?.reservedBytes ?? 0) + attemptBytes >
+				(recording?.limitBytes ?? recordingBytes)
+		)
+			throw new MediaProcessingBudgetError("recording");
+		const statements: AtomicStatement[] = limits.map((limit) => {
+			const previous = rows.get(limit.id);
+			const reservedBytes =
+				(previous?.reservedBytes ?? 0) +
+				(alreadyReserved || (limit.id === attemptKey && previous?.reservedBytes)
+					? 0
+					: attemptBytes);
+			const deadline =
+				previous && previous.expiresAt > expiresAt
+					? previous.expiresAt
+					: expiresAt;
+			return database
+				.insert(mediaProcessingBudgets)
+				.values({ ...limit, reservedBytes, expiresAt: deadline })
+				.onConflictDoUpdate({
+					target: mediaProcessingBudgets.id,
+					set: { reservedBytes, expiresAt: deadline },
+				});
+		});
+		return { statements, result: attemptBytes };
 	});
 }
 
 export async function cleanupExpiredMediaProcessingBudgets(now = new Date()) {
-	const result = await db()
-		.delete(mediaProcessingBudgets)
+	const database = db();
+	const expired = database
+		.select({ id: mediaProcessingBudgets.id })
+		.from(mediaProcessingBudgets)
 		.where(lt(mediaProcessingBudgets.expiresAt, now))
 		.limit(1_000);
-	return result[0].affectedRows;
+	const result = await database
+		.delete(mediaProcessingBudgets)
+		.where(inArray(mediaProcessingBudgets.id, expired));
+	return result.meta.changes;
 }

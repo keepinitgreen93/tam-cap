@@ -75,6 +75,9 @@ scripts/seo/
 !/docs/superpowers/
 **/.wrangler/
 **/.dev.vars*
+/.secrets/
+/.playwright-cli/
+/output/playwright/
 /.growth-agent/
 
 # OpenCode commands (local)

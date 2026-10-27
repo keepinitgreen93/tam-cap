@@ -1,4 +1,4 @@
-import type { DbClient } from "@cap/web-backend/src/Database";
+import type { CloudflareDbClient } from "@cap/web-backend/src/CloudflareDatabase";
 import type { HttpApi } from "@effect/platform";
 import type { Context, Layer as EffectLayer } from "effect";
 import {
@@ -22,13 +22,13 @@ vi.mock("server-only", () => ({}));
 vi.mock("next/cache", () => ({ revalidatePath: mocks.revalidatePath }));
 
 vi.mock("@/lib/server", async () => {
-	const { Database, Videos } = await import("@cap/web-backend");
+	const { CloudflareDatabase, Videos } = await import("@cap/web-backend");
 	const { HttpAuthMiddleware, Organisation, User } = await import(
 		"@cap/web-domain"
 	);
 	const { HttpApiBuilder, HttpServer } = await import("@effect/platform");
 	const { Effect, Layer, Option } = await import("effect");
-	const Db = await import("@cap/database/schema");
+	const Db = await import("@cap/database/cloudflare/schema");
 	const { sql } = await import("drizzle-orm");
 	const summary = {
 		id: "video",
@@ -96,10 +96,10 @@ vi.mock("@/lib/server", async () => {
 		}),
 	};
 	const database = Layer.succeed(
-		Database,
-		Database.make({
+		CloudflareDatabase,
+		CloudflareDatabase.make({
 			use: (callback) =>
-				Effect.promise(() => callback(client as unknown as DbClient)),
+				Effect.promise(() => callback(client as unknown as CloudflareDbClient)),
 		}),
 	);
 	const videos = Layer.succeed(Videos, {
@@ -119,7 +119,7 @@ vi.mock("@/lib/server", async () => {
 			api: EffectLayer.Layer<
 				HttpApi.Api,
 				never,
-				| Context.Tag.Identifier<typeof Database>
+				| Context.Tag.Identifier<typeof CloudflareDatabase>
 				| Context.Tag.Identifier<typeof Videos>
 				| Context.Tag.Identifier<typeof HttpAuthMiddleware>
 			>,

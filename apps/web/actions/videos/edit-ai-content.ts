@@ -1,8 +1,14 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	type AtomicPlan,
+	type AtomicStatement,
+	atomic,
+} from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
 import { and, eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -63,68 +69,102 @@ export async function editAiContent(
 	);
 
 	try {
-		const result = await db().transaction(async (tx): Promise<EditResult> => {
-			const [video] = await tx
-				.select({
-					metadata: videos.metadata,
-					duration: videos.duration,
-					transcriptionStatus: videos.transcriptionStatus,
-				})
-				.from(videos)
-				.where(and(eq(videos.id, videoId), eq(videos.ownerId, user.id)))
-				.for("update");
-			if (!video) {
-				return {
-					success: false,
-					message: "You don't have permission to edit this video.",
+		const database = db();
+		const result = await atomic(
+			database,
+			async (snapshot): Promise<AtomicPlan<EditResult>> => {
+				const statements: AtomicStatement[] = [];
+				const [video] = await snapshot.read((reader) =>
+					reader
+						.select({
+							metadata: videos.metadata,
+							duration: videos.duration,
+							transcriptionStatus: videos.transcriptionStatus,
+						})
+						.from(videos)
+						.where(
+							and(
+								writableVideo,
+								eq(videos.id, videoId),
+								eq(videos.ownerId, user.id),
+							),
+						),
+				);
+				if (!video) {
+					return {
+						statements,
+						result: {
+							success: false,
+							message: "You don't have permission to edit this video.",
+						},
+					};
+				}
+				const metadata = video.metadata ?? {};
+				if (
+					video.transcriptionStatus === "PROCESSING" ||
+					metadata.aiGenerationStatus === "QUEUED" ||
+					metadata.aiGenerationStatus === "PROCESSING"
+				) {
+					return {
+						statements,
+						result: {
+							success: false,
+							message: "Wait for AI generation to finish before editing.",
+						},
+					};
+				}
+				const current = {
+					summary: metadata.summary || "",
+					chapters: metadata.chapters ?? [],
 				};
-			}
-			const metadata = video.metadata ?? {};
-			if (
-				video.transcriptionStatus === "PROCESSING" ||
-				metadata.aiGenerationStatus === "QUEUED" ||
-				metadata.aiGenerationStatus === "PROCESSING"
-			) {
-				return {
-					success: false,
-					message: "Wait for AI generation to finish before editing.",
+				if (
+					(summaryChanged && current.summary !== expected.summary) ||
+					(chaptersChanged &&
+						!chaptersEqual(current.chapters, expected.chapters))
+				) {
+					return {
+						statements,
+						result: {
+							success: false,
+							message:
+								"This content changed since you started editing. Copy your changes, then cancel and reopen the editor to load the latest version.",
+						},
+					};
+				}
+				const next = {
+					summary: summaryChanged ? value.summary : current.summary,
+					chapters: chaptersChanged ? value.chapters : current.chapters,
 				};
-			}
-			const current = {
-				summary: metadata.summary || "",
-				chapters: metadata.chapters ?? [],
-			};
-			if (
-				(summaryChanged && current.summary !== expected.summary) ||
-				(chaptersChanged && !chaptersEqual(current.chapters, expected.chapters))
-			) {
-				return {
-					success: false,
-					message:
-						"This content changed since you started editing. Copy your changes, then cancel and reopen the editor to load the latest version.",
-				};
-			}
-			const next = {
-				summary: summaryChanged ? value.summary : current.summary,
-				chapters: chaptersChanged ? value.chapters : current.chapters,
-			};
-			const validationError = validateAiContent(next, video.duration);
-			if (validationError) return { success: false, message: validationError };
-			let updatedMetadata = sql`COALESCE(${videos.metadata}, JSON_OBJECT())`;
-			if (summaryChanged) {
-				updatedMetadata = sql`JSON_SET(${updatedMetadata}, '$.summary', ${next.summary}, '$.summaryManuallyEdited', CAST('true' AS JSON))`;
-			}
-			if (chaptersChanged) {
-				updatedMetadata = sql`JSON_SET(${updatedMetadata}, '$.chapters', CAST(${JSON.stringify(next.chapters)} AS JSON), '$.chaptersManuallyEdited', CAST('true' AS JSON))`;
-			}
-			if (summaryChanged || chaptersChanged) {
-				await tx
-					.update(videos)
-					.set({ metadata: updatedMetadata })
-					.where(and(eq(videos.id, videoId), eq(videos.ownerId, user.id)));
-			}
-			return { success: true, data: next };
-		});
+				const validationError = validateAiContent(next, video.duration);
+				if (validationError)
+					return {
+						statements,
+						result: { success: false, message: validationError },
+					};
+				let updatedMetadata = sql`COALESCE(${videos.metadata}, JSON_OBJECT())`;
+				if (summaryChanged) {
+					updatedMetadata = sql`JSON_SET(${updatedMetadata}, '$.summary', ${next.summary}, '$.summaryManuallyEdited', JSON('true'))`;
+				}
+				if (chaptersChanged) {
+					updatedMetadata = sql`JSON_SET(${updatedMetadata}, '$.chapters', JSON(${JSON.stringify(next.chapters)}), '$.chaptersManuallyEdited', JSON('true'))`;
+				}
+				if (summaryChanged || chaptersChanged) {
+					statements.push(
+						database
+							.update(videos)
+							.set({ metadata: updatedMetadata })
+							.where(
+								and(
+									writableVideo,
+									eq(videos.id, videoId),
+									eq(videos.ownerId, user.id),
+								),
+							),
+					);
+				}
+				return { statements, result: { success: true, data: next } };
+			},
+		);
 		if (result.success) revalidatePath(`/s/${videoId}`);
 		return result;
 	} catch (error) {

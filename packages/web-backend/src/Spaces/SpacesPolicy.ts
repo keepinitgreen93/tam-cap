@@ -1,7 +1,7 @@
 import { Policy, type Space } from "@cap/web-domain";
 import { Effect, Option } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { OrganisationsRepo } from "../Organisations/OrganisationsRepo.ts";
 import { SpacesRepo } from "../Spaces/SpacesRepo.ts";
 

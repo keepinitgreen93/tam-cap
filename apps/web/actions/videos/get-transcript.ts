@@ -1,14 +1,15 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import { provideOptionalAuth, Storage, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Exit, Option } from "effect";
 import * as EffectRuntime from "@/lib/server";
 import { runPromise } from "@/lib/server";
+import { readTranscriptVtt } from "@/lib/transcript-publication";
 import { decodeStorageVideo } from "@/lib/video-storage";
 
 export async function getTranscript(
@@ -56,23 +57,21 @@ export async function getTranscript(
 	}
 
 	try {
-		const vttContent = await Effect.gen(function* () {
-			const [bucket] = yield* Storage.getAccessForVideo(
-				decodeStorageVideo(video),
-			);
+		const [bucket] = await Storage.getAccessForVideo(
+			decodeStorageVideo(video),
+		).pipe(runPromise);
+		const vttContent = await readTranscriptVtt(video, {
+			getText: async (key) =>
+				Option.getOrNull(await bucket.getObject(key).pipe(runPromise)),
+		});
 
-			return yield* bucket.getObject(
-				`${video.ownerId}/${videoId}/transcription.vtt`,
-			);
-		}).pipe(runPromise);
-
-		if (Option.isNone(vttContent)) {
+		if (vttContent === null) {
 			return { success: false, message: "Transcript file not found" };
 		}
 
 		return {
 			success: true,
-			content: vttContent.value,
+			content: vttContent,
 			message: "Transcript retrieved successfully",
 		};
 	} catch (error) {

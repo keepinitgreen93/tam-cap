@@ -1,5 +1,5 @@
 import type * as S3 from "@aws-sdk/client-s3";
-import type * as Db from "@cap/database/schema";
+import type * as Db from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import {
 	type Organisation,
@@ -548,14 +548,26 @@ const makeGoogleDriveAccess = ({
 	repo,
 	integration,
 	config,
+	copyTarget,
 }: {
 	repo: StorageRepo;
 	integration: typeof Db.storageIntegrations.$inferSelect;
 	config: GoogleDriveIntegrationConfig;
+	copyTarget?: {
+		sourceVideoId: Video.VideoId;
+		targetVideoId: Video.VideoId;
+		ownerId: User.UserId;
+	};
 }) => {
 	const integrationId = integration.id;
 	const ownerId = integration.ownerId;
 	const tokenStore = makeGoogleDriveTokenStore(repo, integration);
+	const copySourceForKey = (key: string) => {
+		if (!copyTarget) return undefined;
+		if (!key.startsWith(`${copyTarget.ownerId}/${copyTarget.targetVideoId}/`))
+			throw new Error("Copy target storage key is outside its recording");
+		return copyTarget.sourceVideoId;
+	};
 
 	const getObjectRecord = (key: string) =>
 		mapStorageError(requireDriveObject(repo, integrationId, key));
@@ -651,6 +663,7 @@ const makeGoogleDriveAccess = ({
 						integrationId,
 						ownerId,
 						videoId: parseObjectKeyVideoId(key),
+						copySourceVideoId: sourceObject.videoId ?? undefined,
 						key,
 						contentType:
 							args?.ContentType ??
@@ -714,6 +727,7 @@ const makeGoogleDriveAccess = ({
 					integrationId,
 					ownerId,
 					videoId: parseObjectKeyVideoId(key),
+					copySourceVideoId: sourceObject.videoId ?? undefined,
 					key,
 					contentType:
 						before.mimeType ??
@@ -767,6 +781,7 @@ const makeGoogleDriveAccess = ({
 				{
 					integrationId,
 					ownerId,
+					copySourceVideoId: copySourceForKey(key),
 					videoId: parseVideoIdFromObjectKey(key).pipe(
 						Option.map((id) => id as Video.VideoId),
 						Option.getOrNull,
@@ -836,6 +851,7 @@ const makeGoogleDriveAccess = ({
 				{
 					integrationId,
 					ownerId,
+					copySourceVideoId: copySourceForKey(key),
 					videoId: parseVideoIdFromObjectKey(key).pipe(
 						Option.map((id) => id as Video.VideoId),
 						Option.getOrNull,
@@ -997,6 +1013,7 @@ const makeGoogleDriveAccess = ({
 				{
 					integrationId,
 					ownerId,
+					copySourceVideoId: copySourceForKey(key),
 					videoId: parseVideoIdFromObjectKey(key).pipe(
 						Option.map((id) => id as Video.VideoId),
 						Option.getOrNull,
@@ -1017,6 +1034,7 @@ const makeGoogleDriveAccess = ({
 				{
 					integrationId,
 					ownerId,
+					copySourceVideoId: copySourceForKey(key),
 					videoId: parseVideoIdFromObjectKey(key).pipe(
 						Option.map((id) => id as Video.VideoId),
 						Option.getOrNull,
@@ -1043,6 +1061,7 @@ const makeGoogleDriveAccess = ({
 				{
 					integrationId,
 					ownerId,
+					copySourceVideoId: copySourceForKey(key),
 					videoId: parseVideoIdFromObjectKey(key).pipe(
 						Option.map((id) => id as Video.VideoId),
 						Option.getOrNull,
@@ -1168,6 +1187,9 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 			organizationId?: Organisation.OrganisationId,
 		) {
 			if (organizationId) {
+				yield* mapStorageError(
+					repo.assertOrganizationAccess(organizationId, userId),
+				);
 				const organizationBucket = yield* mapStorageError(
 					s3Buckets.getBucketAccessForOrganization(organizationId),
 				);
@@ -1194,6 +1216,11 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 
 		const getDriveAccess = Effect.fn("Storage.getDriveAccess")(function* (
 			integrationId: StorageDomain.StorageIntegrationId,
+			copyTarget?: {
+				sourceVideoId: Video.VideoId;
+				targetVideoId: Video.VideoId;
+				ownerId: User.UserId;
+			},
 		) {
 			const integration = yield* mapStorageError(
 				repo.getIntegrationById(integrationId),
@@ -1213,12 +1240,13 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 			const config = yield* mapStorageError(
 				repo.getGoogleDriveConfig(integration),
 			);
-			return makeGoogleDriveAccess({ repo, integration, config });
+			return makeGoogleDriveAccess({ repo, integration, config, copyTarget });
 		});
 
 		const getOrganizationWritableAccess = Effect.fn(
 			"Storage.getOrganizationWritableAccess",
 		)(function* (organizationId: Organisation.OrganisationId) {
+			yield* mapStorageError(repo.assertOrganizationAccess(organizationId));
 			const activeIntegration = yield* mapStorageError(
 				repo.getActiveIntegrationForOrganization(organizationId),
 			);
@@ -1253,6 +1281,9 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 			organizationId?: Organisation.OrganisationId,
 		) {
 			if (organizationId) {
+				yield* mapStorageError(
+					repo.assertOrganizationAccess(organizationId, userId),
+				);
 				const organizationAccess =
 					yield* getOrganizationWritableAccess(organizationId);
 
@@ -1278,10 +1309,23 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 
 		const getAccessForVideo = Effect.fn("Storage.getAccessForVideo")(function* (
 			video: Video.Video,
-			options?: { resolvePublishedOutput?: boolean },
+			options?: {
+				resolvePublishedOutput?: boolean;
+				copyTargetVideoId?: Video.VideoId;
+			},
 		) {
+			yield* mapStorageError(repo.assertVideoAccess(video.id, video.ownerId));
 			if (Option.isSome(video.storageIntegrationId)) {
-				const access = yield* getDriveAccess(video.storageIntegrationId.value);
+				const access = yield* getDriveAccess(
+					video.storageIntegrationId.value,
+					options?.copyTargetVideoId
+						? {
+								sourceVideoId: video.id,
+								targetVideoId: options.copyTargetVideoId,
+								ownerId: video.ownerId,
+							}
+						: undefined,
+				);
 				return [
 					options?.resolvePublishedOutput === false
 						? access
@@ -1318,6 +1362,7 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 		const createUploadTargetForVideo = Effect.fn(
 			"Storage.createUploadTargetForVideo",
 		)(function* (video: Video.Video, key: string, input: UploadTargetInput) {
+			yield* mapStorageError(repo.assertWritableVideo(video.id, video.ownerId));
 			const [access] = yield* getAccessForVideo(video);
 			return yield* access.createUploadTarget(key, input);
 		});
@@ -1407,7 +1452,10 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 		);
 	static getAccessForVideo = (
 		video: Video.Video,
-		options?: { resolvePublishedOutput?: boolean },
+		options?: {
+			resolvePublishedOutput?: boolean;
+			copyTargetVideoId?: Video.VideoId;
+		},
 	) =>
 		Effect.flatMap(Storage, (storage) =>
 			storage.getAccessForVideo(video, options),

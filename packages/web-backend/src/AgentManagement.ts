@@ -1,4 +1,4 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import {
 	type Folder,
 	type Organisation,
@@ -9,7 +9,7 @@ import {
 } from "@cap/web-domain";
 import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
 import { Effect } from "effect";
-import { Database } from "./Database.ts";
+import { CloudflareDatabase } from "./CloudflareDatabase.ts";
 
 type OrganizationRole = "owner" | "admin" | "member";
 
@@ -22,7 +22,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 	"AgentManagement",
 	{
 		effect: Effect.gen(function* () {
-			const database = yield* Database;
+			const database = yield* CloudflareDatabase;
 
 			const getMembership = Effect.fn("AgentManagement.getMembership")(
 				function* (
@@ -33,7 +33,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 						db
 							.select({
 								id: Db.organizationMembers.id,
-								role: Db.organizationMembers.role,
+								role: sql<string>`CASE WHEN ${Db.organizations.ownerId} = ${Db.organizationMembers.userId} THEN 'owner' WHEN ${Db.organizationMembers.role} = 'admin' THEN 'admin' ELSE 'member' END`,
 								hasProSeat: Db.organizationMembers.hasProSeat,
 							})
 							.from(Db.organizationMembers)
@@ -83,9 +83,16 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 								createdById: Db.spaces.createdById,
 								privacy: Db.spaces.privacy,
 								memberRole: Db.spaceMembers.role,
-								organizationRole: Db.organizationMembers.role,
+								organizationRole: sql<string>`CASE WHEN ${Db.organizations.ownerId} = ${Db.organizationMembers.userId} THEN 'owner' WHEN ${Db.organizationMembers.role} = 'admin' THEN 'admin' ELSE 'member' END`,
 							})
 							.from(Db.spaces)
+							.innerJoin(
+								Db.organizations,
+								and(
+									eq(Db.spaces.organizationId, Db.organizations.id),
+									isNull(Db.organizations.tombstoneAt),
+								),
+							)
 							.innerJoin(
 								Db.organizationMembers,
 								and(
@@ -133,7 +140,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 								id: Db.organizations.id,
 								name: Db.organizations.name,
 								ownerId: Db.organizations.ownerId,
-								role: Db.organizationMembers.role,
+								role: sql<string>`CASE WHEN ${Db.organizations.ownerId} = ${Db.organizationMembers.userId} THEN 'owner' WHEN ${Db.organizationMembers.role} = 'admin' THEN 'admin' ELSE 'member' END`,
 								hasProSeat: Db.organizationMembers.hasProSeat,
 								allowedEmailDomain: Db.organizations.allowedEmailDomain,
 								customDomain: Db.organizations.customDomain,
@@ -437,7 +444,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 								)
 								.limit(limit + 1),
 						);
-						const [{ count }] = yield* database.use((db) =>
+						const [countRow] = yield* database.use((db) =>
 							db
 								.select({ count: sql<number>`COUNT(*)`.mapWith(Number) })
 								.from(Db.notifications)
@@ -448,7 +455,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 									),
 								),
 						);
-						return { rows, unreadCount: count ?? 0 };
+						return { rows, unreadCount: countRow?.count ?? 0 };
 					},
 				),
 
@@ -502,7 +509,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 						organizationId,
 					);
 					const organization = yield* getOrganization(userId, organizationId);
-					const [{ total, assigned }] = yield* database.use((db) =>
+					const [seatCount] = yield* database.use((db) =>
 						db
 							.select({
 								total: sql<number>`COUNT(*)`.mapWith(Number),
@@ -517,8 +524,8 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 					return {
 						membership,
 						organization,
-						totalSeats: total ?? 0,
-						assignedSeats: assigned ?? 0,
+						totalSeats: seatCount?.total ?? 0,
+						assignedSeats: seatCount?.assigned ?? 0,
 					};
 				}),
 
@@ -769,15 +776,7 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 					capId: Video.VideoId | null,
 				) {
 					const organization = yield* getOrganization(userId, organizationId);
-					const isPro =
-						organization.ownerSubscriptionStatus === "active" ||
-						organization.ownerSubscriptionStatus === "trialing" ||
-						organization.ownerThirdPartySubscriptionId !== null;
-					if (!isPro) {
-						return yield* new Policy.PolicyDeniedError({
-							reason: "Cap Pro is required for analytics",
-						});
-					}
+
 					if (spaceId) {
 						const access = yield* getSpaceAccess(userId, spaceId);
 						if (access.organizationId !== organizationId) {
@@ -807,6 +806,6 @@ export class AgentManagement extends Effect.Service<AgentManagement>()(
 				getSpaceAccess,
 			};
 		}),
-		dependencies: [Database.Default],
+		dependencies: [CloudflareDatabase.Default],
 	},
 ) {}

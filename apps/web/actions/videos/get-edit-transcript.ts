@@ -1,9 +1,11 @@
 "use server";
 
 import { randomUUID } from "node:crypto";
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videoEdits, videos } from "@cap/database/schema";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videoEdits, videos } from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
 import { Storage } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
@@ -14,12 +16,11 @@ import {
 	type EditTranscript,
 	type EditTranscriptBackfillStatus,
 	getEditTranscriptBackfillStatus,
-	getEditTranscriptObjectKey,
 	parseEditTranscript,
 	remapEditTranscriptThroughSpec,
 } from "@/lib/edit-transcript";
-import { decryptEditTranscriptObject } from "@/lib/edit-transcript-storage";
 import { runPromise } from "@/lib/server";
+import { readOriginalEditTranscript } from "@/lib/transcript-publication";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { backfillEditTranscriptWorkflow } from "@/workflows/transcribe";
 
@@ -83,14 +84,6 @@ async function loadEditableTranscriptVideo(videoId: Video.VideoId) {
 	return { user, video, bucket };
 }
 
-async function getOptionalObject(
-	bucket: Awaited<ReturnType<typeof loadEditableTranscriptVideo>>["bucket"],
-	key: string,
-) {
-	const object = await bucket.getObject(key).pipe(runPromise);
-	return Option.isSome(object) ? object.value : null;
-}
-
 function isFreshProcessingStatus(status: EditTranscriptBackfillStatus) {
 	if (status.status !== "processing") return false;
 	const requestedAt = Date.parse(status.requestedAt);
@@ -113,13 +106,10 @@ async function readCurrentEditTranscript(
 	bucket: Awaited<ReturnType<typeof loadEditableTranscriptVideo>>["bucket"],
 	video: typeof videos.$inferSelect,
 ): Promise<EditTranscript | null> {
-	const content = await getOptionalObject(
-		bucket,
-		getEditTranscriptObjectKey(video.ownerId, video.id),
-	);
-	const decrypted = content
-		? decryptEditTranscriptObject(content, video.ownerId, video.id)
-		: null;
+	const decrypted = await readOriginalEditTranscript(video, {
+		getText: async (key) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runPromise)),
+	});
 	const transcript = decrypted ? parseEditTranscript(decrypted) : null;
 	if (!transcript) return null;
 
@@ -185,40 +175,41 @@ async function claimEditTranscriptBackfill(
 	videoId: Video.VideoId,
 	userId: string,
 ) {
-	return db().transaction(async (tx) => {
-		const [video] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, videoId))
-			.for("update");
+	const database = db();
+	const requestId = randomUUID();
+	const requestedAt = new Date().toISOString();
+	return atomic(database, async (snapshot) => {
+		const [video] = await snapshot.read((reader) =>
+			reader.select().from(videos).where(eq(videos.id, videoId)),
+		);
 		if (!video || video.ownerId !== userId) throw new Error("Video not found");
-		if (!isEditableTranscriptVideo(video)) {
+		if (video.orgId) await requireActiveOrganization(snapshot, video.orgId);
+		if (!isEditableTranscriptVideo(video))
 			throw new Error("Transcript editing is not available for this video");
-		}
-
 		const existing = getEditTranscriptBackfillStatus(video.metadata);
-		if (existing && isFreshProcessingStatus(existing)) {
-			return { claimed: false as const };
-		}
-
-		const requestId = randomUUID();
-		const status = {
-			status: "processing",
-			requestId,
-			requestedAt: new Date().toISOString(),
+		if (existing && isFreshProcessingStatus(existing))
+			return { statements: [], result: { claimed: false as const } };
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({
+						metadata: {
+							...video.metadata,
+							editTranscriptBackfill: {
+								status: "processing",
+								requestId,
+								requestedAt,
+							},
+						},
+						updatedAt: video.updatedAt,
+					})
+					.where(eq(videos.id, videoId)),
+			],
+			result: { claimed: true as const, requestId },
 		};
-		await tx
-			.update(videos)
-			.set({
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.editTranscriptBackfill', CAST(${JSON.stringify(status)} AS JSON))`,
-				updatedAt: video.updatedAt,
-			})
-			.where(eq(videos.id, videoId));
-
-		return { claimed: true as const, requestId };
 	});
 }
-
 async function setEditTranscriptBackfillError(
 	videoId: Video.VideoId,
 	requestId: string,
@@ -232,7 +223,7 @@ async function setEditTranscriptBackfillError(
 		.where(
 			and(
 				eq(videos.id, videoId),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.editTranscriptBackfill.requestId')) = ${requestId}`,
+				sql`json_extract(${videos.metadata}, '$.editTranscriptBackfill.requestId') = ${requestId}`,
 			),
 		);
 }
@@ -250,7 +241,7 @@ async function clearEditTranscriptBackfill(
 		.where(
 			and(
 				eq(videos.id, videoId),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.editTranscriptBackfill.requestId')) = ${requestId}`,
+				sql`json_extract(${videos.metadata}, '$.editTranscriptBackfill.requestId') = ${requestId}`,
 			),
 		);
 }
@@ -270,7 +261,11 @@ export async function requestEditTranscript(
 			return { status: "processing" };
 		}
 
-		const transcriptAfterClaim = await readCurrentEditTranscript(bucket, video);
+		const refreshed = await loadEditableTranscriptVideo(videoId);
+		const transcriptAfterClaim = await readCurrentEditTranscript(
+			refreshed.bucket,
+			refreshed.video,
+		);
 		if (transcriptAfterClaim) {
 			await clearEditTranscriptBackfill(videoId, claim.requestId);
 			return { status: "ready", transcript: transcriptAfterClaim };

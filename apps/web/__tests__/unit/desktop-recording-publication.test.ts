@@ -1,6 +1,12 @@
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopRecordingJob } from "@/lib/desktop-recording-jobs";
+import {
+	databaseRevision,
+	snapshotGuard,
+} from "../../../../packages/database/cloudflare/concurrency-schema";
 
 const mocks = vi.hoisted(() => ({
 	db: vi.fn(),
@@ -10,23 +16,24 @@ const mocks = vi.hoisted(() => ({
 	head: vi.fn(),
 	storage: vi.fn(),
 	invalidateQuota: vi.fn(),
-	tables: {
-		videos: {
-			id: "videos.id",
-			ownerId: "videos.ownerId",
-			metadata: "videos.metadata",
-		},
-		jobs: { videoId: "jobs.videoId" },
-		uploads: { videoId: "uploads.videoId", rawFileKey: "uploads.rawFileKey" },
+	tables: {} as {
+		videos: typeof import("@cap/database/cloudflare/schema").videos;
+		jobs: typeof import("@cap/database/cloudflare/schema").videoProcessingJobs;
+		uploads: typeof import("@cap/database/cloudflare/schema").videoUploads;
 	},
 }));
 
-vi.mock("@cap/database", () => ({ db: mocks.db }));
-vi.mock("@cap/database/schema", () => ({
-	videos: mocks.tables.videos,
-	videoProcessingJobs: mocks.tables.jobs,
-	videoUploads: mocks.tables.uploads,
-}));
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/schema", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("@cap/database/cloudflare/schema")>();
+	Object.assign(mocks.tables, {
+		videos: actual.videos,
+		jobs: actual.videoProcessingJobs,
+		uploads: actual.videoUploads,
+	});
+	return actual;
+});
 vi.mock("@cap/web-backend", () => ({
 	Storage: { getAccessForVideo: mocks.storage },
 }));
@@ -68,7 +75,7 @@ import { getDesktopRecordingOutputKey } from "@/lib/desktop-recording-source";
 
 type StoredJob = Parameters<typeof parseDesktopRecordingJob>[0];
 type Mutation = {
-	operation: "update" | "delete";
+	operation: "insert" | "update" | "delete";
 	table: unknown;
 	values?: Record<string, unknown>;
 };
@@ -212,7 +219,18 @@ function databaseFixture(initial: DesktopRecordingJob) {
 	let beforeTransaction: (() => void) | undefined;
 	let transactionTail = Promise.resolve();
 	const mutations: Mutation[] = [];
+	let revision = 0;
+	let signature = "";
+	const currentRevision = () => {
+		const next = JSON.stringify([current, video]);
+		if (next !== signature) {
+			signature = next;
+			revision++;
+		}
+		return revision;
+	};
 	const rows = (table: unknown) => {
+		if (table === databaseRevision) return [{ revision: currentRevision() }];
 		if (table === mocks.tables.jobs)
 			return current ? [structuredClone(current)] : [];
 		if (table === mocks.tables.videos)
@@ -220,63 +238,70 @@ function databaseFixture(initial: DesktopRecordingJob) {
 		if (table === mocks.tables.uploads) return [{ rawFileKey: null }];
 		throw new Error("Unexpected table");
 	};
-	const transaction = vi.fn(
-		async (
-			operation: (tx: ReturnType<typeof transactionHandle>) => Promise<unknown>,
-		) => {
-			const previous = transactionTail;
-			let release = () => {};
-			transactionTail = new Promise<void>((resolve) => {
-				release = resolve;
-			});
-			await previous;
-			try {
-				beforeTransaction?.();
-				const pending: Mutation[] = [];
-				const result = await operation(transactionHandle(pending));
-				for (const mutation of pending) {
-					mutations.push(mutation);
-					if (mutation.operation !== "update") continue;
-					if (mutation.table === mocks.tables.jobs && current) {
-						Object.assign(current, mutation.values);
-					} else if (mutation.table === mocks.tables.videos && video) {
-						Object.assign(video, mutation.values);
-					}
-				}
-				return result;
-			} finally {
-				release();
+	const transaction = vi.fn(async (statements: Mutation[]) => {
+		const previous = transactionTail;
+		let release = () => {};
+		transactionTail = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		await previous;
+		try {
+			const hook = beforeTransaction;
+			beforeTransaction = undefined;
+			hook?.();
+			const guard = statements.find(
+				(statement) =>
+					statement.table === snapshotGuard && statement.operation === "insert",
+			);
+			if (
+				guard &&
+				new SQLiteSyncDialect().sqlToQuery(guard.values?.valid as SQL)
+					.params[0] !== currentRevision()
+			)
+				throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+			for (const mutation of statements) {
+				if (mutation.table === snapshotGuard) continue;
+				mutations.push(mutation);
+				if (mutation.operation !== "update") continue;
+				if (mutation.table === mocks.tables.jobs && current)
+					Object.assign(current, mutation.values);
+				else if (mutation.table === mocks.tables.videos && video)
+					Object.assign(video, mutation.values);
 			}
-		},
-	);
-	function transactionHandle(pending: Mutation[]) {
-		return {
-			select: () => ({
-				from: (table: unknown) => ({
-					where: () => ({ for: async () => rows(table) }),
-				}),
-			}),
-			update: (table: unknown) => ({
-				set: (values: Record<string, unknown>) => ({
-					where: async () => {
-						pending.push({ operation: "update", table, values });
-						return [{ affectedRows: 1 }];
-					},
-				}),
-			}),
-			delete: (table: unknown) => ({
-				where: async () => {
-					pending.push({ operation: "delete", table });
-					return [{ affectedRows: 1 }];
-				},
-			}),
-		};
-	}
+			return [];
+		} finally {
+			release();
+		}
+	});
 	mocks.db.mockReturnValue({
 		select: () => ({
-			from: (table: unknown) => ({ where: async () => rows(table) }),
+			from: (table: unknown) => ({
+				where: () =>
+					Object.assign(Promise.resolve(rows(table)), {
+						limit: async () => rows(table),
+					}),
+			}),
 		}),
-		transaction,
+		selectDistinct: () => {
+			throw new Error("Unexpected distinct read");
+		},
+		query: {},
+		insert: (table: unknown) => ({
+			values: (values: Record<string, unknown>) => ({
+				operation: "insert",
+				table,
+				values,
+			}),
+		}),
+		update: (table: unknown) => ({
+			set: (values: Record<string, unknown>) => ({
+				where: () => ({ operation: "update", table, values }),
+			}),
+		}),
+		delete: (table: unknown) => ({
+			where: () => ({ operation: "delete", table }),
+		}),
+		batch: transaction,
 	});
 	mocks.getState.mockImplementation(
 		async () => current && parseDesktopRecordingJob(structuredClone(current)),

@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 const serverEnvMock = vi.hoisted(() =>
 	vi.fn<() => Record<string, string | undefined>>(() => ({})),
@@ -18,6 +18,52 @@ import {
 const envWith = (env: Record<string, string | undefined>) => {
 	serverEnvMock.mockReturnValue(env);
 };
+
+describe("Cloudflare deployment provider boundary", () => {
+	afterEach(() => vi.unstubAllEnvs());
+	const account = "a".repeat(32);
+	const configured = {
+		CLOUDFLARE_ACCOUNT_ID: account,
+		AI_PROVIDER: "openai-compatible",
+		AI_BASE_URL: `https://api.cloudflare.com/client/v4/accounts/${account}/ai/v1`,
+		AI_MODEL: "@cf/meta/llama-3.1-8b-instruct-fp8",
+		AI_API_KEY: "test-inference-token",
+		OPENAI_API_KEY: "must-not-be-used",
+		GROQ_API_KEY: "must-not-be-used",
+	};
+
+	it("never adds external providers to any Cloudflare role", () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		envWith(configured);
+		for (const role of ["generation", "chat", "chat-streaming"] as const) {
+			expect(getConfiguredAiProviders(role)).toEqual(["openai-compatible"]);
+		}
+	});
+
+	it("rejects another account, credentials in URLs, redirects through URLs and remote providers", () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		for (const endpoint of [
+			"https://api.example.test/v1",
+			configured.AI_BASE_URL.replace(account, "b".repeat(32)),
+			configured.AI_BASE_URL.replace("https://", "https://user:password@"),
+			`${configured.AI_BASE_URL}?target=https://example.test`,
+		]) {
+			envWith({ ...configured, AI_BASE_URL: endpoint });
+			expect(getConfiguredAiProviders()).toEqual([]);
+		}
+		envWith({ ...configured, AI_PROVIDER: "openai" });
+		expect(getConfiguredAiProviders()).toEqual([]);
+	});
+
+	it("fails closed on a missing inference token or non-Cloudflare role model", () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		envWith({ ...configured, AI_API_KEY: "" });
+		expect(isAiConfigured()).toBe(false);
+		envWith({ ...configured, AI_CHAT_MODEL: "external-model" });
+		expect(isAiConfigured("chat")).toBe(false);
+		expect(isAiConfigured("generation")).toBe(true);
+	});
+});
 
 describe("getConfiguredAiProviders", () => {
 	it("auto-detects generation providers by key presence in order groq, openai, anthropic", () => {

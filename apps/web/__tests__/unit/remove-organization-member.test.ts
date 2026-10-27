@@ -1,156 +1,71 @@
-import { userIsPro } from "@cap/utils";
-import { Organisation } from "@cap/web-domain";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { users } from "@cap/database/cloudflare/schema";
+import { eq } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { addTestSeat, createTestTeam } from "../helpers/cloudflare-team";
 
-const mocks = vi.hoisted(() => ({
-	getCurrentUser: vi.fn(),
-	requireManager: vi.fn(),
-	selectResults: [] as unknown[][],
-	user: { thirdPartyStripeSubscriptionId: "sub_owner" as string | null },
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	user: null as Awaited<ReturnType<typeof createTestTeam>>["user"] | null,
 }));
-
-const tables = {
-	organizationMembers: {
-		id: "memberId",
-		userId: "memberUserId",
-		organizationId: "memberOrgId",
-		role: "role",
-		hasProSeat: "hasProSeat",
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!state.database) throw new Error("Test database unavailable");
+		return state.database;
 	},
-	organizationInvites: { organizationId: "inviteOrgId", invitedEmail: "email" },
-	spaceMembers: { userId: "spaceUserId", spaceId: "spaceId" },
-	spaces: { id: "spaceId", organizationId: "spaceOrgId" },
-	organizations: { id: "orgId", ownerId: "ownerId" },
-	users: {
-		id: "userId",
-		email: "email",
-		stripeSubscriptionId: "subscriptionId",
-	},
-};
-
-const lockRows = vi.fn();
-
-type SelectQuery = Promise<unknown[]> & {
-	from(): SelectQuery;
-	innerJoin(): SelectQuery;
-	where(): SelectQuery;
-	limit(): SelectQuery;
-	for(mode: string): SelectQuery;
-};
-
-function selectQuery() {
-	const query: SelectQuery = Object.assign(
-		Promise.resolve(mocks.selectResults.shift() ?? []),
-		{
-			from: () => query,
-			innerJoin: () => query,
-			where: () => query,
-			limit: () => query,
-			for: (mode: string) => {
-				lockRows(mode);
-				return query;
-			},
-		},
-	);
-	return query;
-}
-
-const updateSet = vi.fn(
-	(value: { thirdPartyStripeSubscriptionId?: string | null }) => {
-		if ("thirdPartyStripeSubscriptionId" in value) {
-			mocks.user.thirdPartyStripeSubscriptionId =
-				value.thirdPartyStripeSubscriptionId ?? null;
-		}
-		return { where: async () => [{ affectedRows: 1 }] };
-	},
-);
-
-const database = {
-	select: vi.fn(selectQuery),
-	delete: vi.fn(() => ({ where: async () => [{ affectedRows: 1 }] })),
-	update: vi.fn(() => ({ set: updateSet })),
-	transaction: vi.fn(async (fn: (tx: typeof database) => Promise<unknown>) =>
-		fn(database),
-	),
-};
-
-vi.mock("@cap/database", () => ({ db: () => database }));
-vi.mock("@cap/env", () => ({ buildEnv: { NEXT_PUBLIC_IS_CAP: "true" } }));
+}));
 vi.mock("@cap/database/auth/session", () => ({
-	getCurrentUser: mocks.getCurrentUser,
-}));
-vi.mock("@cap/database/schema", () => tables);
-vi.mock("@/actions/organization/authorization", () => ({
-	requireOrganizationSettingsManager: mocks.requireManager,
+	getCurrentUser: async () => state.user,
 }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 
-async function removeSeat(
-	remainingSeats: { stripeSubscriptionId: string | null }[],
-) {
-	mocks.selectResults = [
-		[
-			{
-				id: "member",
-				userId: "teammate",
-				role: "member",
-				email: "t@example.com",
-				hasProSeat: true,
-			},
-		],
-		[{ id: "teammate" }],
-		remainingSeats,
-		[],
-	];
-	const { removeOrganizationMember } = await import(
-		"@/actions/organization/remove-member"
+import { removeOrganizationMember } from "@/actions/organization/remove-member";
+
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+const sponsor = async (userId: typeof users.$inferSelect.id) => {
+	const [user] = await fixture.database
+		.select()
+		.from(users)
+		.where(eq(users.id, userId));
+	return user?.thirdPartyStripeSubscriptionId;
+};
+
+describe("organization member removal on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
+	});
+	afterAll(async () => fixture?.dispose());
+	it.each([
+		{ remaining: [] as (string | null)[], expected: null },
+		{ remaining: ["sub_other"], expected: "sub_other" },
+		{ remaining: [null], expected: "sub_original" },
+		{ remaining: [null, "sub_other"], expected: "sub_other" },
+	])(
+		"preserves the correct remaining sponsor for $remaining",
+		async ({ remaining, expected }) => {
+			const team = await createTestTeam(fixture.database);
+			for (const subscription of remaining)
+				await addTestSeat(fixture.database, team.user, subscription);
+			state.user = team.owner;
+			await removeOrganizationMember(
+				team.invite.memberId,
+				team.owner.activeOrganizationId,
+			);
+			expect(await sponsor(team.user.id)).toBe(expected);
+		},
 	);
-	await removeOrganizationMember(
-		"member",
-		Organisation.OrganisationId.make("org"),
-	);
-}
-
-describe("removeOrganizationMember", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
-		mocks.user.thirdPartyStripeSubscriptionId = "sub_owner";
-		mocks.getCurrentUser.mockResolvedValue({ id: "owner" });
-		mocks.requireManager.mockResolvedValue({ ownerId: "owner", role: "owner" });
-	});
-
-	it("revokes Pro access when the removed seat was the user's last seat", async () => {
-		await removeSeat([]);
-
-		expect(lockRows).toHaveBeenCalledWith("update");
-		expect(userIsPro({ stripeSubscriptionStatus: null, ...mocks.user })).toBe(
-			false,
-		);
-	});
-
-	it("keeps Pro access through another organization's seat", async () => {
-		await removeSeat([{ stripeSubscriptionId: "sub_other" }]);
-
-		expect(mocks.user.thirdPartyStripeSubscriptionId).toBe("sub_other");
-		expect(userIsPro({ stripeSubscriptionStatus: null, ...mocks.user })).toBe(
-			true,
-		);
-	});
-
-	it("keeps Pro access when another seat is sponsored by a manager", async () => {
-		await removeSeat([{ stripeSubscriptionId: null }]);
-
-		expect(userIsPro({ stripeSubscriptionStatus: null, ...mocks.user })).toBe(
-			true,
-		);
-	});
-
-	it("prefers a remaining seat the organization owner pays for", async () => {
-		await removeSeat([
-			{ stripeSubscriptionId: null },
-			{ stripeSubscriptionId: "sub_other" },
-		]);
-
-		expect(mocks.user.thirdPartyStripeSubscriptionId).toBe("sub_other");
+	it("rejects a member attempting to remove another member", async () => {
+		const team = await createTestTeam(fixture.database);
+		state.user = team.user;
+		await expect(
+			removeOrganizationMember(
+				team.invite.memberId,
+				team.owner.activeOrganizationId,
+			),
+		).rejects.toThrow(/admins|owners|permission/);
+		expect(await sponsor(team.user.id)).toBe("sub_original");
 	});
 });

@@ -1,11 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { db } from "@cap/database";
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	mediaProcessingBudgets,
+	organizationMembers,
+	organizations,
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { requireOwnedVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { User, Video } from "@cap/web-domain";
 import {
 	and,
@@ -18,6 +23,7 @@ import {
 	lte,
 	ne,
 	or,
+	sql,
 } from "drizzle-orm";
 import { z } from "zod";
 import type { DesktopRecordingSource } from "@/lib/desktop-recording-source";
@@ -33,6 +39,8 @@ import {
 	RECORDING_PROCESSING_ATTEMPTS,
 	recordingBudgetKey,
 } from "@/lib/media-processing-budget";
+
+export const activeRecordingJob = sql`exists (select 1 from ${videos} inner join ${organizations} on ${organizations.id} = ${videos.orgId} where ${videos.id} = ${videoProcessingJobs.videoId} and ${videos.ownerId} = ${videoProcessingJobs.ownerId} and ${organizations.tombstoneAt} is null and (${organizations.ownerId} = ${videos.ownerId} or exists (select 1 from ${organizationMembers} where ${organizationMembers.organizationId} = ${videos.orgId} and ${organizationMembers.userId} = ${videos.ownerId})))`;
 
 export const DESKTOP_RECORDING_LEASE_MS = 5 * 60 * 1_000;
 export const DESKTOP_RECORDING_SOURCE_RETRY_MS = 60 * 60 * 1_000;
@@ -251,140 +259,160 @@ export async function ensureSegmentProcessingJob({
 	now?: Date;
 }): Promise<{ job: DesktopRecordingJob; created: boolean }> {
 	const candidate = newJob({ videoId, userId, verification, now });
-	return db().transaction(async (tx) => {
-		// Locking a missing job before inserting it deadlocks concurrent completion requests under InnoDB gap locking.
-		await tx
-			.insert(videoProcessingJobs)
-			.values(candidate)
-			.onDuplicateKeyUpdate({ set: { videoId } });
-		const [stored] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(eq(videoProcessingJobs.videoId, videoId))
-			.for("update");
-		const [video] = await tx
-			.select({ ownerId: videos.ownerId, source: videos.source })
-			.from(videos)
-			.where(eq(videos.id, videoId))
-			.for("update");
-		if (!video || video.ownerId !== userId) {
-			throw new Error("Recording does not exist");
-		}
-		if (
-			video.source.type !== "desktopSegments" &&
-			video.source.type !== "desktopMP4"
-		) {
-			throw new Error("Recording is not a desktop upload");
-		}
-		if (!stored) throw new Error("Recording job could not be created");
-		let job = parseDesktopRecordingJob(stored);
-		const created = job.generation === candidate.generation;
-		if (job.errorCode === DESKTOP_RECORDING_DELETING) {
-			throw new DesktopRecordingSourceBlockedError(
-				DESKTOP_RECORDING_DELETING,
-				"This recording is being deleted and will not be processed again.",
+	const database = db();
+	return atomic<{ job: DesktopRecordingJob; created: boolean }>(
+		database,
+		async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [stored] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(videoProcessingJobs)
+					.where(eq(videoProcessingJobs.videoId, videoId)),
 			);
-		}
-		if (job.errorCode === DESKTOP_RECORDING_OUTPUT_REPLACED) {
-			throw new DesktopRecordingSourceBlockedError(
-				DESKTOP_RECORDING_OUTPUT_REPLACED,
-				"This recording was intentionally edited or replaced. Its original source is retained and will not replace the current video.",
-			);
-		}
-		const replacesArtifact =
-			verification !== undefined &&
-			(job.source !== null || job.verification !== null) &&
-			!sameArtifact(verification, job);
-		const resumesReupload =
-			verification !== undefined &&
-			job.errorCode === DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED;
-		if (created || replacesArtifact || resumesReupload) {
-			if (replacesArtifact || resumesReupload) {
-				job =
-					resumesReupload && !replacesArtifact && verification
-						? {
-								...candidate,
-								verification: {
-									...verification,
-									requiredAudio:
-										verification.requiredAudio ||
-										job.verification?.requiredAudio === true ||
-										job.source?.requiredAudio === true,
-								},
-							}
-						: candidate;
-				await tx
-					.update(videoProcessingJobs)
-					.set(job)
-					.where(eq(videoProcessingJobs.videoId, videoId));
+			const video = await requireOwnedVideo(snapshot, videoId, userId);
+			if (
+				video.source.type !== "desktopSegments" &&
+				video.source.type !== "desktopMP4"
+			) {
+				throw new Error("Recording is not a desktop upload");
 			}
-			const upload = {
-				phase: "processing" as const,
-				processingProgress: 0,
-				processingMessage: "Securing recording source...",
-				processingError: null,
-				updatedAt: now,
-			};
-			await tx
-				.insert(videoUploads)
-				.values({ videoId, ...upload })
-				.onDuplicateKeyUpdate({ set: upload });
-			return { job, created: true };
-		}
-		if (job.ownerId !== userId) throw new Error("Recording owner changed");
-		if (verification) {
-			const needsReverification =
-				job.state === "verified" &&
-				((verification.artifact.kind === "mp4" && !job.verification) ||
-					(verification.requiredAudio && !job.verification?.requiredAudio));
-			const mergedVerification = {
-				...verification,
-				requiredAudio:
-					verification.requiredAudio ||
-					job.verification?.requiredAudio === true,
-			};
-			job = { ...job, verification: mergedVerification, updatedAt: now };
-			await tx
-				.update(videoProcessingJobs)
-				.set({ verification: mergedVerification, updatedAt: now })
-				.where(eq(videoProcessingJobs.videoId, videoId));
-			if (needsReverification) {
+			let job = stored ? parseDesktopRecordingJob(stored) : candidate;
+			const created = !stored;
+			if (job.ownerId !== userId) throw new Error("Recording owner changed");
+			if (created)
+				statements.push(database.insert(videoProcessingJobs).values(candidate));
+			if (job.errorCode === DESKTOP_RECORDING_DELETING) {
+				throw new DesktopRecordingSourceBlockedError(
+					DESKTOP_RECORDING_DELETING,
+					"This recording is being deleted and will not be processed again.",
+				);
+			}
+			if (job.errorCode === DESKTOP_RECORDING_OUTPUT_REPLACED) {
+				throw new DesktopRecordingSourceBlockedError(
+					DESKTOP_RECORDING_OUTPUT_REPLACED,
+					"This recording was intentionally edited or replaced. Its original source is retained and will not replace the current video.",
+				);
+			}
+			const replacesArtifact =
+				verification !== undefined &&
+				(job.source !== null || job.verification !== null) &&
+				!sameArtifact(verification, job);
+			const resumesReupload =
+				verification !== undefined &&
+				job.errorCode === DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED;
+			if (created || replacesArtifact || resumesReupload) {
+				if (replacesArtifact || resumesReupload) {
+					job =
+						resumesReupload && !replacesArtifact && verification
+							? {
+									...candidate,
+									verification: {
+										...verification,
+										requiredAudio:
+											verification.requiredAudio ||
+											job.verification?.requiredAudio === true ||
+											job.source?.requiredAudio === true,
+									},
+								}
+							: candidate;
+					statements.push(
+						database
+							.update(videoProcessingJobs)
+							.set(job)
+							.where(
+								and(
+									activeRecordingJob,
+									eq(videoProcessingJobs.videoId, videoId),
+								),
+							),
+					);
+				}
+				const upload = {
+					phase: "processing" as const,
+					processingProgress: 0,
+					processingMessage: "Securing recording source...",
+					processingError: null,
+					updatedAt: now,
+				};
+				statements.push(
+					database
+						.insert(videoUploads)
+						.values({ videoId, ...upload })
+						.onConflictDoUpdate({ target: videoUploads.videoId, set: upload }),
+				);
+				return { statements, result: { job, created: true } };
+			}
+			if (job.ownerId !== userId) throw new Error("Recording owner changed");
+			if (verification) {
+				const needsReverification =
+					job.state === "verified" &&
+					((verification.artifact.kind === "mp4" && !job.verification) ||
+						(verification.requiredAudio && !job.verification?.requiredAudio));
+				const mergedVerification = {
+					...verification,
+					requiredAudio:
+						verification.requiredAudio ||
+						job.verification?.requiredAudio === true,
+				};
+				job = { ...job, verification: mergedVerification, updatedAt: now };
+				statements.push(
+					database
+						.update(videoProcessingJobs)
+						.set({ verification: mergedVerification, updatedAt: now })
+						.where(
+							and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId)),
+						),
+				);
+				if (needsReverification) {
+					job = {
+						...job,
+						state: "retry",
+						leaseExpiresAt: null,
+						nextRetryAt: now,
+						workflowRunId: null,
+					};
+					statements.push(
+						database
+							.update(videoProcessingJobs)
+							.set(job)
+							.where(
+								and(
+									activeRecordingJob,
+									eq(videoProcessingJobs.videoId, videoId),
+								),
+							),
+					);
+				}
+			}
+			if (
+				job.state === "source-blocked" &&
+				!job.source &&
+				job.errorCode !== DESKTOP_RECORDING_RETRY_EXHAUSTED
+			) {
 				job = {
 					...job,
-					state: "retry",
+					state: "committing",
+					output: null,
 					leaseExpiresAt: null,
 					nextRetryAt: now,
 					workflowRunId: null,
+					errorCode: null,
+					errorMessage: null,
+					updatedAt: now,
 				};
-				await tx
-					.update(videoProcessingJobs)
-					.set(job)
-					.where(eq(videoProcessingJobs.videoId, videoId));
+				statements.push(
+					database
+						.update(videoProcessingJobs)
+						.set(job)
+						.where(
+							and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId)),
+						),
+				);
 			}
-		}
-		if (
-			job.state === "source-blocked" &&
-			!job.source &&
-			job.errorCode !== DESKTOP_RECORDING_RETRY_EXHAUSTED
-		) {
-			job = {
-				...job,
-				state: "committing",
-				output: null,
-				leaseExpiresAt: null,
-				nextRetryAt: now,
-				workflowRunId: null,
-				errorCode: null,
-				errorMessage: null,
-				updatedAt: now,
-			};
-			await tx
-				.update(videoProcessingJobs)
-				.set(job)
-				.where(eq(videoProcessingJobs.videoId, videoId));
-		}
-		return { job, created: false };
-	});
+			return { statements, result: { job, created: false } };
+		},
+	);
 }
 
 export async function getProcessingState({
@@ -399,39 +427,46 @@ export async function getProcessingState({
 		.from(videoProcessingJobs)
 		.where(
 			and(
-				eq(videoProcessingJobs.videoId, videoId),
-				generation ? eq(videoProcessingJobs.generation, generation) : undefined,
+				activeRecordingJob,
+				and(
+					eq(videoProcessingJobs.videoId, videoId),
+					generation
+						? eq(videoProcessingJobs.generation, generation)
+						: undefined,
+				),
 			),
 		)
 		.limit(1);
 	return row ? parseDesktopRecordingJob(row) : null;
 }
 
-async function pauseExhaustedRecording(
-	tx: Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0],
+function pauseExhaustedRecording(
+	database: CloudflareDatabase,
 	videoId: Video.VideoId,
 	errorMessage: string,
 	now: Date,
-) {
-	await tx
-		.update(videoProcessingJobs)
-		.set({
-			state: "source-blocked",
-			leaseExpiresAt: null,
-			errorCode: DESKTOP_RECORDING_RETRY_EXHAUSTED,
-			errorMessage,
-			updatedAt: now,
-		})
-		.where(eq(videoProcessingJobs.videoId, videoId));
-	await tx
-		.update(videoUploads)
-		.set({
-			phase: "error",
-			processingMessage: RETRY_EXHAUSTED_MESSAGE,
-			processingError: RETRY_EXHAUSTED_MESSAGE,
-			updatedAt: now,
-		})
-		.where(eq(videoUploads.videoId, videoId));
+): AtomicStatement[] {
+	return [
+		database
+			.update(videoProcessingJobs)
+			.set({
+				state: "source-blocked",
+				leaseExpiresAt: null,
+				errorCode: DESKTOP_RECORDING_RETRY_EXHAUSTED,
+				errorMessage,
+				updatedAt: now,
+			})
+			.where(and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId))),
+		database
+			.update(videoUploads)
+			.set({
+				phase: "error",
+				processingMessage: RETRY_EXHAUSTED_MESSAGE,
+				processingError: RETRY_EXHAUSTED_MESSAGE,
+				updatedAt: now,
+			})
+			.where(eq(videoUploads.videoId, videoId)),
+	];
 }
 
 // A caller that names its attempts by number gets its own live attempt back on a retry instead of being
@@ -447,22 +482,34 @@ export async function claimProcessingAttempt({
 	attemptIdFor?: (attemptCount: number) => string;
 	now?: Date;
 }): Promise<DesktopRecordingAttempt | null> {
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(
-				and(
-					eq(videoProcessingJobs.videoId, videoId),
-					eq(videoProcessingJobs.generation, generation),
-				),
+	const fallbackAttemptId = randomUUID();
+	const namedAttempts = attemptIdFor
+		? Array.from({ length: MAX_AUTOMATIC_ATTEMPTS + 1 }, (_, count) =>
+				attemptIdFor(count),
 			)
-			.for("update");
-		if (!row) return null;
+		: undefined;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(
+					and(
+						activeRecordingJob,
+						and(
+							eq(videoProcessingJobs.videoId, videoId),
+							eq(videoProcessingJobs.generation, generation),
+						),
+					),
+				),
+		);
+		if (!row) return { statements, result: null };
 		const job = parseDesktopRecordingJob(row);
 		const ownAttemptId =
-			attemptIdFor !== undefined &&
-			job.attemptId === attemptIdFor(job.attemptCount)
+			namedAttempts !== undefined &&
+			job.attemptId === namedAttempts[job.attemptCount]
 				? job.attemptId
 				: null;
 		if (
@@ -473,21 +520,24 @@ export async function claimProcessingAttempt({
 				job.state === "queued" ||
 				job.state === "processing")
 		)
-			return { ...job, attemptId: ownAttemptId };
-		if (!isDesktopRecordingJobRecoverable(job, now)) return null;
+			return { statements, result: { ...job, attemptId: ownAttemptId } };
+		if (!isDesktopRecordingJobRecoverable(job, now))
+			return { statements, result: null };
 		if (job.attemptCount >= MAX_AUTOMATIC_ATTEMPTS) {
-			await pauseExhaustedRecording(
-				tx,
-				videoId,
-				job.errorMessage ?? "Automatic processing attempt limit reached.",
-				now,
+			statements.push(
+				...pauseExhaustedRecording(
+					database,
+					videoId,
+					job.errorMessage ?? "Automatic processing attempt limit reached.",
+					now,
+				),
 			);
-			return null;
+			return { statements, result: null };
 		}
 		const attempt: DesktopRecordingAttempt = {
 			...job,
 			state: job.source ? "processing" : "committing",
-			attemptId: attemptIdFor?.(job.attemptCount + 1) ?? randomUUID(),
+			attemptId: namedAttempts?.[job.attemptCount + 1] ?? fallbackAttemptId,
 			attemptCount: job.attemptCount + 1,
 			leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
 			remoteJobId: null,
@@ -496,10 +546,14 @@ export async function claimProcessingAttempt({
 			errorMessage: null,
 			updatedAt: now,
 		};
-		await tx
-			.update(videoProcessingJobs)
-			.set(attempt)
-			.where(eq(videoProcessingJobs.videoId, videoId));
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set(attempt)
+				.where(
+					and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId)),
+				),
+		);
 		const upload = {
 			phase: "processing" as const,
 			processingProgress: 0,
@@ -509,11 +563,13 @@ export async function claimProcessingAttempt({
 			processingError: null,
 			updatedAt: now,
 		};
-		await tx
-			.insert(videoUploads)
-			.values({ videoId, ...upload })
-			.onDuplicateKeyUpdate({ set: upload });
-		return attempt;
+		statements.push(
+			database
+				.insert(videoUploads)
+				.values({ videoId, ...upload })
+				.onConflictDoUpdate({ target: videoUploads.videoId, set: upload }),
+		);
+		return { statements, result: attempt };
 	});
 }
 
@@ -526,46 +582,53 @@ function attemptCondition(fence: DesktopRecordingAttemptFence) {
 	);
 }
 
-function affectedRows(result: unknown) {
-	const item = Array.isArray(result) ? result[0] : result;
-	if (!item || typeof item !== "object" || !("affectedRows" in item)) return 0;
-	return typeof item.affectedRows === "number" ? item.affectedRows : 0;
-}
-
 export async function initializeSourceCommitCheckpoint(
 	fence: DesktopRecordingAttemptFence,
 ): Promise<DesktopRecordingSourceCheckpoint | null> {
 	const now = new Date();
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(and(attemptCondition(fence), isNull(videoProcessingJobs.source)))
-			.for("update");
-		if (!row || !row.leaseExpiresAt || row.leaseExpiresAt <= now) return null;
+	const snapshotId = randomUUID();
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(
+					and(
+						activeRecordingJob,
+						and(attemptCondition(fence), isNull(videoProcessingJobs.source)),
+					),
+				),
+		);
+		if (!row || !row.leaseExpiresAt || row.leaseExpiresAt <= now)
+			return { statements, result: null };
 		if (row.output !== null) {
 			const checkpoint = desktopRecordingSourceCheckpointSchema.parse(
 				row.output,
 			);
-			if (checkpoint.generation !== fence.generation) return null;
-			return checkpoint;
+			if (checkpoint.generation !== fence.generation)
+				return { statements, result: null };
+			return { statements, result: checkpoint };
 		}
 		const checkpoint: DesktopRecordingSourceCheckpoint = {
 			kind: "desktop-recording-source-commit",
 			version: 1,
 			generation: fence.generation,
-			snapshotId: randomUUID(),
+			snapshotId,
 			revision: 0,
 			phase: "plan",
 			cursor: 0,
 			planRoots: [],
 			receiptRoots: [],
 		};
-		await tx
-			.update(videoProcessingJobs)
-			.set({ output: checkpoint, updatedAt: now })
-			.where(attemptCondition(fence));
-		return checkpoint;
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({ output: checkpoint, updatedAt: now })
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		return { statements, result: checkpoint };
 	});
 }
 
@@ -576,29 +639,40 @@ export async function persistSourceCommitCheckpoint(
 	const parsed = desktopRecordingSourceCheckpointSchema.parse(checkpoint);
 	if (parsed.generation !== fence.generation) return false;
 	const now = new Date();
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(and(attemptCondition(fence), isNull(videoProcessingJobs.source)))
-			.for("update");
-		if (!row || !row.leaseExpiresAt || row.leaseExpiresAt <= now) return false;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(
+					and(
+						activeRecordingJob,
+						and(attemptCondition(fence), isNull(videoProcessingJobs.source)),
+					),
+				),
+		);
+		if (!row || !row.leaseExpiresAt || row.leaseExpiresAt <= now)
+			return { statements, result: false };
 		const previous = desktopRecordingSourceCheckpointSchema.parse(row.output);
 		if (
 			previous.generation !== parsed.generation ||
 			previous.snapshotId !== parsed.snapshotId ||
 			previous.revision + 1 !== parsed.revision
 		)
-			return false;
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				output: parsed,
-				leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
-				updatedAt: now,
-			})
-			.where(attemptCondition(fence));
-		return true;
+			return { statements, result: false };
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					output: parsed,
+					leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -606,18 +680,26 @@ export async function persistCommittedSource(
 	fence: DesktopRecordingAttemptFence,
 	source: DesktopRecordingSource,
 ): Promise<boolean> {
-	let parsed = sourceSchema.parse(source);
+	const parsedInput = sourceSchema.parse(source);
 	const now = new Date();
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(attemptCondition(fence))
-			.for("update");
-		if (!row || !row.leaseExpiresAt || row.leaseExpiresAt <= now) return false;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		let parsed = parsedInput;
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		if (!row || !row.leaseExpiresAt || row.leaseExpiresAt <= now)
+			return { statements, result: false };
 		const current = parseDesktopRecordingJob(row);
 		if (current.source) {
-			return current.source.inventorySha256 === parsed.inventorySha256;
+			return {
+				statements,
+				result: current.source.inventorySha256 === parsed.inventorySha256,
+			};
 		}
 		const verification = current.verification;
 		if (
@@ -627,22 +709,24 @@ export async function persistCommittedSource(
 					verification.requiredAudio &&
 					!parsed.requiredAudio))
 		) {
-			await tx
-				.update(videoProcessingJobs)
-				.set({
-					state: "retry",
-					output: null,
-					leaseExpiresAt: null,
-					nextRetryAt: new Date(
-						now.getTime() + getDesktopRecordingRetryDelay(1),
-					),
-					errorCode: "source-intent-changed",
-					errorMessage:
-						"The completed upload changed while its source was being secured. Retrying its snapshot.",
-					updatedAt: now,
-				})
-				.where(attemptCondition(fence));
-			return false;
+			statements.push(
+				database
+					.update(videoProcessingJobs)
+					.set({
+						state: "retry",
+						output: null,
+						leaseExpiresAt: null,
+						nextRetryAt: new Date(
+							now.getTime() + getDesktopRecordingRetryDelay(1),
+						),
+						errorCode: "source-intent-changed",
+						errorMessage:
+							"The completed upload changed while its source was being secured. Retrying its snapshot.",
+						updatedAt: now,
+					})
+					.where(and(activeRecordingJob, attemptCondition(fence))),
+			);
+			return { statements, result: false };
 		}
 		if (
 			parsed.kind === "mp4" &&
@@ -655,18 +739,20 @@ export async function persistCommittedSource(
 				mp4: { ...parsed.mp4, duration: verification.artifact.duration },
 			};
 		}
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				source: parsed,
-				output: null,
-				manifestSha256: parsed.manifestSha256 ?? null,
-				state: "processing",
-				leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
-				updatedAt: now,
-			})
-			.where(attemptCondition(fence));
-		return true;
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					source: parsed,
+					output: null,
+					manifestSha256: parsed.manifestSha256 ?? null,
+					state: "processing",
+					leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -680,42 +766,50 @@ export async function attachRemoteJob({
 		.set({ remoteJobId, updatedAt: now })
 		.where(
 			and(
-				attemptCondition(fence),
-				gt(videoProcessingJobs.leaseExpiresAt, now),
-				or(
-					isNull(videoProcessingJobs.remoteJobId),
-					eq(videoProcessingJobs.remoteJobId, remoteJobId),
+				activeRecordingJob,
+				and(
+					attemptCondition(fence),
+					gt(videoProcessingJobs.leaseExpiresAt, now),
+					or(
+						isNull(videoProcessingJobs.remoteJobId),
+						eq(videoProcessingJobs.remoteJobId, remoteJobId),
+					),
 				),
 			),
 		);
-	return affectedRows(result) > 0;
+	return result.meta.changes > 0;
 }
 
 export async function heartbeatAttempt({
 	now = new Date(),
 	...fence
 }: DesktopRecordingAttemptFence & { now?: Date }): Promise<boolean> {
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(attemptCondition(fence))
-			.for("update");
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
 		if (
 			!row ||
 			!row.leaseExpiresAt ||
 			row.leaseExpiresAt <= now ||
 			getDesktopRecordingWorkerCheckpoint(parseDesktopRecordingJob(row))
 		)
-			return false;
-		const result = await tx
-			.update(videoProcessingJobs)
-			.set({
-				leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
-				updatedAt: now,
-			})
-			.where(attemptCondition(fence));
-		return affectedRows(result) > 0;
+			return { statements, result: false };
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					leaseExpiresAt: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -733,49 +827,56 @@ export async function waitForDesktopRecordingCapacity({
 		retryAfterMs > 360_000
 	)
 		throw new Error("Invalid capacity retry delay");
-	return db().transaction(async (tx) => {
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
 		const condition = and(
 			attemptCondition(fence),
 			isNull(videoProcessingJobs.remoteJobId),
 			gt(videoProcessingJobs.leaseExpiresAt, now),
 		);
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(condition)
-			.for("update");
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(and(activeRecordingJob, condition)),
+		);
 		if (
 			!row ||
 			getDesktopRecordingWorkerCheckpoint(parseDesktopRecordingJob(row))
 		)
-			return false;
+			return { statements, result: false };
 		const nextRetryAt = new Date(now.getTime() + retryAfterMs);
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				leaseExpiresAt: new Date(
-					nextRetryAt.getTime() + DESKTOP_RECORDING_LEASE_MS,
-				),
-				nextRetryAt,
-				output: {
-					kind: "desktop-recording-capacity-wait",
-					version: 1,
-					retryAt: nextRetryAt.toISOString(),
-				},
-				updatedAt: now,
-			})
-			.where(condition);
-		await tx
-			.update(videoUploads)
-			.set({
-				phase: "processing",
-				processingMessage:
-					"Waiting for a processing slot. Your recording is safely stored.",
-				processingError: null,
-				updatedAt: now,
-			})
-			.where(eq(videoUploads.videoId, fence.videoId));
-		return true;
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					leaseExpiresAt: new Date(
+						nextRetryAt.getTime() + DESKTOP_RECORDING_LEASE_MS,
+					),
+					nextRetryAt,
+					output: {
+						kind: "desktop-recording-capacity-wait",
+						version: 1,
+						retryAt: nextRetryAt.toISOString(),
+					},
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, condition)),
+		);
+		statements.push(
+			database
+				.update(videoUploads)
+				.set({
+					phase: "processing",
+					processingMessage:
+						"Waiting for a processing slot. Your recording is safely stored.",
+					processingError: null,
+					updatedAt: now,
+				})
+				.where(eq(videoUploads.videoId, fence.videoId)),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -791,47 +892,57 @@ export async function scheduleRetry({
 	now?: Date;
 	nextRetryAt?: Date;
 }): Promise<boolean> {
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select({ attemptCount: videoProcessingJobs.attemptCount })
-			.from(videoProcessingJobs)
-			.where(attemptCondition(fence))
-			.for("update");
-		if (!row) return false;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select({ attemptCount: videoProcessingJobs.attemptCount })
+				.from(videoProcessingJobs)
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		if (!row) return { statements, result: false };
 		if (row.attemptCount >= MAX_AUTOMATIC_ATTEMPTS) {
-			await pauseExhaustedRecording(
-				tx,
-				fence.videoId,
-				`${errorCode}: ${errorMessage}`,
-				now,
+			statements.push(
+				...pauseExhaustedRecording(
+					database,
+					fence.videoId,
+					`${errorCode}: ${errorMessage}`,
+					now,
+				),
 			);
-			return true;
+			return { statements, result: true };
 		}
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				state: "retry",
-				leaseExpiresAt: null,
-				nextRetryAt:
-					nextRetryAt ??
-					new Date(
-						now.getTime() + getDesktopRecordingRetryDelay(row.attemptCount),
-					),
-				errorCode,
-				errorMessage,
-				updatedAt: now,
-			})
-			.where(attemptCondition(fence));
-		await tx
-			.update(videoUploads)
-			.set({
-				phase: "processing",
-				processingMessage: "Processing interrupted. Retrying automatically...",
-				processingError: null,
-				updatedAt: now,
-			})
-			.where(eq(videoUploads.videoId, fence.videoId));
-		return true;
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					state: "retry",
+					leaseExpiresAt: null,
+					nextRetryAt:
+						nextRetryAt ??
+						new Date(
+							now.getTime() + getDesktopRecordingRetryDelay(row.attemptCount),
+						),
+					errorCode,
+					errorMessage,
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		statements.push(
+			database
+				.update(videoUploads)
+				.set({
+					phase: "processing",
+					processingMessage:
+						"Processing interrupted. Retrying automatically...",
+					processingError: null,
+					updatedAt: now,
+				})
+				.where(eq(videoUploads.videoId, fence.videoId)),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -845,32 +956,44 @@ export async function markSourceBlocked({
 	errorMessage: string;
 	now?: Date;
 }): Promise<boolean> {
-	return db().transaction(async (tx) => {
-		const result = await tx
-			.update(videoProcessingJobs)
-			.set({
-				state: "source-blocked",
-				leaseExpiresAt: null,
-				nextRetryAt: new Date(
-					now.getTime() + DESKTOP_RECORDING_SOURCE_RETRY_MS,
-				),
-				errorCode,
-				errorMessage,
-				updatedAt: now,
-			})
-			.where(attemptCondition(fence));
-		if (affectedRows(result) === 0) return false;
-		await tx
-			.update(videoUploads)
-			.set({
-				phase: "error",
-				processingMessage:
-					"Waiting for complete recording source. Uploaded files are retained.",
-				processingError: `${errorCode}: ${errorMessage}`,
-				updatedAt: now,
-			})
-			.where(eq(videoUploads.videoId, fence.videoId));
-		return true;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		if (!current) return { statements, result: false };
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					state: "source-blocked",
+					leaseExpiresAt: null,
+					nextRetryAt: new Date(
+						now.getTime() + DESKTOP_RECORDING_SOURCE_RETRY_MS,
+					),
+					errorCode,
+					errorMessage,
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		statements.push(
+			database
+				.update(videoUploads)
+				.set({
+					phase: "error",
+					processingMessage:
+						"Waiting for complete recording source. Uploaded files are retained.",
+					processingError: `${errorCode}: ${errorMessage}`,
+					updatedAt: now,
+				})
+				.where(eq(videoUploads.videoId, fence.videoId)),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -888,8 +1011,11 @@ export async function attachWorkflowRun({
 		.set({ workflowRunId })
 		.where(
 			and(
-				eq(videoProcessingJobs.videoId, videoId),
-				eq(videoProcessingJobs.generation, generation),
+				activeRecordingJob,
+				and(
+					eq(videoProcessingJobs.videoId, videoId),
+					eq(videoProcessingJobs.generation, generation),
+				),
 			),
 		);
 }
@@ -916,12 +1042,15 @@ export async function recordWorkflowDispatchFailure({
 		})
 		.where(
 			and(
-				eq(videoProcessingJobs.videoId, videoId),
-				eq(videoProcessingJobs.generation, generation),
-				inArray(videoProcessingJobs.state, ["committing", "queued", "retry"]),
-				or(
-					isNull(videoProcessingJobs.leaseExpiresAt),
-					lte(videoProcessingJobs.leaseExpiresAt, now),
+				activeRecordingJob,
+				and(
+					eq(videoProcessingJobs.videoId, videoId),
+					eq(videoProcessingJobs.generation, generation),
+					inArray(videoProcessingJobs.state, ["committing", "queued", "retry"]),
+					or(
+						isNull(videoProcessingJobs.leaseExpiresAt),
+						lte(videoProcessingJobs.leaseExpiresAt, now),
+					),
 				),
 			),
 		);
@@ -931,26 +1060,38 @@ export async function deferWithoutMediaServer(
 	fence: DesktopRecordingAttemptFence,
 ): Promise<boolean> {
 	const now = new Date();
-	return db().transaction(async (tx) => {
-		const result = await tx
-			.update(videoProcessingJobs)
-			.set({
-				state: "queued",
-				leaseExpiresAt: null,
-				nextRetryAt: new Date(
-					now.getTime() + 24 * DESKTOP_RECORDING_SOURCE_RETRY_MS,
-				),
-				errorCode: "media-server-unconfigured",
-				errorMessage:
-					"Source is retained; full output verification requires a media server.",
-				updatedAt: now,
-			})
-			.where(attemptCondition(fence));
-		if (affectedRows(result) === 0) return false;
-		await tx
-			.delete(videoUploads)
-			.where(eq(videoUploads.videoId, fence.videoId));
-		return true;
+	const database = db();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		if (!current) return { statements, result: false };
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					state: "queued",
+					leaseExpiresAt: null,
+					nextRetryAt: new Date(
+						now.getTime() + 24 * DESKTOP_RECORDING_SOURCE_RETRY_MS,
+					),
+					errorCode: "media-server-unconfigured",
+					errorMessage:
+						"Source is retained; full output verification requires a media server.",
+					updatedAt: now,
+				})
+				.where(and(activeRecordingJob, attemptCondition(fence))),
+		);
+		statements.push(
+			database
+				.delete(videoUploads)
+				.where(eq(videoUploads.videoId, fence.videoId)),
+		);
+		return { statements, result: true };
 	});
 }
 
@@ -972,79 +1113,107 @@ export async function retryBlockedDesktopRecording({
 	| { status: "not-found" }
 	| { status: "not-retryable"; state: string; errorCode: string | null }
 > {
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(eq(videoProcessingJobs.videoId, videoId))
-			.for("update");
-		if (!row) return { status: "not-found" as const };
-		const job = parseDesktopRecordingJob(row);
-		if (
-			job.state !== "source-blocked" ||
-			!job.source ||
-			!job.errorCode ||
-			!OPERATOR_RETRYABLE_BLOCKS.has(job.errorCode)
-		)
+	const generation = randomUUID();
+	const database = db();
+	return atomic<Awaited<ReturnType<typeof retryBlockedDesktopRecording>>>(
+		database,
+		async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [row] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(videoProcessingJobs)
+					.where(
+						and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId)),
+					),
+			);
+			if (!row) return { statements, result: { status: "not-found" as const } };
+			const job = parseDesktopRecordingJob(row);
+			if (
+				job.state !== "source-blocked" ||
+				!job.source ||
+				!job.errorCode ||
+				!OPERATOR_RETRYABLE_BLOCKS.has(job.errorCode)
+			)
+				return {
+					statements,
+					result: {
+						status: "not-retryable" as const,
+						state: job.state,
+						errorCode: job.errorCode,
+					},
+				};
+			statements.push(
+				database
+					.update(videoProcessingJobs)
+					.set({
+						state: "retry",
+						generation,
+						attemptId: null,
+						remoteJobId: null,
+						output: null,
+						attemptCount: 0,
+						leaseExpiresAt: null,
+						nextRetryAt: now,
+						workflowRunId: null,
+						errorCode: null,
+						errorMessage: null,
+						updatedAt: now,
+					})
+					.where(
+						and(
+							activeRecordingJob,
+							and(
+								eq(videoProcessingJobs.videoId, videoId),
+								eq(videoProcessingJobs.generation, job.generation),
+								eq(videoProcessingJobs.state, "source-blocked"),
+							),
+						),
+					),
+			);
+			// Earlier attempts spent this generation's transfer budget; the retry starts with a fresh one.
+			statements.push(
+				database
+					.delete(mediaProcessingBudgets)
+					.where(
+						eq(
+							mediaProcessingBudgets.id,
+							recordingBudgetKey(videoId, job.generation),
+						),
+					),
+			);
+			statements.push(
+				database
+					.update(videoUploads)
+					.set({
+						phase: "processing",
+						processingProgress: 0,
+						processingMessage: "Retrying video processing...",
+						processingError: null,
+						updatedAt: now,
+					})
+					.where(eq(videoUploads.videoId, videoId)),
+			);
 			return {
-				status: "not-retryable" as const,
-				state: job.state,
-				errorCode: job.errorCode,
+				statements,
+				result: {
+					status: "queued" as const,
+					ownerId: job.ownerId,
+					previousErrorCode: job.errorCode,
+				},
 			};
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				state: "retry",
-				attemptCount: 0,
-				leaseExpiresAt: null,
-				nextRetryAt: now,
-				workflowRunId: null,
-				errorCode: null,
-				errorMessage: null,
-				updatedAt: now,
-			})
-			.where(
-				and(
-					eq(videoProcessingJobs.videoId, videoId),
-					eq(videoProcessingJobs.generation, job.generation),
-					eq(videoProcessingJobs.state, "source-blocked"),
-				),
-			);
-		// Earlier attempts spent this generation's transfer budget; the retry starts with a fresh one.
-		await tx
-			.delete(mediaProcessingBudgets)
-			.where(
-				eq(
-					mediaProcessingBudgets.id,
-					recordingBudgetKey(videoId, job.generation),
-				),
-			);
-		await tx
-			.update(videoUploads)
-			.set({
-				phase: "processing",
-				processingProgress: 0,
-				processingMessage: "Retrying video processing...",
-				processingError: null,
-				updatedAt: now,
-			})
-			.where(eq(videoUploads.videoId, videoId));
-		return {
-			status: "queued" as const,
-			ownerId: job.ownerId,
-			previousErrorCode: job.errorCode,
-		};
-	});
+		},
+	);
 }
 
-export async function retireDesktopRecordingJobForOutputReplacement(
-	tx: Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0],
+export function retireDesktopRecordingJobForOutputReplacement(
+	database: CloudflareDatabase,
 	{
 		videoId,
 		userId,
 		now = new Date(),
 	}: { videoId: Video.VideoId; userId: User.UserId; now?: Date },
-): Promise<void> {
+) {
 	const retired = {
 		generation: randomUUID(),
 		state: "source-blocked" as const,
@@ -1059,10 +1228,10 @@ export async function retireDesktopRecordingJobForOutputReplacement(
 		updatedAt: now,
 	};
 	// MP4 outputs can be original-source snapshots; preserve source and output references until whole-video deletion.
-	await tx
+	return database
 		.insert(videoProcessingJobs)
 		.values({ ...newJob({ videoId, userId, now }), ...retired })
-		.onDuplicateKeyUpdate({ set: retired });
+		.onConflictDoUpdate({ target: videoProcessingJobs.videoId, set: retired });
 }
 
 export async function listRecoverableSegmentJobs({
@@ -1084,33 +1253,36 @@ export async function listRecoverableSegmentJobs({
 			.innerJoin(videos, eq(videos.id, videoProcessingJobs.videoId))
 			.where(
 				and(
-					inArray(videoProcessingJobs.state, states),
-					or(
-						ne(videoProcessingJobs.state, "source-blocked"),
-						isNull(videoProcessingJobs.source),
-					),
-					or(
-						isNull(videoProcessingJobs.errorCode),
-						and(
-							ne(
-								videoProcessingJobs.errorCode,
-								DESKTOP_RECORDING_OUTPUT_REPLACED,
-							),
-							ne(videoProcessingJobs.errorCode, DESKTOP_RECORDING_DELETING),
-							ne(
-								videoProcessingJobs.errorCode,
-								DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED,
-							),
-							ne(
-								videoProcessingJobs.errorCode,
-								DESKTOP_RECORDING_RETRY_EXHAUSTED,
+					activeRecordingJob,
+					and(
+						inArray(videoProcessingJobs.state, states),
+						or(
+							ne(videoProcessingJobs.state, "source-blocked"),
+							isNull(videoProcessingJobs.source),
+						),
+						or(
+							isNull(videoProcessingJobs.errorCode),
+							and(
+								ne(
+									videoProcessingJobs.errorCode,
+									DESKTOP_RECORDING_OUTPUT_REPLACED,
+								),
+								ne(videoProcessingJobs.errorCode, DESKTOP_RECORDING_DELETING),
+								ne(
+									videoProcessingJobs.errorCode,
+									DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED,
+								),
+								ne(
+									videoProcessingJobs.errorCode,
+									DESKTOP_RECORDING_RETRY_EXHAUSTED,
+								),
 							),
 						),
-					),
-					lte(videoProcessingJobs.nextRetryAt, now),
-					or(
-						isNull(videoProcessingJobs.leaseExpiresAt),
-						lte(videoProcessingJobs.leaseExpiresAt, now),
+						lte(videoProcessingJobs.nextRetryAt, now),
+						or(
+							isNull(videoProcessingJobs.leaseExpiresAt),
+							lte(videoProcessingJobs.leaseExpiresAt, now),
+						),
 					),
 				),
 			)

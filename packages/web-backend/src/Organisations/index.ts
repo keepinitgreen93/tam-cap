@@ -1,9 +1,12 @@
-import { releaseProSeatSubscription } from "@cap/database/pro-seat-subscription";
-import * as Db from "@cap/database/schema";
+import {
+	beginOrganizationDeletion,
+	finishOrganizationDeletion,
+} from "@cap/database/cloudflare/organization-delete";
+import * as Db from "@cap/database/cloudflare/schema";
 import { CurrentUser, Organisation, Policy } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect, Array as EffectArray, Option } from "effect";
-import { Database } from "../Database";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase";
 import { ImageUploads } from "../ImageUploads";
 import { S3Buckets } from "../S3Buckets";
 import { Tinybird } from "../Tinybird";
@@ -92,6 +95,10 @@ export class Organisations extends Effect.Service<Organisations>()(
 						),
 					);
 
+				yield* db.use((database) =>
+					beginOrganizationDeletion(database, id, user.id),
+				);
+
 				const videos = yield* db.use((db) =>
 					db
 						.select({
@@ -155,185 +162,8 @@ export class Organisations extends Effect.Service<Organisations>()(
 					{ concurrency: 1 },
 				);
 
-				yield* db.use((db) =>
-					db.transaction(async (tx) => {
-						const memberRows = await tx
-							.select({
-								userId: Db.organizationMembers.userId,
-								hasProSeat: Db.organizationMembers.hasProSeat,
-							})
-							.from(Db.organizationMembers)
-							.where(Dz.eq(Db.organizationMembers.organizationId, id))
-							.for("update");
-						await tx
-							.delete(Db.organizationMembers)
-							.where(Dz.eq(Db.organizationMembers.organizationId, id));
-
-						const proSeatUserIds = [
-							...new Set(
-								memberRows
-									.filter((member) => member.hasProSeat)
-									.map((member) => member.userId),
-							),
-						].sort();
-						for (const proSeatUserId of proSeatUserIds) {
-							await releaseProSeatSubscription(tx, proSeatUserId);
-						}
-
-						const videoIds = videos.map((video) => video.id);
-						const spaceRows = await tx
-							.select({ id: Db.spaces.id })
-							.from(Db.spaces)
-							.where(Dz.eq(Db.spaces.organizationId, id));
-						const integrationRows = await tx
-							.select({ id: Db.storageIntegrations.id })
-							.from(Db.storageIntegrations)
-							.where(Dz.eq(Db.storageIntegrations.organizationId, id));
-						const spaceIds = spaceRows.map((space) => space.id);
-						const affectedUserIds = [
-							...new Set([
-								organisation.ownerId,
-								...memberRows.map((member) => member.userId),
-							]),
-						];
-						const integrationIds = integrationRows.map(
-							(integration) => integration.id,
-						);
-
-						if (videoIds.length > 0) {
-							await tx
-								.delete(Db.comments)
-								.where(Dz.inArray(Db.comments.videoId, videoIds));
-							await tx
-								.delete(Db.notifications)
-								.where(Dz.inArray(Db.notifications.videoId, videoIds));
-							await tx
-								.delete(Db.videoUploads)
-								.where(Dz.inArray(Db.videoUploads.videoId, videoIds));
-							await tx
-								.delete(Db.importedVideos)
-								.where(Dz.inArray(Db.importedVideos.id, videoIds));
-							await tx
-								.delete(Db.storageObjects)
-								.where(Dz.inArray(Db.storageObjects.videoId, videoIds));
-							await tx
-								.delete(Db.sharedVideos)
-								.where(Dz.inArray(Db.sharedVideos.videoId, videoIds));
-							await tx
-								.delete(Db.spaceVideos)
-								.where(Dz.inArray(Db.spaceVideos.videoId, videoIds));
-						}
-
-						if (spaceIds.length > 0) {
-							await tx
-								.delete(Db.spaceVideos)
-								.where(Dz.inArray(Db.spaceVideos.spaceId, spaceIds));
-							await tx
-								.delete(Db.spaceMembers)
-								.where(Dz.inArray(Db.spaceMembers.spaceId, spaceIds));
-						}
-
-						if (integrationIds.length > 0) {
-							await tx
-								.delete(Db.storageObjects)
-								.where(
-									Dz.inArray(Db.storageObjects.integrationId, integrationIds),
-								);
-						}
-
-						await tx
-							.delete(Db.sharedVideos)
-							.where(Dz.eq(Db.sharedVideos.organizationId, id));
-						await tx
-							.delete(Db.importedVideos)
-							.where(Dz.eq(Db.importedVideos.orgId, id));
-						await tx
-							.delete(Db.notifications)
-							.where(Dz.eq(Db.notifications.orgId, id));
-						await tx
-							.delete(Db.folders)
-							.where(Dz.eq(Db.folders.organizationId, id));
-
-						if (videoIds.length > 0) {
-							await tx
-								.delete(Db.videos)
-								.where(Dz.inArray(Db.videos.id, videoIds));
-						}
-
-						if (spaceIds.length > 0) {
-							await tx
-								.delete(Db.spaces)
-								.where(Dz.inArray(Db.spaces.id, spaceIds));
-						}
-
-						await tx
-							.delete(Db.organizationInvites)
-							.where(Dz.eq(Db.organizationInvites.organizationId, id));
-						await tx
-							.delete(Db.integrationInstallations)
-							.where(Dz.eq(Db.integrationInstallations.organizationId, id));
-						await tx
-							.delete(Db.storageIntegrations)
-							.where(Dz.eq(Db.storageIntegrations.organizationId, id));
-						await tx
-							.delete(Db.s3Buckets)
-							.where(Dz.eq(Db.s3Buckets.organizationId, id));
-						await tx
-							.delete(Db.organizations)
-							.where(Dz.eq(Db.organizations.id, id));
-
-						for (const affectedUserId of affectedUserIds) {
-							const [otherOrg] = await tx
-								.select({ id: Db.organizations.id })
-								.from(Db.organizations)
-								.leftJoin(
-									Db.organizationMembers,
-									Dz.and(
-										Dz.eq(
-											Db.organizationMembers.organizationId,
-											Db.organizations.id,
-										),
-										Dz.eq(Db.organizationMembers.userId, affectedUserId),
-									),
-								)
-								.where(
-									Dz.and(
-										Dz.isNull(Db.organizations.tombstoneAt),
-										Dz.or(
-											Dz.eq(Db.organizations.ownerId, affectedUserId),
-											Dz.eq(Db.organizationMembers.userId, affectedUserId),
-										),
-									),
-								)
-								.orderBy(Dz.asc(Db.organizations.createdAt))
-								.limit(1);
-							const fallbackOrgId =
-								otherOrg?.id ?? Organisation.OrganisationId.make("");
-
-							await tx
-								.update(Db.users)
-								.set({
-									activeOrganizationId: fallbackOrgId,
-									defaultOrgId: fallbackOrgId,
-								})
-								.where(
-									Dz.and(
-										Dz.eq(Db.users.id, affectedUserId),
-										Dz.or(
-											Dz.eq(Db.users.activeOrganizationId, id),
-											Dz.eq(Db.users.defaultOrgId, id),
-										),
-									),
-								);
-						}
-
-						await tx
-							.delete(Db.sessions)
-							.where(Dz.eq(Db.sessions.userId, user.id));
-						await tx
-							.delete(Db.authApiKeys)
-							.where(Dz.eq(Db.authApiKeys.userId, user.id));
-					}),
+				yield* db.use((database) =>
+					finishOrganizationDeletion(database, id, user.id),
 				);
 			});
 			return { update, softDelete };

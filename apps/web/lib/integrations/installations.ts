@@ -1,9 +1,10 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { integrationInstallations } from "@cap/database/cloudflare/schema";
 import { decrypt, encrypt } from "@cap/database/crypto";
 import { nanoId } from "@cap/database/helpers";
-import { integrationInstallations } from "@cap/database/schema";
 import type { Organisation, User } from "@cap/web-domain";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 
 export type IntegrationInstallationSummary = {
 	id: string;
@@ -32,61 +33,53 @@ export const saveIntegrationInstallation = async ({
 }) => {
 	const encryptedCredentials = await encrypt(JSON.stringify(credentials));
 	const candidateId = nanoId();
-	await db().transaction(async (tx) => {
-		await tx
-			.insert(integrationInstallations)
-			.values({
-				id: candidateId,
-				provider,
-				externalId,
-				displayName,
-				organizationId,
-				installedByUserId,
-				encryptedCredentials,
-				metadata,
-			})
-			.onDuplicateKeyUpdate({
-				set: {
-					externalId: sql`${integrationInstallations.externalId}`,
-				},
-			});
-
-		const [installation] = await tx
-			.select({
-				id: integrationInstallations.id,
-				organizationId: integrationInstallations.organizationId,
-			})
-			.from(integrationInstallations)
-			.where(
-				and(
-					eq(integrationInstallations.provider, provider),
-					eq(integrationInstallations.externalId, externalId),
-				),
-			)
-			.for("update");
-		if (!installation) {
-			throw new Error("Integration installation could not be saved");
-		}
-		if (installation.organizationId !== organizationId) {
+	const database = db();
+	const now = new Date();
+	await atomic(database, async (snapshot) => {
+		const [installation] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(integrationInstallations)
+				.where(
+					and(
+						eq(integrationInstallations.provider, provider),
+						eq(integrationInstallations.externalId, externalId),
+					),
+				)
+				.limit(1),
+		);
+		if (installation && installation.organizationId !== organizationId)
 			throw new Error(
 				"Integration is already connected to another organization",
 			);
-		}
-		if (installation.id === candidateId) return;
-
-		await tx
-			.update(integrationInstallations)
-			.set({
-				displayName,
-				installedByUserId,
-				encryptedCredentials,
-				metadata,
-				updatedAt: new Date(),
-			})
-			.where(eq(integrationInstallations.id, installation.id));
+		return {
+			statements: [
+				installation
+					? database
+							.update(integrationInstallations)
+							.set({
+								displayName,
+								installedByUserId,
+								encryptedCredentials,
+								metadata,
+								updatedAt: now,
+							})
+							.where(eq(integrationInstallations.id, installation.id))
+					: database.insert(integrationInstallations).values({
+							id: candidateId,
+							provider,
+							externalId,
+							displayName,
+							organizationId,
+							installedByUserId,
+							encryptedCredentials,
+							metadata,
+						}),
+			],
+			result: undefined,
+		};
 	});
 };
-
 export const listIntegrationInstallations = async ({
 	organizationId,
 	provider,

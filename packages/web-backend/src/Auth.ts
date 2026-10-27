@@ -1,7 +1,7 @@
 import { getServerSession } from "@cap/database/auth/auth-options";
 import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import {
 	CurrentUser,
 	type DatabaseError,
@@ -12,7 +12,7 @@ import { HttpApiError, HttpServerRequest } from "@effect/platform";
 import * as Dz from "drizzle-orm";
 import { type Cause, Effect, Layer, Option, Schema } from "effect";
 
-import { Database } from "./Database.ts";
+import { CloudflareDatabase as Database } from "./CloudflareDatabase.ts";
 
 export const getCurrentUser = Effect.gen(function* () {
 	const db = yield* Database;

@@ -12,7 +12,7 @@ const mocks = vi.hoisted(() => ({
 	restoreStartError: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({ from: () => ({ where: mocks.where }) }),
 		update: () => ({ set: mocks.set }),
@@ -21,7 +21,7 @@ vi.mock("@cap/database", () => ({
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.currentUser,
 }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	videos: { id: "videoId" },
 	videoUploads: {
 		videoId: "uploadVideoId",
@@ -88,7 +88,7 @@ describe("Loom processing retries", () => {
 				.mockResolvedValueOnce([video])
 				.mockResolvedValueOnce([upload])
 				.mockResolvedValueOnce([{ source: "loom", sourceId: "loom-1" }])
-				.mockResolvedValueOnce([{ affectedRows: 1 }]);
+				.mockResolvedValueOnce({ meta: { changes: 1 } });
 			const { LoomImportStartError } = await import("@/lib/loom-import-start");
 			mocks.start.mockRejectedValueOnce(
 				new LoomImportStartError(canRetry, new Error()),
@@ -151,7 +151,7 @@ describe("Loom processing retries", () => {
 					{ ...upload, ...uploading, phase: "uploading" },
 				])
 				.mockResolvedValueOnce([{ source: "loom", sourceId: "loom-1" }])
-				.mockResolvedValueOnce([{ affectedRows: 1 }]);
+				.mockResolvedValueOnce({ meta: { changes: 1 } });
 			await expect(retryVideoProcessing({ videoId })).resolves.toEqual({
 				success: true,
 				status: "already-processing",
@@ -167,7 +167,7 @@ describe("Loom processing retries", () => {
 			.mockResolvedValueOnce([video])
 			.mockResolvedValueOnce([upload])
 			.mockResolvedValueOnce([{ source: "loom", sourceId: "loom-1" }])
-			.mockResolvedValueOnce([{ affectedRows: 1 }]);
+			.mockResolvedValueOnce({ meta: { changes: 1 } });
 		await expect(retryVideoProcessing({ videoId })).resolves.toEqual({
 			success: true,
 			status: "started",
@@ -194,7 +194,7 @@ describe("Loom processing retries", () => {
 			.mockResolvedValueOnce([video])
 			.mockResolvedValueOnce([upload])
 			.mockResolvedValueOnce([{ source: "loom", sourceId: "loom-1" }])
-			.mockResolvedValueOnce([{ affectedRows: 0 }]);
+			.mockResolvedValueOnce({ meta: { changes: 0 } });
 		await expect(retryVideoProcessing({ videoId })).resolves.toEqual({
 			success: true,
 			status: "already-processing",

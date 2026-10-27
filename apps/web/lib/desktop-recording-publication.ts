@@ -1,16 +1,19 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend/src/Storage/index";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { Video } from "@cap/web-domain";
 import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import {
+	activeRecordingJob,
 	DESKTOP_RECORDING_LEASE_MS,
 	DESKTOP_RECORDING_SOURCE_RETRY_MS,
 	type DesktopRecordingJob,
@@ -191,19 +194,28 @@ function workerDisposition(
 
 async function applyActiveRecordingProgress(payload: RecordingProgress) {
 	const videoId = Video.VideoId.make(payload.videoId);
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(eq(videoProcessingJobs.videoId, videoId))
-			.for("update");
+	const database = db();
+	const mutationTime = new Date();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(
+					and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId)),
+				),
+		);
 		const legacyResponse = { handled: true, status: 200 as const };
 		if (!row)
-			return payload.recordingWorker
-				? workerAcknowledgement(payload, "superseded")
-				: legacyResponse;
+			return {
+				statements,
+				result: payload.recordingWorker
+					? workerAcknowledgement(payload, "superseded")
+					: legacyResponse,
+			};
 		const job = parseDesktopRecordingJob(row);
-		const now = new Date();
+		const now = mutationTime;
 		const disposition = payload.recordingWorker
 			? workerDisposition(job, payload, now)
 			: isCurrentDesktopRecordingAttempt(job, payload, now) &&
@@ -211,15 +223,18 @@ async function applyActiveRecordingProgress(payload: RecordingProgress) {
 				? "advance"
 				: "superseded";
 		if (disposition === "terminal")
-			return workerAcknowledgement(payload, "accepted");
+			return { statements, result: workerAcknowledgement(payload, "accepted") };
 		if (disposition !== "advance" && disposition !== "repeat")
-			return payload.recordingWorker
-				? workerAcknowledgement(
-						payload,
-						disposition,
-						job.remoteJobId ? { ownerJobId: job.remoteJobId } : {},
-					)
-				: legacyResponse;
+			return {
+				statements,
+				result: payload.recordingWorker
+					? workerAcknowledgement(
+							payload,
+							disposition,
+							job.remoteJobId ? { ownerJobId: job.remoteJobId } : {},
+						)
+					: legacyResponse,
+			};
 		const failed = payload.phase === "error" || payload.phase === "cancelled";
 		const errorCode = payload.errorCode ?? "processing-unavailable";
 		const blocked =
@@ -230,64 +245,73 @@ async function applyActiveRecordingProgress(payload: RecordingProgress) {
 				"source-changed",
 				"processing-budget-exhausted",
 			].includes(errorCode);
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				...(payload.recordingWorker ? { remoteJobId: payload.jobId } : {}),
-				leaseExpiresAt: failed
-					? null
-					: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
-				updatedAt: now,
-				...(payload.recordingWorker && disposition === "advance"
-					? { output: workerCheckpoint(payload, now) }
-					: {}),
-				...(failed
-					? {
-							state: blocked ? ("source-blocked" as const) : ("retry" as const),
-							nextRetryAt: new Date(
-								now.getTime() +
-									(blocked
-										? DESKTOP_RECORDING_SOURCE_RETRY_MS
-										: getDesktopRecordingRetryDelay(job.attemptCount)),
-							),
-							errorCode,
-							errorMessage:
-								payload.error ??
-								payload.message ??
-								"Recording processing was interrupted",
-						}
-					: {}),
-			})
-			.where(eq(videoProcessingJobs.videoId, videoId));
-		if (disposition === "advance") {
-			await tx
-				.update(videoUploads)
+		statements.push(
+			database
+				.update(videoProcessingJobs)
 				.set({
-					phase: blocked
-						? "error"
-						: payload.phase === "generating_thumbnail"
-							? "generating_thumbnail"
-							: "processing",
-					processingProgress: Math.round(payload.progress),
-					processingMessage: blocked
-						? "Waiting for complete recording source. Uploaded files are retained."
-						: failed
-							? "Processing interrupted. Retrying automatically..."
-							: (payload.message ?? "Verifying and processing recording..."),
-					processingError: blocked
-						? `${errorCode}: ${payload.error ?? payload.message ?? "Recording source is unavailable"}`
-						: null,
+					...(payload.recordingWorker ? { remoteJobId: payload.jobId } : {}),
+					leaseExpiresAt: failed
+						? null
+						: new Date(now.getTime() + DESKTOP_RECORDING_LEASE_MS),
 					updatedAt: now,
+					...(payload.recordingWorker && disposition === "advance"
+						? { output: workerCheckpoint(payload, now) }
+						: {}),
+					...(failed
+						? {
+								state: blocked
+									? ("source-blocked" as const)
+									: ("retry" as const),
+								nextRetryAt: new Date(
+									now.getTime() +
+										(blocked
+											? DESKTOP_RECORDING_SOURCE_RETRY_MS
+											: getDesktopRecordingRetryDelay(job.attemptCount)),
+								),
+								errorCode,
+								errorMessage:
+									payload.error ??
+									payload.message ??
+									"Recording processing was interrupted",
+							}
+						: {}),
 				})
-				.where(eq(videoUploads.videoId, videoId));
+				.where(eq(videoProcessingJobs.videoId, videoId)),
+		);
+		if (disposition === "advance") {
+			statements.push(
+				database
+					.update(videoUploads)
+					.set({
+						phase: blocked
+							? "error"
+							: payload.phase === "generating_thumbnail"
+								? "generating_thumbnail"
+								: "processing",
+						processingProgress: Math.round(payload.progress),
+						processingMessage: blocked
+							? "Waiting for complete recording source. Uploaded files are retained."
+							: failed
+								? "Processing interrupted. Retrying automatically..."
+								: (payload.message ?? "Verifying and processing recording..."),
+						processingError: blocked
+							? `${errorCode}: ${payload.error ?? payload.message ?? "Recording source is unavailable"}`
+							: null,
+						updatedAt: now,
+					})
+					.where(eq(videoUploads.videoId, videoId)),
+			);
 		}
-		return payload.recordingWorker
-			? workerAcknowledgement(
-					payload,
-					"accepted",
-					failed ? {} : { leaseDurationMs: DESKTOP_RECORDING_LEASE_MS },
-				)
-			: legacyResponse;
+		return {
+			statements,
+			result: payload.recordingWorker
+				? workerAcknowledgement(
+						payload,
+						"accepted",
+						failed ? {} : { leaseDurationMs: DESKTOP_RECORDING_LEASE_MS },
+					)
+				: legacyResponse,
+		};
 	});
 }
 
@@ -485,7 +509,7 @@ export async function applyDesktopRecordingProgress(input: unknown): Promise<{
 	const [video] = await db()
 		.select()
 		.from(videos)
-		.where(eq(videos.id, videoId));
+		.where(and(writableVideo, eq(videos.id, videoId)));
 	if (!video || video.ownerId !== job.ownerId)
 		return { handled: true, status: 409 };
 	const receipt = await createVerifiedRecordingReceipt(
@@ -501,12 +525,18 @@ export async function applyDesktopRecordingProgress(input: unknown): Promise<{
 		job.source?.kind === "segments"
 			? await findRecordingAssets(video, outputKey)
 			: {};
-	const published = await db().transaction(async (tx) => {
-		const [current] = await tx
-			.select()
-			.from(videoProcessingJobs)
-			.where(eq(videoProcessingJobs.videoId, videoId))
-			.for("update");
+	const database = db();
+	const mutationTime = new Date();
+	const published = await atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoProcessingJobs)
+				.where(
+					and(activeRecordingJob, eq(videoProcessingJobs.videoId, videoId)),
+				),
+		);
 		const currentJob = current ? parseDesktopRecordingJob(current) : null;
 		if (
 			!currentJob ||
@@ -517,12 +547,13 @@ export async function applyDesktopRecordingProgress(input: unknown): Promise<{
 			!isDeepStrictEqual(currentJob.source, job.source) ||
 			!isDeepStrictEqual(currentJob.verification, job.verification)
 		)
-			return false;
-		const [currentVideo] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, videoId))
-			.for("update");
+			return { statements, result: false };
+		const [currentVideo] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(and(writableVideo, eq(videos.id, videoId))),
+		);
 		if (
 			!currentVideo ||
 			currentVideo.ownerId !== job.ownerId ||
@@ -530,38 +561,44 @@ export async function applyDesktopRecordingProgress(input: unknown): Promise<{
 			currentVideo.storageIntegrationId !== video.storageIntegrationId ||
 			!isDeepStrictEqual(currentVideo.source, video.source)
 		)
-			return false;
-		const now = new Date();
-		await tx
-			.update(videos)
-			.set({
-				source: { type: "desktopMP4", outputKey, ...assets },
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.desktopRecordingUpload', JSON_EXTRACT(${JSON.stringify(receipt)}, '$'))`,
-				duration: completion.metadata.duration,
-				width: completion.metadata.width,
-				height: completion.metadata.height,
-				fps: Math.round(completion.metadata.fps),
-			})
-			.where(and(eq(videos.id, videoId), eq(videos.ownerId, job.ownerId)));
-		await tx
-			.update(videoProcessingJobs)
-			.set({
-				state: "verified",
-				output: {
-					...receipt,
-					verifiedAt: now.toISOString(),
-					...(payload.recordingWorker
-						? { recordingWorker: workerCheckpoint(payload, now) }
-						: {}),
-				},
-				leaseExpiresAt: null,
-				errorCode: null,
-				errorMessage: null,
-				updatedAt: now,
-			})
-			.where(eq(videoProcessingJobs.videoId, videoId));
-		await tx.delete(videoUploads).where(eq(videoUploads.videoId, videoId));
-		return true;
+			return { statements, result: false };
+		const now = mutationTime;
+		statements.push(
+			database
+				.update(videos)
+				.set({
+					source: { type: "desktopMP4", outputKey, ...assets },
+					metadata: sql`JSON_SET(JSON_REMOVE(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.editTranscriptBackfill', '$.liveTranscript'), '$.desktopRecordingUpload', JSON_EXTRACT(${JSON.stringify(receipt)}, '$'))`,
+					duration: completion.metadata.duration,
+					width: completion.metadata.width,
+					height: completion.metadata.height,
+					fps: Math.round(completion.metadata.fps),
+				})
+				.where(and(eq(videos.id, videoId), eq(videos.ownerId, job.ownerId))),
+		);
+		statements.push(
+			database
+				.update(videoProcessingJobs)
+				.set({
+					state: "verified",
+					output: {
+						...receipt,
+						verifiedAt: now.toISOString(),
+						...(payload.recordingWorker
+							? { recordingWorker: workerCheckpoint(payload, now) }
+							: {}),
+					},
+					leaseExpiresAt: null,
+					errorCode: null,
+					errorMessage: null,
+					updatedAt: now,
+				})
+				.where(eq(videoProcessingJobs.videoId, videoId)),
+		);
+		statements.push(
+			database.delete(videoUploads).where(eq(videoUploads.videoId, videoId)),
+		);
+		return { statements, result: true };
 	});
 	if (!published) return { handled: true, status: 503 };
 	await invalidateGoogleDriveStorageQuotaCache(

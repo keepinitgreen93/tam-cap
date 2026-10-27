@@ -1,9 +1,11 @@
-import { updateIfDefined } from "@cap/database";
-import * as Db from "@cap/database/schema";
+import { updateIfDefined } from "@cap/database/cloudflare";
+import type { AtomicStatement } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
+import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	makeCurrentUserLayer,
 	provideOptionalAuth,
 	Storage,
@@ -16,6 +18,7 @@ import { Effect, Option, Schedule } from "effect";
 import { Hono, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { withAuth } from "@/app/api/utils";
+import { retireDesktopRecordingJobForOutputReplacement } from "@/lib/desktop-recording-jobs";
 import {
 	invalidateReuploadedVideo,
 	prepareDesktopReupload,
@@ -35,6 +38,7 @@ import {
 	hasCompleteRecordingParts,
 	matchesCompletedRecordingParts,
 } from "@/lib/recording-multipart-integrity";
+import { ownedRecordingPlan } from "@/lib/recording-upload-state";
 import { runPromise } from "@/lib/server";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { stringOrNumberOptional } from "@/utils/zod";
@@ -154,12 +158,20 @@ app.post(
 						startedAt: new Date(),
 						updatedAt: new Date(),
 					};
-					yield* db.use((db) =>
-						db
-							.insert(Db.videoUploads)
-							.values({ videoId, ...state })
-							.onDuplicateKeyUpdate({ set: state }),
-					);
+					yield* db.use((db) => {
+						return ownedRecordingPlan(db, video, async () => ({
+							statements: [
+								db
+									.insert(Db.videoUploads)
+									.values({ videoId, ...state })
+									.onConflictDoUpdate({
+										target: Db.videoUploads.videoId,
+										set: state,
+									}),
+							],
+							result: undefined,
+						}));
+					});
 					return token;
 				}).pipe(
 					Effect.onError(() =>
@@ -188,21 +200,28 @@ app.post(
 			const video = yield* policy.getOwnedById(videoId);
 			if (Option.isNone(video)) return yield* new Video.NotFoundError();
 
-			yield* db.use((db) =>
-				db
-					.insert(Db.videoUploads)
-					.values({
-						videoId: video.value[0].id,
-						mode: "multipart",
-					})
-					.onDuplicateKeyUpdate({
-						set: {
-							mode: "multipart",
-							rawFileKey: null,
-							updatedAt: new Date(),
-						},
-					}),
-			);
+			yield* db.use((db) => {
+				const mutationTime = new Date();
+				return ownedRecordingPlan(db, video.value[0], async () => ({
+					statements: [
+						db
+							.insert(Db.videoUploads)
+							.values({
+								videoId: video.value[0].id,
+								mode: "multipart",
+							})
+							.onConflictDoUpdate({
+								target: Db.videoUploads.videoId,
+								set: {
+									mode: "multipart",
+									rawFileKey: null,
+									updatedAt: mutationTime,
+								},
+							}),
+					],
+					result: undefined,
+				}));
+			});
 		}).pipe(
 			Effect.tapError(Effect.logError),
 			Effect.catchAll((e) => {
@@ -531,16 +550,21 @@ app.post(
 									bucket.provider,
 								),
 							);
-							yield* db.use((db) =>
-								db
-									.delete(Db.videoUploads)
-									.where(
-										and(
-											eq(Db.videoUploads.videoId, videoId),
-											eq(Db.videoUploads.rawFileKey, replacement.outputKey),
-										),
-									),
-							);
+							yield* db.use((db) => {
+								return ownedRecordingPlan(db, video, async () => ({
+									statements: [
+										db
+											.delete(Db.videoUploads)
+											.where(
+												and(
+													eq(Db.videoUploads.videoId, videoId),
+													eq(Db.videoUploads.rawFileKey, replacement.outputKey),
+												),
+											),
+									],
+									result: undefined,
+								}));
+							});
 							if (bucket.provider === "s3")
 								yield* bucket.multipart.abort(
 									replacement.outputKey,
@@ -548,11 +572,16 @@ app.post(
 								);
 						} else {
 							yield* bucket.multipart.abort(fileKey, uploadId);
-							yield* db.use((db) =>
-								db
-									.delete(Db.videoUploads)
-									.where(eq(Db.videoUploads.videoId, videoId)),
-							);
+							yield* db.use((db) => {
+								return ownedRecordingPlan(db, video, async () => ({
+									statements: [
+										db
+											.delete(Db.videoUploads)
+											.where(eq(Db.videoUploads.videoId, videoId)),
+									],
+									result: undefined,
+								}));
+							});
 						}
 					}).pipe(
 						Effect.catchAll(() =>
@@ -623,42 +652,55 @@ app.post(
 							),
 						);
 					const head = yield* verify;
-					yield* db.use((db) =>
-						db.transaction(async (tx) => {
+					yield* db.use((db) => {
+						const transcriptPublication = createTranscriptInvalidation();
+						const retirement = retireDesktopRecordingJobForOutputReplacement(
+							db,
+							{ videoId, userId: user.id },
+						);
+						return ownedRecordingPlan(db, video, async (snapshot) => {
+							const statements: AtomicStatement[] = [];
 							const publication = await prepareDesktopReupload(
-								tx,
+								snapshot,
 								video,
 								replacement,
+								transcriptPublication,
 							);
-							if (!publication) return;
-							await tx
-								.update(Db.videos)
-								.set({
-									...publication,
-									duration: updateIfDefined(
-										body.durationInSecs,
-										Db.videos.duration,
+							if (!publication) return { statements, result: undefined };
+							statements.push(retirement);
+							statements.push(
+								db
+									.update(Db.videos)
+									.set({
+										...publication,
+										duration: updateIfDefined(
+											body.durationInSecs,
+											Db.videos.duration,
+										),
+										width: updateIfDefined(body.width, Db.videos.width),
+										height: updateIfDefined(body.height, Db.videos.height),
+										fps: updateIfDefined(body.fps, Db.videos.fps),
+									})
+									.where(
+										and(
+											eq(Db.videos.id, videoId),
+											eq(Db.videos.ownerId, user.id),
+										),
 									),
-									width: updateIfDefined(body.width, Db.videos.width),
-									height: updateIfDefined(body.height, Db.videos.height),
-									fps: updateIfDefined(body.fps, Db.videos.fps),
-								})
-								.where(
-									and(
-										eq(Db.videos.id, videoId),
-										eq(Db.videos.ownerId, user.id),
+							);
+							statements.push(
+								db
+									.delete(Db.videoUploads)
+									.where(
+										and(
+											eq(Db.videoUploads.videoId, videoId),
+											eq(Db.videoUploads.rawFileKey, outputKey),
+										),
 									),
-								);
-							await tx
-								.delete(Db.videoUploads)
-								.where(
-									and(
-										eq(Db.videoUploads.videoId, videoId),
-										eq(Db.videoUploads.rawFileKey, outputKey),
-									),
-								);
-						}),
-					);
+							);
+							return { statements, result: undefined };
+						});
+					});
 					yield* Effect.tryPromise(() =>
 						invalidateGoogleDriveStorageQuotaCache(
 							Option.getOrNull(video.storageIntegrationId),
@@ -828,25 +870,30 @@ app.post(
 					);
 
 					if (isRawRecorderUpload(subpath)) {
-						yield* db.use((db) =>
-							db
-								.update(Db.videos)
-								.set({
-									duration: updateIfDefined(
-										body.durationInSecs,
-										Db.videos.duration,
-									),
-									width: updateIfDefined(body.width, Db.videos.width),
-									height: updateIfDefined(body.height, Db.videos.height),
-									fps: updateIfDefined(body.fps, Db.videos.fps),
-								})
-								.where(
-									and(
-										eq(Db.videos.id, Video.VideoId.make(videoId)),
-										eq(Db.videos.ownerId, user.id),
-									),
-								),
-						);
+						yield* db.use((db) => {
+							return ownedRecordingPlan(db, video, async () => ({
+								statements: [
+									db
+										.update(Db.videos)
+										.set({
+											duration: updateIfDefined(
+												body.durationInSecs,
+												Db.videos.duration,
+											),
+											width: updateIfDefined(body.width, Db.videos.width),
+											height: updateIfDefined(body.height, Db.videos.height),
+											fps: updateIfDefined(body.fps, Db.videos.fps),
+										})
+										.where(
+											and(
+												eq(Db.videos.id, Video.VideoId.make(videoId)),
+												eq(Db.videos.ownerId, user.id),
+											),
+										),
+								],
+								result: undefined,
+							}));
+						});
 
 						const processingStarted = yield* Effect.tryPromise(() =>
 							startVideoProcessingWorkflow({
@@ -911,29 +958,35 @@ app.post(
 					}
 
 					yield* db.use((db) =>
-						db.transaction(async (tx) => {
-							await tx
-								.update(Db.videos)
-								.set({
-									duration: updateIfDefined(
-										body.durationInSecs,
-										Db.videos.duration,
+						ownedRecordingPlan(db, video, async (_snapshot) => {
+							const statements: AtomicStatement[] = [];
+							statements.push(
+								db
+									.update(Db.videos)
+									.set({
+										duration: updateIfDefined(
+											body.durationInSecs,
+											Db.videos.duration,
+										),
+										width: updateIfDefined(body.width, Db.videos.width),
+										height: updateIfDefined(body.height, Db.videos.height),
+										fps: updateIfDefined(body.fps, Db.videos.fps),
+									})
+									.where(
+										and(
+											eq(Db.videos.id, Video.VideoId.make(videoId)),
+											eq(Db.videos.ownerId, user.id),
+										),
 									),
-									width: updateIfDefined(body.width, Db.videos.width),
-									height: updateIfDefined(body.height, Db.videos.height),
-									fps: updateIfDefined(body.fps, Db.videos.fps),
-								})
-								.where(
-									and(
-										eq(Db.videos.id, Video.VideoId.make(videoId)),
-										eq(Db.videos.ownerId, user.id),
+							);
+							statements.push(
+								db
+									.delete(Db.videoUploads)
+									.where(
+										eq(Db.videoUploads.videoId, Video.VideoId.make(videoId)),
 									),
-								);
-							await tx
-								.delete(Db.videoUploads)
-								.where(
-									eq(Db.videoUploads.videoId, Video.VideoId.make(videoId)),
-								);
+							);
+							return { statements, result: undefined };
 						}),
 					);
 
@@ -1139,16 +1192,21 @@ app.post("/abort", abortRequestValidator, (c) => {
 				),
 			);
 
-			yield* db.use((db) =>
-				db
-					.delete(Db.videoUploads)
-					.where(
-						and(
-							eq(Db.videoUploads.videoId, videoId),
-							eq(Db.videoUploads.rawFileKey, replacement.outputKey),
-						),
-					),
-			);
+			yield* db.use((db) => {
+				return ownedRecordingPlan(db, video, async () => ({
+					statements: [
+						db
+							.delete(Db.videoUploads)
+							.where(
+								and(
+									eq(Db.videoUploads.videoId, videoId),
+									eq(Db.videoUploads.rawFileKey, replacement.outputKey),
+								),
+							),
+					],
+					result: undefined,
+				}));
+			});
 			// Drive abort deletes the object mapping, which may already be used by a concurrent publication.
 			if (bucket.provider === "s3") {
 				yield* bucket.multipart
@@ -1174,9 +1232,16 @@ app.post("/abort", abortRequestValidator, (c) => {
 		console.log(`Aborting multipart upload ${uploadId} for key: ${fileKey}`);
 		yield* bucket.multipart.abort(fileKey, uploadId);
 
-		yield* db.use((db) =>
-			db.delete(Db.videoUploads).where(eq(Db.videoUploads.videoId, videoId)),
-		);
+		yield* db.use((db) => {
+			return ownedRecordingPlan(db, video, async () => ({
+				statements: [
+					db
+						.delete(Db.videoUploads)
+						.where(eq(Db.videoUploads.videoId, videoId)),
+				],
+				result: undefined,
+			}));
+		});
 
 		return c.json({ success: true, fileKey, uploadId });
 	}).pipe(

@@ -133,6 +133,32 @@ function missingCredentialHint(provider: AiProviderId): string {
 export function getConfiguredAiProviders(
 	role: AiModelRole = "generation",
 ): AiProviderId[] {
+	if (process.env.CAP_RUNTIME === "cloudflare") {
+		const env = serverEnv();
+		if (
+			env.AI_PROVIDER !== "openai-compatible" ||
+			!env.CLOUDFLARE_ACCOUNT_ID?.match(/^[a-f0-9]{32}$/i) ||
+			!env.AI_API_KEY?.trim() ||
+			!openAiCompatibleModelId(role)?.startsWith("@cf/")
+		)
+			return [];
+		try {
+			const endpoint = new URL(env.AI_BASE_URL ?? "");
+			if (
+				endpoint.origin !== "https://api.cloudflare.com" ||
+				endpoint.username ||
+				endpoint.password ||
+				endpoint.search ||
+				endpoint.hash ||
+				endpoint.pathname.replace(/\/$/, "") !==
+					`/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}/ai/v1`
+			)
+				return [];
+		} catch {
+			return [];
+		}
+		return ["openai-compatible"];
+	}
 	const explicit = serverEnv().AI_PROVIDER;
 	const providers: AiProviderId[] = [];
 

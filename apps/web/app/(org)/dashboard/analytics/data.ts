@@ -1,7 +1,7 @@
-import { db } from "@cap/database";
-import { comments, spaceVideos, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { comments, spaceVideos, videos } from "@cap/database/cloudflare/schema";
 import { Tinybird } from "@cap/web-backend";
-import { and, between, eq, inArray } from "drizzle-orm";
+import { and, between, eq } from "drizzle-orm";
 import { type SQL, sql } from "drizzle-orm/sql";
 import { Effect } from "effect";
 
@@ -98,7 +98,10 @@ const getLifetimeRangeStart = async (
 ): Promise<Date | undefined> => {
 	const whereClause =
 		videoIds && videoIds.length > 0
-			? and(eq(videos.orgId, orgId), inArray(videos.id, videoIds))
+			? and(
+					eq(videos.orgId, orgId),
+					sql`${videos.id} in (select value from json_each(${JSON.stringify(videoIds)}))`,
+				)
 			: eq(videos.orgId, orgId);
 
 	const rows = await db()
@@ -524,7 +527,12 @@ const loadVideoNames = async (videoIds: ReadonlyArray<string>, scope?: SQL) => {
 	const records = await db()
 		.select({ id: videos.id, name: videos.name })
 		.from(videos)
-		.where(and(inArray(videos.id, typedVideoIds), scope));
+		.where(
+			and(
+				sql`${videos.id} in (select value from json_each(${JSON.stringify(typedVideoIds)}))`,
+				scope,
+			),
+		);
 	return new Map(records.map((record) => [record.id, record.name]));
 };
 
@@ -537,8 +545,8 @@ const queryVideoSeries = async (
 ): Promise<CountSeriesRow[]> => {
 	const bucketExpr =
 		bucket === "hour"
-			? sql<string>`DATE_FORMAT(${videos.createdAt}, '%Y-%m-%dT%H:00:00Z')`
-			: sql<string>`DATE_FORMAT(${videos.createdAt}, '%Y-%m-%dT00:00:00Z')`;
+			? sql<string>`strftime('%Y-%m-%dT%H:00:00Z', ${videos.createdAt} / 1000, 'unixepoch')`
+			: sql<string>`strftime('%Y-%m-%dT00:00:00Z', ${videos.createdAt} / 1000, 'unixepoch')`;
 
 	const conditions = [
 		eq(videos.orgId, orgId),
@@ -546,7 +554,9 @@ const queryVideoSeries = async (
 	];
 
 	if (spaceVideoIds && spaceVideoIds.length > 0) {
-		conditions.push(inArray(videos.id, spaceVideoIds));
+		conditions.push(
+			sql`${videos.id} in (select value from json_each(${JSON.stringify(spaceVideoIds)}))`,
+		);
 	}
 
 	const rows = await db()
@@ -574,8 +584,8 @@ const queryCommentsSeries = async (
 	const column = comments.createdAt;
 	const bucketExpr =
 		bucket === "hour"
-			? sql<string>`DATE_FORMAT(${column}, '%Y-%m-%dT%H:00:00Z')`
-			: sql<string>`DATE_FORMAT(${column}, '%Y-%m-%dT00:00:00Z')`;
+			? sql<string>`strftime('%Y-%m-%dT%H:00:00Z', ${column} / 1000, 'unixepoch')`
+			: sql<string>`strftime('%Y-%m-%dT00:00:00Z', ${column} / 1000, 'unixepoch')`;
 
 	const conditions = [
 		eq(videos.orgId, orgId),
@@ -584,7 +594,9 @@ const queryCommentsSeries = async (
 	];
 
 	if (spaceVideoIds && spaceVideoIds.length > 0) {
-		conditions.push(inArray(videos.id, spaceVideoIds));
+		conditions.push(
+			sql`${videos.id} in (select value from json_each(${JSON.stringify(spaceVideoIds)}))`,
+		);
 	}
 
 	const rows = await db()

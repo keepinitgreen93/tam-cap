@@ -1,16 +1,10 @@
-import { db } from "@cap/database";
 import {
 	getCurrentUser,
 	type userSelectProps,
 } from "@cap/database/auth/session";
-import {
-	organizationInvites,
-	organizations,
-	users,
-} from "@cap/database/schema";
-import { eq } from "drizzle-orm";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
+import { getInviteDetails } from "@/lib/organization-invite-read";
 import { InviteAccept } from ".//InviteAccept";
 
 type Props = {
@@ -30,24 +24,6 @@ export async function generateMetadata(props: Props): Promise<Metadata> {
 		title: `Join ${invite.organizationName} on Cap`,
 		description: `You've been invited to join ${invite.organizationName} on Cap.`,
 	};
-}
-
-async function getInviteDetails(inviteId: string) {
-	const query = await db()
-		.select({
-			invite: organizationInvites,
-			organizationName: organizations.name,
-			inviterName: users.name,
-		})
-		.from(organizationInvites)
-		.leftJoin(
-			organizations,
-			eq(organizationInvites.organizationId, organizations.id),
-		)
-		.leftJoin(users, eq(organizationInvites.invitedByUserId, users.id))
-		.where(eq(organizationInvites.id, inviteId));
-
-	return query[0];
 }
 
 export default async function InvitePage(props: Props) {

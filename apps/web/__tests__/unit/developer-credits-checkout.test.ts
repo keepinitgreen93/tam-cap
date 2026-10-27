@@ -28,7 +28,7 @@ function resetMockDb() {
 	mockDb.values.mockReturnValue(Promise.resolve());
 }
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => mockDb,
 }));
 
@@ -36,7 +36,7 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: vi.fn(),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	developerApps: {
 		id: "id",
 		ownerId: "ownerId",
@@ -52,7 +52,7 @@ vi.mock("@cap/database/schema", () => ({
 
 vi.mock("@cap/env", () => ({
 	buildEnv: {
-		NEXT_PUBLIC_IS_CAP: "",
+		NEXT_PUBLIC_IS_CAP: "true",
 		NEXT_PUBLIC_WEB_URL: "https://cap.test",
 	},
 	serverEnv: () => ({

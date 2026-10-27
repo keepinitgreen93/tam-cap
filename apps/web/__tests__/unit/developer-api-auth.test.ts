@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-vi.mock("@cap/database", () => {
+vi.mock("@cap/database/cloudflare/application", () => {
 	const mockDb = {
 		select: vi.fn(() => mockDb),
 		insert: vi.fn(() => mockDb),
@@ -20,7 +20,7 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: vi.fn(),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	developerApiKeys: {
 		appId: "appId",
 		keyHash: "keyHash",

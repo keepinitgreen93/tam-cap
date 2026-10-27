@@ -41,7 +41,7 @@ export const userIsPro = (
 		thirdPartyStripeSubscriptionId?: string | null;
 	} | null,
 ) => {
-	if (!buildEnv.NEXT_PUBLIC_IS_CAP) return true;
+	if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true") return true;
 
 	if (!user) return false;
 

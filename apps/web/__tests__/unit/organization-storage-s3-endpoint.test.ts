@@ -1,14 +1,30 @@
 import { Agent as HttpAgent } from "node:http";
 import { Agent as HttpsAgent } from "node:https";
+import {
+	organizations,
+	s3Buckets,
+	users,
+} from "@cap/database/cloudflare/schema";
 import type { Organisation } from "@cap/web-domain";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
 
 const state = vi.hoisted(() => ({
 	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" as string | undefined },
 	NODE_ENV: "production",
 	s3Configs: [] as Array<Record<string, unknown>>,
 	send: vi.fn(async () => ({})),
-	insert: vi.fn(),
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
 }));
 
 vi.mock("@cap/env", () => ({
@@ -33,34 +49,13 @@ vi.mock("@aws-sdk/client-s3", () => ({
 	},
 }));
 
-const query = (result: unknown): unknown =>
-	new Proxy(() => undefined, {
-		get: (_, property) =>
-			property === "then"
-				? (resolve: (value: unknown) => void) => resolve(result)
-				: () => query(result),
-	});
-
-type FakeDatabase = {
-	select: () => unknown;
-	update: () => unknown;
-	insert: (...args: unknown[]) => unknown;
-	transaction: (
-		callback: (tx: FakeDatabase) => Promise<unknown>,
-	) => Promise<unknown>;
-};
-
-const database: FakeDatabase = {
-	select: () => query([{ id: "org_synthetic", name: "Org", ownerId: "usr" }]),
-	update: () => query(undefined),
-	insert: (...args: unknown[]) => {
-		state.insert(...args);
-		return query(undefined);
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!state.database) throw new Error("Test database unavailable");
+		return state.database;
 	},
-	transaction: async (callback) => callback(database),
-};
-
-vi.mock("@cap/database", () => ({ db: () => database }));
+}));
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => ({ id: "usr_synthetic" }),
 }));
@@ -68,14 +63,7 @@ vi.mock("@cap/database/crypto", () => ({
 	encrypt: async (value: string) => `enc:${value}`,
 	decrypt: async (value: string) => value.replace(/^enc:/, ""),
 }));
-vi.mock("@cap/database/helpers", () => ({ nanoId: () => "synthetic_id" }));
-vi.mock("@cap/database/schema", () => ({
-	organizations: {},
-	s3Buckets: {},
-	storageIntegrations: {},
-	storageObjects: {},
-	videos: {},
-}));
+
 vi.mock("@cap/utils", () => ({ userIsPro: () => true }));
 vi.mock("@cap/web-backend", () => ({}));
 vi.mock("@cap/web-domain", () => ({
@@ -105,12 +93,28 @@ const input = (endpoint: string) => ({
 });
 
 describe("organization storage S3 endpoint policy", () => {
-	beforeEach(() => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
+		await fixture.database.insert(users).values({
+			id: "usr_synthetic" as typeof users.$inferInsert.id,
+			email: "operator@example.com",
+			activeOrganizationId:
+				"org_synthetic" as typeof organizations.$inferInsert.id,
+		});
+		await fixture.database.insert(organizations).values({
+			id: "org_synthetic" as typeof organizations.$inferInsert.id,
+			ownerId: "usr_synthetic" as typeof users.$inferInsert.id,
+			name: "Org",
+		});
+	});
+	afterAll(async () => fixture?.dispose());
+	beforeEach(async () => {
 		state.buildEnv.NEXT_PUBLIC_IS_CAP = "true";
 		state.NODE_ENV = "production";
 		state.s3Configs.length = 0;
 		state.send.mockClear();
-		state.insert.mockClear();
+		await fixture.database.delete(s3Buckets);
 	});
 
 	it.each([
@@ -122,7 +126,7 @@ describe("organization storage S3 endpoint policy", () => {
 		await expect(saveOrganizationS3Config(input(endpoint))).rejects.toThrow(
 			blockedS3EndpointMessage,
 		);
-		expect(state.insert).not.toHaveBeenCalled();
+		expect(await fixture.database.select().from(s3Buckets)).toHaveLength(0);
 	});
 
 	it.each([
@@ -144,7 +148,7 @@ describe("organization storage S3 endpoint policy", () => {
 		await expect(saveOrganizationS3Config(input(""))).resolves.toEqual({
 			success: true,
 		});
-		expect(state.insert).toHaveBeenCalledTimes(2);
+		expect(await fixture.database.select().from(s3Buckets)).toHaveLength(2);
 	});
 
 	it("tests public endpoints through public-only agents on Cap Cloud", async () => {
@@ -176,7 +180,7 @@ describe("organization storage S3 endpoint policy", () => {
 			testOrganizationS3Config(input("http://192.168.1.10:9000")),
 		).resolves.toEqual({ success: true });
 
-		expect(state.insert).toHaveBeenCalledTimes(1);
+		expect(await fixture.database.select().from(s3Buckets)).toHaveLength(1);
 		expect(state.s3Configs).toHaveLength(1);
 		expect(state.s3Configs[0]?.endpoint).toBe("http://192.168.1.10:9000");
 		expect(state.s3Configs[0]?.requestHandler).toBeUndefined();

@@ -1,7 +1,7 @@
 import "server-only";
 
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import { type User, Video } from "@cap/web-domain";
 import { and, count, eq, gte, lt, or } from "drizzle-orm";
 

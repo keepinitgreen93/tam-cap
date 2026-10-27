@@ -1,3 +1,7 @@
+vi.mock("@/lib/video-processing-state", () => ({
+	matchesProcessingRun: vi.fn(),
+}));
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -7,12 +11,12 @@ const mocks = vi.hoisted(() => ({
 	now: 0,
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({ from: () => ({ where: mocks.where }) }),
 	}),
 }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	videos: { id: "id" },
 	videoUploads: { videoId: "videoId" },
 }));

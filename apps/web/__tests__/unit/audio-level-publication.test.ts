@@ -1,5 +1,11 @@
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	databaseRevision,
+	snapshotGuard,
+} from "../../../../packages/database/cloudflare/concurrency-schema";
 
 const mocks = vi.hoisted(() => ({
 	db: vi.fn(),
@@ -7,7 +13,7 @@ const mocks = vi.hoisted(() => ({
 	reserve: vi.fn(),
 	fetch: vi.fn(),
 }));
-vi.mock("@cap/database", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
 vi.mock("@/lib/media-processing-budget", () => ({
 	reserveMediaProcessingBudget: mocks.reserve,
 }));
@@ -31,7 +37,7 @@ import {
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import {
 	getPublishedRecordingOutputKey,
 	resolveRecordingObjectKey,
@@ -75,38 +81,81 @@ beforeEach(() => {
 	jobState = "verified";
 	uploading = false;
 	writes = [];
+	let revision = 0;
+	let signature = "";
+	const currentRevision = () => {
+		const next = JSON.stringify([current, jobState, uploading]);
+		if (next !== signature) {
+			signature = next;
+			revision++;
+		}
+		return revision;
+	};
+	type Mutation = {
+		table: unknown;
+		operation: "insert" | "update" | "delete";
+		values?: Record<string, unknown>;
+	};
 	const connection = {
 		select: () => ({
 			from: (table: unknown) => ({
 				where: () => {
 					const rows =
-						table === videos
-							? [structuredClone(current)]
-							: table === videoProcessingJobs
-								? [{ state: jobState, generation: "generation" }]
-								: table === videoUploads && uploading
-									? [{ phase: "processing" }]
-									: [];
+						table === databaseRevision
+							? [{ revision: currentRevision() }]
+							: table === videos
+								? [structuredClone(current)]
+								: table === videoProcessingJobs
+									? [{ state: jobState, generation: "generation" }]
+									: table === videoUploads && uploading
+										? [{ phase: "processing" }]
+										: [];
 					return Object.assign(Promise.resolve(rows), {
 						for: () => Promise.resolve(rows),
 					});
 				},
 			}),
 		}),
-		update: () => ({
-			set: (value: Record<string, unknown>) => ({
-				where: async () => {
-					writes.push(value);
-					Object.assign(current, value);
-				},
+		selectDistinct: () => {
+			throw new Error("Unexpected distinct read");
+		},
+		query: {},
+		insert: (table: unknown) => ({
+			values: (values: Record<string, unknown>) => ({
+				table,
+				operation: "insert",
+				values,
 			}),
 		}),
+		delete: (table: unknown) => ({
+			where: () => ({ table, operation: "delete" }),
+		}),
+		update: (table: unknown) => ({
+			set: (values: Record<string, unknown>) => ({
+				where: () => ({ table, operation: "update", values }),
+			}),
+		}),
+		batch: async (statements: Mutation[]) => {
+			const guard = statements.find(
+				(statement) =>
+					statement.table === snapshotGuard && statement.operation === "insert",
+			);
+			if (
+				guard &&
+				new SQLiteSyncDialect().sqlToQuery(guard.values?.valid as SQL)
+					.params[0] !== currentRevision()
+			)
+				throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+			for (const statement of statements)
+				if (statement.operation === "update" && statement.values) {
+					writes.push(statement.values);
+					Object.assign(current, statement.values);
+				}
+			return [];
+		},
 	};
-	mocks.db.mockReturnValue({
-		...connection,
-		transaction: async (fn: (tx: typeof connection) => Promise<unknown>) =>
-			fn(connection),
-	});
+	mocks.db.mockReturnValue(connection);
+
 	mocks.access.mockImplementation(() =>
 		Effect.succeed([
 			{

@@ -1,4 +1,5 @@
 import type { User, Video } from "@cap/web-domain";
+import { QueryPromise } from "drizzle-orm/query-promise";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	attachRemoteJob,
@@ -27,14 +28,25 @@ import type {
 
 const mocks = vi.hoisted(() => ({ db: vi.fn() }));
 vi.mock("@cap/database", () => ({ db: mocks.db }));
-vi.mock("@cap/database/schema", () => {
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
+vi.mock("../../../../packages/database/cloudflare/concurrency-schema", () => ({
+	databaseRevision: {
+		table: "revision",
+		id: "revision.id",
+		revision: "revision.revision",
+	},
+	snapshotGuard: { table: "guard", id: "guard.id" },
+}));
+vi.mock("@cap/database/cloudflare/schema", () => {
 	const table = (name: string, fields: string[]) =>
 		Object.fromEntries([
 			["table", name],
 			...fields.map((field) => [field, `${name}.${field}`]),
 		]);
 	return {
-		videos: table("videos", ["id", "ownerId", "source"]),
+		videos: table("videos", ["id", "ownerId", "source", "orgId"]),
+		organizations: table("organizations", ["id", "ownerId", "tombstoneAt"]),
+		organizationMembers: table("members", ["organizationId", "userId"]),
 		videoUploads: table("uploads", ["videoId"]),
 		mediaProcessingBudgets: table("budgets", ["id"]),
 		videoProcessingJobs: table("jobs", [
@@ -55,6 +67,11 @@ vi.mock("@cap/database/schema", () => {
 	};
 });
 vi.mock("drizzle-orm", () => ({
+	sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
+		op: "sql",
+		strings,
+		values,
+	}),
 	and: (...args: unknown[]) => ({ op: "and", args }),
 	or: (...args: unknown[]) => ({ op: "or", args }),
 	eq: (column: string, value: unknown) => ({ op: "eq", column, value }),
@@ -74,6 +91,8 @@ type Condition = {
 	args?: (Condition | undefined)[];
 	column?: string;
 	value?: unknown;
+	strings?: string[];
+	values?: unknown[];
 };
 
 const videoId = "video" as Video.VideoId;
@@ -105,6 +124,20 @@ function getJobRow(): Row {
 
 function matches(row: Row, condition?: Condition): boolean {
 	if (!condition) return true;
+	if (condition.op === "sql") {
+		const video = rows.videos?.find(
+			(candidate) => candidate.id === (row.videoId ?? row.id),
+		);
+		const org = rows.organizations?.find(
+			(candidate) => candidate.id === video?.orgId,
+		);
+		return Boolean(
+			video &&
+				org &&
+				!org.tombstoneAt &&
+				(!row.ownerId || row.ownerId === video.ownerId),
+		);
+	}
 	if (condition.op === "and")
 		return (condition.args ?? []).every((part) => matches(row, part));
 	if (condition.op === "or")
@@ -121,117 +154,139 @@ function matches(row: Row, condition?: Condition): boolean {
 }
 
 function createClient() {
-	const client = {
-		select(fields?: Record<string, string>) {
-			let table = "";
-			let condition: Condition | undefined;
-			const run = () =>
-				(rows[table] ?? [])
-					.filter((row) => matches(row, condition))
-					.map((row) => {
-						if (!fields) return { ...row };
-						return Object.fromEntries(
-							Object.entries(fields).map(([name, column]) => [
-								name,
-								row[column.split(".")[1] ?? ""],
-							]),
-						);
-					});
-			const query = {
-				from(value: Table) {
-					table = value.table;
-					return query;
-				},
-				innerJoin() {
-					return query;
-				},
-				orderBy() {
-					return query;
-				},
-				where(value: Condition) {
-					condition = value;
-					return query;
-				},
-				for: async () => {
-					lockingOperations.push(`select:${table}`);
-					return run();
-				},
-				limit: async (limit: number) => run().slice(0, limit),
-			};
-			return query;
-		},
-		update(table: Table) {
-			return {
-				set(values: Row) {
-					return {
-						where: async (condition: Condition) => {
-							const matching = (rows[table.table] ?? []).filter((row) =>
-								matches(row, condition),
-							);
-							for (const row of matching) Object.assign(row, values);
-							return [{ affectedRows: matching.length }];
-						},
-					};
-				},
-			};
-		},
-		delete(table: Table) {
-			return {
-				where: async (condition: Condition) => {
-					const before = rows[table.table] ?? [];
-					rows[table.table] = before.filter((row) => !matches(row, condition));
-					return [
-						{ affectedRows: before.length - (rows[table.table]?.length ?? 0) },
-					];
-				},
-			};
-		},
-		insert(table: Table) {
-			return {
-				values(values: Row) {
-					const run = async (update?: Row) => {
-						lockingOperations.push(
-							`${update ? "upsert" : "insert"}:${table.table}`,
-						);
-						const stored = (rows[table.table] ?? []).find(
-							(row) => row.videoId === values.videoId,
-						);
-						if (stored) {
-							if (!update) throw new Error("Duplicate row");
-							Object.assign(stored, update);
-						} else {
-							rows[table.table]?.push({ ...values });
-						}
-						return [{ affectedRows: 1 }];
-					};
-					let updates: Row | undefined;
-					const pending = Promise.resolve().then(() => run(updates));
-					return Object.assign(pending, {
-						onDuplicateKeyUpdate: ({ set }: { set: Row }) => {
-							updates = set;
-							return pending;
-						},
-					});
-				},
-			};
-		},
-	};
 	let tail = Promise.resolve();
+	let revision = 0;
+	let signature = "";
+	const currentRevision = () => {
+		const next = JSON.stringify(rows);
+		if (next !== signature) {
+			signature = next;
+			revision++;
+		}
+		return revision;
+	};
+	class Selection extends QueryPromise<Row[]> {
+		private table = "";
+		private condition: Condition | undefined;
+		private maximum = Number.POSITIVE_INFINITY;
+		constructor(private fields?: Record<string, string>) {
+			super();
+		}
+		from(value: Table) {
+			this.table = value.table;
+			return this;
+		}
+		innerJoin() {
+			return this;
+		}
+		orderBy() {
+			return this;
+		}
+		where(value: Condition) {
+			this.condition = value;
+			return this;
+		}
+		limit(value: number) {
+			this.maximum = value;
+			return this;
+		}
+		async execute() {
+			if (this.table === "revision") return [{ revision: currentRevision() }];
+			lockingOperations.push(`select:${this.table}`);
+			return (rows[this.table] ?? [])
+				.filter((row) => matches(row, this.condition))
+				.slice(0, this.maximum)
+				.map((row) => {
+					if (!this.fields) return { ...row };
+					return Object.fromEntries(
+						Object.entries(this.fields).map(([name, column]) => [
+							name,
+							row[column.split(".")[1] ?? ""],
+						]),
+					);
+				});
+		}
+	}
+	class Mutation extends QueryPromise<{ meta: { changes: number } }> {
+		private condition: Condition | undefined;
+		private updates: Row | undefined;
+		constructor(
+			readonly table: Table,
+			readonly operation: "insert" | "update" | "delete",
+			readonly values: Row = {},
+		) {
+			super();
+		}
+		where(condition: Condition) {
+			this.condition = condition;
+			return this;
+		}
+		onConflictDoUpdate({ set }: { set: Row }) {
+			this.updates = set;
+			return this;
+		}
+		async execute() {
+			const name = this.table.table;
+			if (name === "guard") return { meta: { changes: 1 } };
+			const records = rows[name] ?? [];
+			if (this.operation === "insert") {
+				lockingOperations.push(`${this.updates ? "upsert" : "insert"}:${name}`);
+				const stored = records.find(
+					(row) => row.videoId === this.values.videoId,
+				);
+				if (stored) {
+					if (!this.updates) throw new Error("Duplicate row");
+					Object.assign(stored, this.updates);
+				} else records.push({ ...this.values });
+				rows[name] = records;
+				return { meta: { changes: 1 } };
+			}
+			const matching = records.filter((row) => matches(row, this.condition));
+			if (this.operation === "update")
+				for (const row of matching) Object.assign(row, this.values);
+			else rows[name] = records.filter((row) => !matches(row, this.condition));
+			return { meta: { changes: matching.length } };
+		}
+	}
 	return {
-		...client,
-		async transaction(callback: (tx: typeof client) => Promise<unknown>) {
-			const previous = tail;
+		select: (fields?: Record<string, string>) => new Selection(fields),
+		selectDistinct: (fields?: Record<string, string>) => new Selection(fields),
+		query: {},
+		update: (table: Table) => ({
+			set: (values: Row) => new Mutation(table, "update", values),
+		}),
+		insert: (table: Table) => ({
+			values: (values: Row) => new Mutation(table, "insert", values),
+		}),
+		delete: (table: Table) => new Mutation(table, "delete"),
+		async batch(statements: Mutation[]) {
+			const waiting = tail;
 			let release = () => {};
 			tail = new Promise<void>((resolve) => {
 				release = resolve;
 			});
-			await previous;
-			const before = structuredClone(rows);
+			await waiting;
 			try {
-				return await callback(client);
-			} catch (error) {
-				rows = before;
-				throw error;
+				const guard = statements.find(
+					(statement) =>
+						statement.table.table === "guard" &&
+						statement.operation === "insert",
+				);
+				if (
+					guard &&
+					(guard.values.valid as Condition).values?.[1] !== currentRevision()
+				)
+					throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+				const previous = structuredClone(rows);
+				try {
+					const result = [];
+					for (const statement of statements)
+						result.push(await statement.execute());
+					return result;
+				} catch (error) {
+					rows = previous;
+					throw error;
+				}
 			} finally {
 				release();
 			}
@@ -245,8 +300,15 @@ beforeEach(() => {
 	lockingOperations = [];
 	rows = {
 		videos: [
-			{ id: videoId, ownerId: userId, source: { type: "desktopSegments" } },
+			{
+				id: videoId,
+				ownerId: userId,
+				orgId: "org",
+				source: { type: "desktopSegments" },
+			},
 		],
+		organizations: [{ id: "org", ownerId: userId, tombstoneAt: null }],
+		members: [],
 		jobs: [],
 		uploads: [],
 		budgets: [],
@@ -271,12 +333,15 @@ async function createAttempt(withVerification = true) {
 }
 
 describe("durable recording job ownership", () => {
-	it("establishes the job row before taking locking reads to prevent concurrent first-insert deadlocks", async () => {
+	it("plans ownership reads before committing the job and upload together", async () => {
 		await ensureSegmentProcessingJob({ videoId, userId });
-		expect(lockingOperations.slice(0, 3)).toEqual([
-			"upsert:jobs",
+		expect(lockingOperations.slice(0, 2)).toEqual([
 			"select:jobs",
 			"select:videos",
+		]);
+		expect(lockingOperations.slice(-2)).toEqual([
+			"insert:jobs",
+			"upsert:uploads",
 		]);
 	});
 
@@ -469,7 +534,7 @@ describe("durable recording job ownership", () => {
 	it("does not mutate an upload owned by another account", async () => {
 		await expect(
 			ensureSegmentProcessingJob({ videoId, userId: "other" as User.UserId }),
-		).rejects.toThrow("does not exist");
+		).rejects.toThrow("ownership changed");
 		expect(rows.jobs).toEqual([]);
 	});
 
@@ -752,7 +817,7 @@ describe("operator retry of blocked recordings", () => {
 				previousErrorCode: errorCode,
 			});
 			expect(getJobRow()).toMatchObject({
-				generation: attempt.generation,
+				generation: expect.any(String),
 				state: "retry",
 				source,
 				attemptCount: 0,
@@ -766,9 +831,10 @@ describe("operator retry of blocked recordings", () => {
 				phase: "processing",
 				processingError: null,
 			});
+			expect(getJobRow().generation).not.toBe(attempt.generation);
 			const next = await claimProcessingAttempt({
 				videoId,
-				generation: attempt.generation,
+				generation: String(getJobRow().generation),
 			});
 			expect(next).toMatchObject({
 				state: "processing",
@@ -909,19 +975,12 @@ describe("retained-source retry policy", () => {
 		rows.jobs = [
 			{ ...attempt, source, output, state: "verified", leaseExpiresAt: null },
 		];
-		await mocks
-			.db()
-			.transaction(
-				(
-					tx: Parameters<
-						typeof retireDesktopRecordingJobForOutputReplacement
-					>[0],
-				) =>
-					retireDesktopRecordingJobForOutputReplacement(tx, {
-						videoId,
-						userId,
-					}),
-			);
+		await mocks.db().batch([
+			retireDesktopRecordingJobForOutputReplacement(mocks.db(), {
+				videoId,
+				userId,
+			}),
+		]);
 		expect(rows.jobs?.[0]).toMatchObject({
 			source,
 			verification,
@@ -938,19 +997,12 @@ describe("retained-source retry policy", () => {
 	});
 
 	it("keeps a replacement tombstone even when the original predated durable jobs", async () => {
-		await mocks
-			.db()
-			.transaction(
-				(
-					tx: Parameters<
-						typeof retireDesktopRecordingJobForOutputReplacement
-					>[0],
-				) =>
-					retireDesktopRecordingJobForOutputReplacement(tx, {
-						videoId,
-						userId,
-					}),
-			);
+		await mocks.db().batch([
+			retireDesktopRecordingJobForOutputReplacement(mocks.db(), {
+				videoId,
+				userId,
+			}),
+		]);
 		expect(rows.jobs?.[0]).toMatchObject({
 			source: null,
 			errorCode: "output-replaced",
@@ -1171,6 +1223,15 @@ describe("recovery admission", () => {
 			nextRetryAt: new Date(now.getTime() - 24 * 60 * 60_000),
 		}));
 		rows.jobs.push(current);
+		for (const job of rows.jobs ?? []) {
+			if (!rows.videos?.some((video) => video.id === job.videoId))
+				rows.videos?.push({
+					id: job.videoId,
+					ownerId: job.ownerId,
+					orgId: "org",
+					source: { type: "desktopSegments" },
+				});
+		}
 		const selected = await listRecoverableSegmentJobs({ now, limit: 3 });
 		expect(selected[0]?.videoId).toBe(videoId);
 		expect(selected).toHaveLength(3);

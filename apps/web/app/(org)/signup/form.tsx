@@ -1,5 +1,6 @@
 "use client";
 
+import { buildEnv } from "@cap/env";
 import { Button, Input, LogoBadge } from "@cap/ui";
 import {
 	faArrowLeft,
@@ -428,29 +429,36 @@ export function SignupForm() {
 								Log in here
 							</Link>
 						</motion.p>
-						<motion.p
-							layout="position"
-							className="text-xs text-center text-gray-9"
-						>
-							By typing your email and clicking continue, you acknowledge that
-							you have both read and agree to Cap's{" "}
-							<Link
-								href="/terms"
-								target="_blank"
-								className="text-xs font-semibold text-gray-12 hover:text-blue-300"
+						{buildEnv.NEXT_PUBLIC_IS_CAP === "true" ? (
+							<motion.p
+								layout="position"
+								className="text-xs text-center text-gray-9"
 							>
-								Terms of Service
-							</Link>{" "}
-							and{" "}
-							<Link
-								href="/privacy"
-								target="_blank"
-								className="text-xs font-semibold text-gray-12 hover:text-blue-300"
-							>
-								Privacy Policy
-							</Link>
-							.
-						</motion.p>
+								By typing your email and clicking continue, you acknowledge that
+								you have both read and agree to Cap's{" "}
+								<Link
+									href="/terms"
+									target="_blank"
+									className="text-xs font-semibold text-gray-12 hover:text-blue-300"
+								>
+									Terms of Service
+								</Link>{" "}
+								and{" "}
+								<Link
+									href="/privacy"
+									target="_blank"
+									className="text-xs font-semibold text-gray-12 hover:text-blue-300"
+								>
+									Privacy Policy
+								</Link>
+								.
+							</motion.p>
+						) : (
+							<p className="text-xs text-center text-gray-9">
+								This workspace is managed by your organization. Contact your
+								administrator for access.
+							</p>
+						)}
 					</motion.div>
 				</Suspense>
 			</motion.div>

@@ -1,4 +1,4 @@
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import type { Context, Next } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -11,16 +11,12 @@ const mocks = vi.hoisted(() => ({
 	validate: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({ from: () => ({ where: mocks.where }) }),
 	}),
 }));
-vi.mock("@cap/database/schema", () => ({
-	videos: { id: "id", ownerId: "ownerId" },
-	videoUploads: { videoId: "videoId", phase: "phase" },
-	videoProcessingJobs: { videoId: "videoId" },
-}));
+
 vi.mock("@cap/web-domain", () => ({
 	Video: { VideoId: { make: (id: string) => id } },
 }));
@@ -237,10 +233,8 @@ describe("recording completion acknowledgement", () => {
 		expect(response.status).toBe(404);
 		const [condition] = mocks.where.mock.calls[0] ?? [];
 		if (!condition) throw new Error("Missing owned-video query");
-		expect(new MySqlDialect().sqlToQuery(condition).params).toEqual([
-			"id",
+		expect(new SQLiteSyncDialect().sqlToQuery(condition).params).toEqual([
 			"recording",
-			"ownerId",
 			"owner",
 		]);
 		expect(mocks.queue).not.toHaveBeenCalled();

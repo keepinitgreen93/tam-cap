@@ -1,8 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoId } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	agentApiKeys,
 	authApiKeys,
@@ -10,7 +9,8 @@ import {
 	organizations,
 	sessions,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import type { Organisation } from "@cap/web-domain";
 import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -203,14 +203,15 @@ export async function signOutAllDevices() {
 	const currentUser = await getCurrentUser();
 	if (!currentUser) throw new Error("Unauthorized");
 
-	await db().transaction(async (tx) => {
-		await tx
+	const database = db();
+	await database.batch([
+		database
 			.update(users)
 			.set({ authSessionVersion: sql`${users.authSessionVersion} + 1` })
-			.where(eq(users.id, currentUser.id));
-		await tx.delete(sessions).where(eq(sessions.userId, currentUser.id));
-		await tx.delete(authApiKeys).where(eq(authApiKeys.userId, currentUser.id));
-		await tx
+			.where(eq(users.id, currentUser.id)),
+		database.delete(sessions).where(eq(sessions.userId, currentUser.id)),
+		database.delete(authApiKeys).where(eq(authApiKeys.userId, currentUser.id)),
+		database
 			.update(agentApiKeys)
 			.set({ revokedAt: new Date() })
 			.where(
@@ -218,6 +219,6 @@ export async function signOutAllDevices() {
 					eq(agentApiKeys.userId, currentUser.id),
 					isNull(agentApiKeys.revokedAt),
 				),
-			);
-	});
+			),
+	]);
 }

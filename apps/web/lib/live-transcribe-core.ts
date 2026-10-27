@@ -199,7 +199,20 @@ export interface LiveTranscriptArtifact {
 	hasGaps?: boolean;
 }
 
-export function getLiveTranscriptObjectKey(ownerId: string, videoId: string) {
+export function getLiveTranscriptObjectKey(
+	ownerId: string,
+	videoId: string,
+	runId?: string,
+) {
+	if (runId !== undefined) {
+		if (
+			!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+				runId,
+			)
+		)
+			throw new Error("Invalid live transcription identity");
+		return `${ownerId}/${videoId}/.recording/transcription/${runId}/live.json`;
+	}
 	return `${ownerId}/${videoId}/transcription.live.json`;
 }
 

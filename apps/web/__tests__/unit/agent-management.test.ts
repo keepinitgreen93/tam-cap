@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+const environment = vi.hoisted(() => ({ NEXT_PUBLIC_IS_CAP: "true" }));
+vi.mock("@cap/env", () => ({ buildEnv: environment }));
+
+import { describe, expect, it, vi } from "vitest";
 import {
 	decodeNotificationCursor,
 	encodeNotificationCursor,

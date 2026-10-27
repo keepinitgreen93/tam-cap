@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizations } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations } from "@cap/database/cloudflare/schema";
 import type { Organisation } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -25,6 +25,10 @@ export async function removeOrganizationDomain(
 	if (!organization) throw new Error("Organization not found");
 
 	await requireOrganizationSettingsManager(user.id, organizationId);
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Domains on this self-hosted server are managed by the deployment operator",
+		);
 
 	try {
 		if (organization.customDomain) {

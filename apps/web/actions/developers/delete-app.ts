@@ -1,45 +1,35 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { developerApiKeys, developerApps } from "@cap/database/schema";
+import {
+	developerApiKeys,
+	developerApps,
+} from "@cap/database/cloudflare/schema";
 import { and, eq, isNull } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { mutateOwnedDeveloperApp } from "@/lib/developer-persistence";
 
 export async function deleteDeveloperApp(appId: string) {
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 
-	const [app] = await db()
-		.select()
-		.from(developerApps)
-		.where(
-			and(
-				eq(developerApps.id, appId),
-				eq(developerApps.ownerId, user.id),
-				isNull(developerApps.deletedAt),
-			),
-		)
-		.limit(1);
-
-	if (!app) throw new Error("App not found");
-
-	await db().transaction(async (tx) => {
-		await tx
+	const now = new Date();
+	await mutateOwnedDeveloperApp(user.id, appId, (database) => [
+		database
 			.update(developerApiKeys)
-			.set({ revokedAt: new Date() })
+			.set({ revokedAt: now })
 			.where(
 				and(
 					eq(developerApiKeys.appId, appId),
 					isNull(developerApiKeys.revokedAt),
 				),
-			);
+			),
 
-		await tx
+		database
 			.update(developerApps)
-			.set({ deletedAt: new Date() })
-			.where(eq(developerApps.id, appId));
-	});
+			.set({ deletedAt: now })
+			.where(eq(developerApps.id, appId)),
+	]);
 
 	revalidatePath("/dashboard/developers");
 	return { success: true };

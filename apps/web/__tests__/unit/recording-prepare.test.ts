@@ -1,5 +1,5 @@
 import type { HttpApi } from "@effect/platform";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -15,7 +15,7 @@ vi.mock("@/lib/desktop-recording-source", () => ({
 }));
 
 vi.mock("@/lib/server", async () => {
-	const { Database } = await import("@cap/web-backend");
+	const { CloudflareDatabase: Database } = await import("@cap/web-backend");
 	const { HttpAuthMiddleware, Organisation, User, DatabaseError } =
 		await import("@cap/web-domain");
 	const { HttpApiBuilder, HttpApiError, HttpServer } = await import(
@@ -26,7 +26,7 @@ vi.mock("@/lib/server", async () => {
 		select: () => ({
 			from: () => ({ leftJoin: () => ({ where: mocks.where }) }),
 		}),
-	} as unknown as import("@cap/web-backend/src/Database").DbClient;
+	} as unknown as import("@cap/web-backend/src/CloudflareDatabase").CloudflareDbClient;
 	const database = Layer.succeed(
 		Database,
 		Database.make({
@@ -55,7 +55,7 @@ vi.mock("@/lib/server", async () => {
 			api: import("effect").Layer.Layer<
 				HttpApi.Api,
 				never,
-				| import("@cap/web-backend").Database
+				| import("@cap/web-backend").CloudflareDatabase
 				| import("@cap/web-domain").HttpAuthMiddleware
 			>,
 		) => {
@@ -114,7 +114,7 @@ describe("optional recording preparation API", () => {
 		mocks.rows = [[]];
 		expect((await request()).status).toBe(404);
 		const [condition] = mocks.where.mock.calls[0] ?? [];
-		const query = new MySqlDialect().sqlToQuery(condition);
+		const query = new SQLiteSyncDialect().sqlToQuery(condition);
 		expect(query.params).toEqual(["recording", "owner"]);
 		expect(mocks.prepare).not.toHaveBeenCalled();
 	});
@@ -182,7 +182,7 @@ describe("optional recording preparation API", () => {
 			prepared: segments,
 		});
 		for (const [condition] of mocks.where.mock.calls) {
-			expect(new MySqlDialect().sqlToQuery(condition).params).toEqual([
+			expect(new SQLiteSyncDialect().sqlToQuery(condition).params).toEqual([
 				"recording",
 				"owner",
 			]);

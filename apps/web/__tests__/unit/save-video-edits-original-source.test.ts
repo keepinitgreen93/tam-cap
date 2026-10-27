@@ -1,5 +1,11 @@
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { Effect } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	databaseRevision,
+	snapshotGuard,
+} from "../../../../packages/database/cloudflare/concurrency-schema";
 
 const tables = vi.hoisted(() => ({
 	videos: { id: "videos.id" },
@@ -20,7 +26,10 @@ function selectFromRows() {
 	return {
 		from: (table: unknown) => ({
 			where: () => {
-				const rows = state.rows.get(table) ?? [];
+				const rows =
+					table === databaseRevision
+						? [{ revision: currentRevision() }]
+						: (state.rows.get(table) ?? []);
 				return Object.assign(Promise.resolve(rows), {
 					for: () => Promise.resolve(rows),
 				});
@@ -29,22 +38,78 @@ function selectFromRows() {
 	};
 }
 
-vi.mock("@cap/database", () => ({
+let revision = 0;
+let signature = "";
+const currentRevision = () => {
+	const next = JSON.stringify([...state.rows.values()]);
+	if (next !== signature) {
+		signature = next;
+		revision++;
+	}
+	return revision;
+};
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: selectFromRows,
-		transaction: async (run: (tx: Record<string, unknown>) => Promise<void>) =>
-			run({
-				select: selectFromRows,
-				insert: () => ({ values: async () => undefined }),
-				update: () => ({
-					set: () => ({ where: async () => undefined }),
-				}),
-				delete: () => ({ where: async () => undefined }),
+		selectDistinct: selectFromRows,
+		query: {},
+		insert: (table: unknown) => ({
+			values: (data: Record<string, unknown>) => ({
+				operation: "insert",
+				table,
+				data,
 			}),
+		}),
+		update: (table: unknown) => ({
+			set: (data: Record<string, unknown>) => ({
+				where: () => ({ operation: "update", table, data }),
+			}),
+		}),
+		delete: (table: unknown) => ({
+			where: () => ({ operation: "delete", table }),
+		}),
+		batch: async (
+			statements: Array<{
+				operation: string;
+				table: unknown;
+				data?: Record<string, unknown>;
+			}>,
+		) => {
+			const guard = statements.find(
+				(statement) =>
+					statement.table === snapshotGuard && statement.operation === "insert",
+			);
+			if (
+				guard &&
+				new SQLiteSyncDialect().sqlToQuery(guard.data?.valid as SQL)
+					.params[0] !== currentRevision()
+			)
+				throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+			for (const statement of statements) {
+				if (statement.table === snapshotGuard) continue;
+				if (statement.operation === "delete")
+					state.rows.set(statement.table, []);
+				else if (statement.operation === "insert")
+					state.rows.set(statement.table, [statement.data]);
+				else
+					for (const row of state.rows.get(statement.table) ?? [])
+						if (row && typeof row === "object")
+							Object.assign(row, statement.data);
+			}
+			return [];
+		},
 	}),
 }));
-
-vi.mock("@cap/database/schema", () => tables);
+vi.mock("@cap/database/cloudflare/schema", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("@cap/database/cloudflare/schema")>();
+	Object.assign(tables, {
+		videos: actual.videos,
+		videoUploads: actual.videoUploads,
+		videoEdits: actual.videoEdits,
+	});
+	return actual;
+});
 
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => ({ id: "user-1", isPro: true }),
@@ -69,7 +134,6 @@ vi.mock("@cap/web-backend", () => ({
 	},
 }));
 
-vi.mock("drizzle-orm", () => ({ eq: () => undefined }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 vi.mock("workflow/api", () => ({ start: startMock }));
 vi.mock("server-only", () => ({}));
@@ -138,7 +202,8 @@ async function saveTrim(end: number) {
 }
 
 describe("saveVideoEdits original source copy", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
+		await import("@cap/database/cloudflare/schema");
 		vi.clearAllMocks();
 		state.rows.clear();
 		copyObjectMock.mockReturnValue(Effect.succeed({}));

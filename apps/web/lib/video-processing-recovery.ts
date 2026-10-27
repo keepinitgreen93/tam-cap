@@ -1,5 +1,9 @@
-import { db } from "@cap/database";
-import { importedVideos, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	importedVideos,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import {
@@ -14,16 +18,14 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { start } from "workflow/api";
 import {
 	getLoomImportRunState,
 	LOOM_IMPORT_CONFIRMATION_MESSAGE,
 	LoomImportStartError,
 	startLoomImportWorkflow,
 } from "@/lib/loom-import-start";
-import { setVideoProcessingError } from "@/lib/video-processing";
+import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { WORKFLOW_UPGRADE_ERROR_FRAGMENT } from "@/lib/workflow-recovery";
-import { processVideoWorkflow } from "@/workflows/process-video";
 
 export const VIDEO_PROCESSING_RECOVERY_BATCH_SIZE = 20;
 export const LOOM_IMPORT_RECOVERY_BATCH_SIZE = 8;
@@ -63,68 +65,28 @@ export type FailedVideoProcessingRecoverySummary = {
 	}>;
 };
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
+const getAffectedRows = (result: { meta: { changes: number } }) =>
+	result.meta.changes;
 
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
-
-async function recoverWebCandidate({
-	videoId,
-	userId,
-	rawFileKey,
-	bucketId,
-}: {
+async function recoverWebCandidate(input: {
 	videoId: Video.VideoId;
 	userId: string;
 	rawFileKey: string;
 	bucketId: S3Bucket.S3BucketId | null;
+	uploadUpdatedAt: Date;
+	metadata: VideoMetadata | null;
 }): Promise<FailedVideoProcessingRecoveryStatus> {
-	const claimResult = await db()
-		.update(videoUploads)
-		.set({
-			phase: "processing",
-			processingProgress: 0,
-			processingMessage: "Processing video",
-			processingError: null,
-			updatedAt: new Date(),
-		})
-		.where(
-			and(
-				eq(videoUploads.videoId, videoId),
-				eq(videoUploads.phase, "error"),
-				eq(videoUploads.rawFileKey, rawFileKey),
-				recoverableProcessingError(),
-			),
-		);
-
-	if (getAffectedRows(claimResult) === 0) {
-		return "already-claimed";
-	}
-
 	try {
-		await start(processVideoWorkflow, [
-			{
-				videoId,
-				userId,
-				rawFileKey,
-				bucketId,
-			},
-		]);
-		return "started";
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		await setVideoProcessingError(
-			videoId,
-			"Processing recovery will retry automatically",
-			new Error(
-				`${WORKFLOW_UPGRADE_ERROR_FRAGMENT}; recovery start failed: ${message}`,
-			),
-		);
+		const status = await startVideoProcessingWorkflow({
+			...input,
+			forceRestart: true,
+			expectedUpdatedAt: input.uploadUpdatedAt,
+			expectedProcessingToken: input.metadata?.processingRun?.token ?? null,
+			processingMessage: "Processing video",
+			startFailureMessage: "Processing recovery will retry automatically",
+		});
+		return status === "started" ? "started" : "already-claimed";
+	} catch {
 		return "retry-scheduled";
 	}
 }
@@ -150,8 +112,8 @@ async function recoverLoomCandidate({
 }): Promise<FailedVideoProcessingRecoveryStatus> {
 	const runState = await getLoomImportRunState(receipt);
 	const receiptCondition = receipt
-		? sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${videoId} AND JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId')) = ${receipt.runId})`
-		: sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${videoId} AND JSON_EXTRACT(${videos.metadata}, '$.loomImportRun') IS NULL)`;
+		? sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${videoId} AND json_extract(${videos.metadata}, '$.loomImportRun.runId') = ${receipt.runId})`
+		: sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${videoId} AND json_extract(${videos.metadata}, '$.loomImportRun') IS NULL)`;
 	if (runState === "active") {
 		await db()
 			.update(videoUploads)
@@ -347,7 +309,7 @@ export async function recoverFailedVideoProcessing({
 									),
 								),
 								and(
-									sql`JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId') IS NOT NULL`,
+									sql`json_extract(${videos.metadata}, '$.loomImportRun.runId') IS NOT NULL`,
 									eq(
 										videoUploads.processingMessage,
 										LOOM_IMPORT_CONFIRMATION_MESSAGE,
@@ -355,7 +317,7 @@ export async function recoverFailedVideoProcessing({
 								),
 							)
 						: and(
-								sql`JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId') IS NOT NULL`,
+								sql`json_extract(${videos.metadata}, '$.loomImportRun.runId') IS NOT NULL`,
 								or(
 									eq(
 										videoUploads.processingMessage,
@@ -461,12 +423,14 @@ export async function recoverFailedVideoProcessing({
 			userId: videos.ownerId,
 			bucketId: videos.bucket,
 			rawFileKey: videoUploads.rawFileKey,
+			uploadUpdatedAt: videoUploads.updatedAt,
+			metadata: videos.metadata,
 		})
 		.from(videos)
 		.innerJoin(videoUploads, eq(videos.id, videoUploads.videoId))
 		.where(
 			and(
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.source}, '$.type')) = 'webMP4'`,
+				sql`json_extract(${videos.source}, '$.type') = 'webMP4'`,
 				eq(videoUploads.phase, "error"),
 				isNotNull(videoUploads.rawFileKey),
 				notLike(videoUploads.processingError, "%import-loom-video%"),
@@ -523,6 +487,8 @@ export async function recoverFailedVideoProcessing({
 					userId: candidate.userId,
 					rawFileKey: candidate.rawFileKey,
 					bucketId: candidate.bucketId,
+					uploadUpdatedAt: candidate.uploadUpdatedAt,
+					metadata: candidate.metadata,
 				});
 			} catch (error) {
 				status = "failed";

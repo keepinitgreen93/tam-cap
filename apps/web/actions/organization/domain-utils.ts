@@ -3,6 +3,36 @@ import { parse } from "tldts";
 const VERCEL_CNAME_TARGET = "cname.vercel-dns.com";
 const VERCEL_A_RECORD = "76.76.21.21";
 
+export const operatorManagedDomainStatus = (domain: string) => {
+	const configuredDomain = new URL(
+		process.env.WEB_URL ??
+			process.env.NEXT_PUBLIC_WEB_URL ??
+			"http://localhost",
+	).hostname.toLowerCase();
+	const verified = domain.toLowerCase() === configuredDomain;
+	return {
+		verified,
+		operatorManaged: true,
+		configuredDomain,
+		error: verified
+			? undefined
+			: {
+					code: "operator_managed",
+					message:
+						"Domains on this self-hosted server are managed by the deployment operator",
+				},
+		config: {
+			operatorManaged: true,
+			configuredDomain,
+			verification: [],
+			currentAValues: [],
+			recommendedCNAME: [],
+			recommendedIPv4: [],
+		},
+		status: { name: domain, verified, operatorManaged: true },
+	};
+};
+
 export const isSubdomain = (raw: string): boolean => {
 	const input =
 		raw
@@ -16,6 +46,8 @@ export const isSubdomain = (raw: string): boolean => {
 };
 
 export const getConfigResponse = async (domain: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return operatorManagedDomainStatus(domain);
 	const response = await fetch(
 		`https://api.vercel.com/v6/domains/${domain.toLowerCase()}/config?teamId=${
 			process.env.VERCEL_TEAM_ID
@@ -33,6 +65,8 @@ export const getConfigResponse = async (domain: string) => {
 };
 
 export const getDomainResponse = async (domain: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return operatorManagedDomainStatus(domain);
 	const response = await fetch(
 		`https://api.vercel.com/v9/projects/${
 			process.env.VERCEL_PROJECT_ID
@@ -50,6 +84,8 @@ export const getDomainResponse = async (domain: string) => {
 };
 
 export const verifyDomain = async (domain: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return operatorManagedDomainStatus(domain);
 	const response = await fetch(
 		`https://api.vercel.com/v9/projects/${
 			process.env.VERCEL_PROJECT_ID
@@ -68,6 +104,8 @@ export const verifyDomain = async (domain: string) => {
 };
 
 export const addDomain = async (domain: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return operatorManagedDomainStatus(domain);
 	const response = await fetch(
 		`https://api.vercel.com/v9/projects/${process.env.VERCEL_PROJECT_ID}/domains?teamId=${process.env.VERCEL_TEAM_ID}`,
 		{
@@ -85,6 +123,8 @@ export const addDomain = async (domain: string) => {
 };
 
 export const getRequiredConfig = async (domain: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return operatorManagedDomainStatus(domain);
 	// First try to get the records directly
 	try {
 		const recordsResponse = await fetch(
@@ -103,7 +143,8 @@ export const getRequiredConfig = async (domain: string) => {
 
 		if (recordsResponse.records) {
 			const aRecord = recordsResponse.records.find(
-				(record: any) => record.type === "A" && record.name === "",
+				(record: { type?: string; name?: string }) =>
+					record.type === "A" && record.name === "",
 			);
 
 			if (aRecord) {
@@ -149,7 +190,7 @@ export const getRequiredConfig = async (domain: string) => {
 
 		if (projectResponse.domains) {
 			const projectDomain = projectResponse.domains.find(
-				(d: any) => d.name === domain,
+				(d: { name?: string }) => d.name === domain,
 			);
 			if (projectDomain?.apexValue) {
 				response.aValues = [projectDomain.apexValue];
@@ -161,6 +202,8 @@ export const getRequiredConfig = async (domain: string) => {
 };
 
 export const checkDomainStatus = async (domain: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return operatorManagedDomainStatus(domain);
 	try {
 		const [domainJson, configJson, requiredConfigJson] = await Promise.all([
 			getDomainResponse(domain),

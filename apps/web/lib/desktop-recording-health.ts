@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { videoProcessingJobs } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videoProcessingJobs } from "@cap/database/cloudflare/schema";
 import { inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED } from "@/lib/desktop-recording-jobs";
@@ -20,7 +20,7 @@ export async function getDesktopRecordingHealth({
 }: {
 	now?: Date;
 } = {}) {
-	const staleBefore = new Date(now.getTime() - RECOVERY_GRACE_MS);
+	const staleBefore = now.getTime() - RECOVERY_GRACE_MS;
 	const job = videoProcessingJobs;
 	const [row] = await db()
 		.select({

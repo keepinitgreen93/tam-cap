@@ -5,7 +5,7 @@ import type { RequestPresigningArguments } from "@smithy/types";
 import { Config, Effect, Layer, Option } from "effect";
 
 import { AwsCredentials } from "../Aws.ts";
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { createCloudFrontSignedUrl } from "./cloudfront-signed-url.ts";
 import { createS3BucketAccess } from "./S3BucketAccess.ts";
 import { S3BucketClientProvider } from "./S3BucketClientProvider.ts";

@@ -1,4 +1,4 @@
-import type * as Db from "@cap/database/schema";
+import type * as Db from "@cap/database/cloudflare/schema";
 import {
 	CurrentUser,
 	Folder,
@@ -8,7 +8,7 @@ import {
 } from "@cap/web-domain";
 import { Effect, Option } from "effect";
 import { describe, expect, it, vi } from "vitest";
-import { Database } from "../../../../packages/web-backend/src/Database";
+import { CloudflareDatabase as Database } from "../../../../packages/web-backend/src/CloudflareDatabase";
 import { Folders } from "../../../../packages/web-backend/src/Folders";
 import { FoldersPolicy } from "../../../../packages/web-backend/src/Folders/FoldersPolicy";
 import { FoldersRepo } from "../../../../packages/web-backend/src/Folders/FoldersRepo";
@@ -47,7 +47,7 @@ function makeFixture() {
 			),
 		create,
 		delete: () => Effect.die("Unexpected folder delete"),
-		update: () => Effect.succeed(Option.none()),
+		update: () => Effect.succeed(undefined),
 	});
 	const policy = FoldersPolicy.make({
 		canCreateIn: () => Effect.void,

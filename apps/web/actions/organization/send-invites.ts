@@ -1,16 +1,18 @@
 "use server";
 
-import { db } from "@cap/database";
+import { normalizeEmail } from "@cap/database/auth/identity";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { sendEmail } from "@cap/database/emails/config";
-import { OrganizationInvite } from "@cap/database/emails/organization-invite";
-import { nanoId } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	organizationInvites,
 	organizationMembers,
 	organizations,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { sendEmail } from "@cap/database/emails/config";
+import { OrganizationInvite } from "@cap/database/emails/organization-invite";
+import { nanoId } from "@cap/database/helpers";
 import { serverEnv } from "@cap/env";
 import type { Organisation } from "@cap/web-domain";
 import { and, eq, inArray } from "drizzle-orm";
@@ -66,7 +68,12 @@ export async function sendOrganizationInvites(
 	for (const inviteInput of inviteInputs) {
 		const email =
 			typeof inviteInput === "string" ? inviteInput : inviteInput.email;
-		const normalizedEmail = email.trim().toLowerCase();
+		let normalizedEmail: string;
+		try {
+			normalizedEmail = normalizeEmail(email);
+		} catch {
+			continue;
+		}
 		if (!emailRegex.test(normalizedEmail)) continue;
 
 		const inviteRole =
@@ -115,10 +122,37 @@ export async function sendOrganizationInvites(
 		return { success: true, failedEmails, skippedEmails: [] as string[] };
 	}
 
-	const inviteRecords = await db().transaction(async (tx) => {
-		const [existingInvites, existingMembers] = await Promise.all([
-			tx
-				.select({ invitedEmail: organizationInvites.invitedEmail })
+	const proposed = validInvites.map((invite) => ({ ...invite, id: nanoId() }));
+	const database = db();
+	const inviteRecords = await atomic(database, async (snapshot) => {
+		const [currentOrganization] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(organizations)
+				.where(eq(organizations.id, organizationId))
+				.limit(1),
+		);
+		const [actor] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(organizationMembers)
+				.where(
+					and(
+						eq(organizationMembers.organizationId, organizationId),
+						eq(organizationMembers.userId, user.id),
+					),
+				)
+				.limit(1),
+		);
+		if (
+			!currentOrganization ||
+			currentOrganization.tombstoneAt ||
+			(currentOrganization.ownerId !== user.id && actor?.role !== "admin")
+		)
+			throw new Error("Only an organization manager can invite members.");
+		const existingInvites = await snapshot.read((reader) =>
+			reader
+				.select({ email: organizationInvites.invitedEmail })
 				.from(organizationInvites)
 				.where(
 					and(
@@ -126,7 +160,9 @@ export async function sendOrganizationInvites(
 						inArray(organizationInvites.invitedEmail, validEmails),
 					),
 				),
-			tx
+		);
+		const existingMembers = await snapshot.read((reader) =>
+			reader
 				.select({ email: users.email })
 				.from(organizationMembers)
 				.innerJoin(users, eq(organizationMembers.userId, users.id))
@@ -136,41 +172,27 @@ export async function sendOrganizationInvites(
 						inArray(users.email, validEmails),
 					),
 				),
-		]);
-
-		const existingInviteEmails = new Set(
-			existingInvites.map((i) => i.invitedEmail.toLowerCase()),
 		);
-
-		const existingMemberEmails = new Set(
-			existingMembers.map((m) => m.email.toLowerCase()),
+		const existing = new Set(
+			[...existingInvites, ...existingMembers].map((row) =>
+				normalizeEmail(row.email),
+			),
 		);
-
-		const invitesToSend = validInvites.filter(
-			(invite) =>
-				!existingInviteEmails.has(invite.email) &&
-				!existingMemberEmails.has(invite.email),
-		);
-
-		const records = invitesToSend.map((invite) => ({
-			id: nanoId(),
-			email: invite.email,
-			role: invite.role,
-		}));
-
-		if (records.length > 0) {
-			await tx.insert(organizationInvites).values(
-				records.map((r) => ({
-					id: r.id,
-					organizationId: organizationId,
-					invitedEmail: r.email,
-					invitedByUserId: user.id,
-					role: r.role,
-				})),
+		const records = proposed.filter((invite) => !existing.has(invite.email));
+		const statements: AtomicStatement[] = [];
+		for (let offset = 0; offset < records.length; offset += 10)
+			statements.push(
+				database.insert(organizationInvites).values(
+					records.slice(offset, offset + 10).map((record) => ({
+						id: record.id,
+						organizationId,
+						invitedEmail: record.email,
+						invitedByUserId: user.id,
+						role: record.role,
+					})),
+				),
 			);
-		}
-
-		return records;
+		return { statements, result: records };
 	});
 
 	const emailResults = await Promise.allSettled(

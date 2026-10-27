@@ -1,15 +1,21 @@
 "use server";
 
 import { randomUUID } from "node:crypto";
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videoEdits, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import {
+	videoEdits,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import type { VideoEditSpec } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { Storage } from "@cap/web-backend";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { revalidatePath } from "next/cache";
 import { start } from "workflow/api";
@@ -96,12 +102,15 @@ async function markEditProcessing({
 }): Promise<EditOperation> {
 	const startedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
 	const operation = { token: randomUUID(), startedAt: startedAt.toISOString() };
-	await db().transaction(async (tx) => {
-		const [current] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, video.id))
-			.for("update");
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(and(writableVideo, eq(videos.id, video.id))),
+		);
 		if (
 			!current ||
 			current.ownerId !== video.ownerId ||
@@ -111,11 +120,12 @@ async function markEditProcessing({
 		) {
 			throw new Error("Video changed before the edit could start");
 		}
-		const [upload] = await tx
-			.select()
-			.from(videoUploads)
-			.where(eq(videoUploads.videoId, video.id))
-			.for("update");
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, video.id)),
+		);
 		if (
 			legacyUpload &&
 			upload &&
@@ -125,15 +135,15 @@ async function markEditProcessing({
 			upload.updatedAt.getTime() === legacyUpload.updatedAt.getTime() &&
 			upload.phase === legacyUpload.phase
 		) {
-			await tx.delete(videoUploads).where(eq(videoUploads.videoId, video.id));
+			statements.push(
+				database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
+			);
 		} else if (upload || current.metadata?.editProcessing) {
 			throw new Error("Video is already uploading or processing");
 		}
-		const [currentEdit] = await tx
-			.select()
-			.from(videoEdits)
-			.where(eq(videoEdits.videoId, video.id))
-			.for("update");
+		const [currentEdit] = await snapshot.read((reader) =>
+			reader.select().from(videoEdits).where(eq(videoEdits.videoId, video.id)),
+		);
 		if (
 			!areEditSpecsEquivalent(
 				currentEdit?.editSpec ??
@@ -145,19 +155,21 @@ async function markEditProcessing({
 		) {
 			throw new Error("Video edits changed before this edit could start");
 		}
-		await tx.insert(videoUploads).values({
-			videoId: video.id,
-			uploaded: 0,
-			total: 0,
-			mode: "singlepart",
-			phase: "processing",
-			processingProgress: 0,
-			processingMessage: "Starting video edit...",
-			processingError: null,
-			rawFileKey: sourceKey,
-			startedAt,
-			updatedAt: startedAt,
-		});
+		statements.push(
+			database.insert(videoUploads).values({
+				videoId: video.id,
+				uploaded: 0,
+				total: 0,
+				mode: "singlepart",
+				phase: "processing",
+				processingProgress: 0,
+				processingMessage: "Starting video edit...",
+				processingError: null,
+				rawFileKey: sourceKey,
+				startedAt,
+				updatedAt: startedAt,
+			}),
+		);
 		const metadata = {
 			...(current.metadata ?? {}),
 			editProcessing: {
@@ -170,7 +182,13 @@ async function markEditProcessing({
 				dispatch: "pending" as const,
 			},
 		};
-		await tx.update(videos).set({ metadata }).where(eq(videos.id, video.id));
+		statements.push(
+			database
+				.update(videos)
+				.set({ metadata })
+				.where(and(writableVideo, eq(videos.id, video.id))),
+		);
+		return { statements, result: undefined };
 	});
 	return operation;
 }
@@ -186,7 +204,7 @@ async function loadEditableVideo(
 	const [video] = await db()
 		.select()
 		.from(videos)
-		.where(eq(videos.id, videoId));
+		.where(and(writableVideo, eq(videos.id, videoId)));
 
 	if (!video) throw new Error("Video not found");
 	if (video.ownerId !== user.id) throw new Error("Forbidden");

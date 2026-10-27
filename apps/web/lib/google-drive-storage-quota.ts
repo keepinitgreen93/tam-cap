@@ -1,13 +1,14 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { storageIntegrations } from "@cap/database/cloudflare/schema";
 import { decrypt } from "@cap/database/crypto";
-import { storageIntegrations } from "@cap/database/schema";
 import {
 	type GoogleDriveIntegrationConfig,
 	type GoogleDriveStorageQuota,
 	type GoogleDriveStorageQuotaCache,
 	getGoogleDriveStorageQuota,
 } from "@cap/web-backend";
-import { Storage } from "@cap/web-domain";
+import { activeIntegration } from "@cap/web-backend/src/Storage/persistence";
+import type { Storage } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import { runPromise } from "@/lib/server";
 
@@ -89,6 +90,7 @@ const saveQuotaCache = async (
 		.set({ googleDriveStorageQuotaCache: storageQuotaCache })
 		.where(
 			and(
+				activeIntegration,
 				eq(storageIntegrations.id, integrationId),
 				eq(storageIntegrations.provider, googleDriveProvider),
 				eq(storageIntegrations.status, "active"),
@@ -131,23 +133,4 @@ export const getCachedGoogleDriveStorageQuota = async (
 	}
 };
 
-export const invalidateGoogleDriveStorageQuotaCache = async (
-	integrationId: string | null | undefined,
-) => {
-	if (!integrationId) return;
-	const storageIntegrationId = Storage.StorageIntegrationId.make(integrationId);
-
-	try {
-		await db()
-			.update(storageIntegrations)
-			.set({ googleDriveStorageQuotaCache: null })
-			.where(
-				and(
-					eq(storageIntegrations.id, storageIntegrationId),
-					eq(storageIntegrations.provider, googleDriveProvider),
-				),
-			);
-	} catch (error) {
-		console.error("Failed to invalidate Google Drive storage quota:", error);
-	}
-};
+export { invalidateGoogleDriveStorageQuotaCache } from "./google-drive-storage-quota-cache";

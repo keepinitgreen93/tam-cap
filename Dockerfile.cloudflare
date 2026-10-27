@@ -1,0 +1,57 @@
+ARG CAP_TARGET=web
+FROM oven/bun:1.4.4 AS bun
+
+FROM node:24.22.1-bookworm-slim AS web-build
+WORKDIR /app
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
+COPY . .
+RUN --mount=type=cache,id=cap-bun-1.4.4,target=/root/.bun/install/cache bun install --frozen-lockfile
+RUN bun build packages/workflow-cloudflare/index.mjs --target=node --format=esm --outfile=/app/workflow-cloudflare/index.mjs
+ARG NEXT_PUBLIC_WEB_URL=https://videos.trulyauthenticmarketing.com
+ENV NEXT_PUBLIC_WEB_URL=$NEXT_PUBLIC_WEB_URL
+ENV NEXT_PUBLIC_DOCKER_BUILD=true
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV WORKFLOW_TARGET_WORLD=@cap/workflow-cloudflare
+RUN --mount=type=cache,id=cap-next,target=/app/apps/web/.next/cache bun run build:web
+
+FROM node:24.22.1-bookworm-slim AS web
+WORKDIR /app
+ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV CAP_RUNTIME=cloudflare
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+COPY --from=web-build --chown=node:node /app/apps/web/.next/standalone ./
+COPY --from=web-build --chown=node:node /app/apps/web/.next/static ./apps/web/.next/static
+COPY --from=web-build --chown=node:node /app/apps/web/public ./apps/web/public
+COPY --from=web-build --chown=node:node /app/packages/workflow-cloudflare ./node_modules/@cap/workflow-cloudflare
+COPY --from=web-build --chown=node:node /app/workflow-cloudflare/index.mjs ./node_modules/@cap/workflow-cloudflare/index.mjs
+USER node
+EXPOSE 3000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 CMD ["node", "-e", "fetch('http://127.0.0.1:3000/login', {redirect:'manual'}).then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))"]
+CMD ["node", "apps/web/server.js"]
+
+FROM oven/bun:1.4.4 AS media-build
+WORKDIR /app
+COPY apps/media-server/package.json apps/media-server/bun.lock ./
+RUN --mount=type=cache,id=cap-media-bun-1.4.4,target=/root/.bun/install/cache bun install --frozen-lockfile --production
+
+FROM oven/bun:1.4.4 AS media
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=media-build --chown=bun:bun /app/node_modules ./node_modules
+COPY --chown=bun:bun apps/media-server/package.json ./package.json
+COPY --chown=bun:bun apps/media-server/src ./src
+COPY --chown=bun:bun apps/media-server/capcodec.md ./capcodec.md
+ENV NODE_ENV=production
+ENV PORT=3456
+ENV MEDIA_SERVER_MAX_CONCURRENT_VIDEO_PROCESSES=1
+ENV MEDIA_SERVER_MAX_CONCURRENT_DIRECT_CONVERSIONS=1
+ENV MEDIA_SERVER_IDLE_TIMEOUT_SECONDS=255
+ENV MEDIA_SERVER_SHUTDOWN_GRACE_MS=30000
+USER bun
+EXPOSE 3456
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 CMD ["bun", "-e", "fetch('http://127.0.0.1:3456/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+CMD ["bun", "run", "src/index.ts"]
+
+FROM ${CAP_TARGET} AS runtime

@@ -1,173 +1,210 @@
-import { MySqlDialect } from "drizzle-orm/mysql-core";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { Video } from "@cap/web-domain";
+import { eq } from "drizzle-orm";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
-const updateWhereMock = vi.fn();
-const selectWhereMock = vi.fn();
-const startMock = vi.fn();
-
-const dbMock = vi.fn(() => ({
-	update: vi.fn(() => ({
-		set: vi.fn(() => ({
-			where: updateWhereMock,
-		})),
-	})),
-	select: vi.fn(() => ({
-		from: vi.fn(() => ({
-			where: selectWhereMock,
-		})),
-	})),
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+const mocks = vi.hoisted(() => ({
+	start: vi.fn(),
+	queue: vi.fn(),
+	getRun: vi.fn(),
 }));
-
-vi.mock("@cap/database", () => ({
-	db: dbMock,
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => fixture.database,
 }));
-
-vi.mock("server-only", () => ({}));
-
-vi.mock("workflow/api", () => ({
-	start: startMock,
+vi.mock("workflow/api", () => ({ start: mocks.start, getRun: mocks.getRun }));
+vi.mock("workflow/runtime", () => ({
+	getWorld: () => ({ queue: mocks.queue }),
 }));
-
 vi.mock("@/workflows/process-video", () => ({
 	processVideoWorkflow: Symbol("processVideoWorkflow"),
 }));
 
-describe("video processing starts", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
-	});
+import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 
+beforeAll(async () => {
+	fixture = await createTestDatabase();
+});
+afterAll(async () => fixture.dispose());
+beforeEach(() => {
+	mocks.queue.mockReset().mockResolvedValue({ messageId: "queue-message" });
+	mocks.getRun.mockReset().mockReturnValue({
+		exists: Promise.resolve(true),
+		status: Promise.resolve("pending"),
+	});
+	mocks.start.mockReset().mockImplementation(
+		async (
+			_workflow: unknown,
+			_payload: unknown,
+			options: {
+				world: {
+					queue: (
+						name: string,
+						message: { runId: string },
+						options: { deploymentId: string },
+					) => Promise<unknown>;
+				};
+			},
+		) => {
+			await options.world.queue(
+				"__wkf_workflow_process",
+				{ runId: "wrun_test" },
+				{ deploymentId: "deployment-test" },
+			);
+			return { runId: "wrun_test" };
+		},
+	);
+});
+async function input(
+	phase:
+		| "uploading"
+		| "processing"
+		| "generating_thumbnail"
+		| "complete" = "uploading",
+) {
+	const owner = await createTestOwner(fixture.database);
+	const videoId = Video.VideoId.make(nanoId());
+	const rawFileKey = `${owner.id}/${videoId}/raw-upload.webm`;
+	await fixture.database.batch([
+		fixture.database.insert(videos).values({
+			id: videoId,
+			ownerId: owner.id,
+			orgId: owner.activeOrganizationId,
+			source: { type: "webMP4" },
+		}),
+		fixture.database
+			.insert(videoUploads)
+			.values({ videoId, phase, mode: "multipart", rawFileKey }),
+	]);
+	return {
+		videoId,
+		userId: owner.id,
+		rawFileKey,
+		bucketId: null,
+		processingMessage: "Starting video processing...",
+		startFailureMessage: "Video processing could not start.",
+		mode: "multipart" as const,
+	};
+}
+
+describe("D1 video processing dispatch", () => {
 	it.each([
 		["processing", "already-processing"],
 		["generating_thumbnail", "already-processing"],
 		["complete", "already-complete"],
-	])("does not start a duplicate workflow during %s", async (phase, status) => {
-		updateWhereMock.mockResolvedValueOnce({ affectedRows: 0 });
-		selectWhereMock.mockResolvedValueOnce([
-			{
-				videoId: "video-123",
-				phase,
-				rawFileKey: "user-123/video-123/raw-upload.webm",
-			},
-		]);
-
-		const { startVideoProcessingWorkflow } = await import(
-			"@/lib/video-processing"
+	] as const)(
+		"does not duplicate workflows during %s",
+		async (phase, status) => {
+			expect(await startVideoProcessingWorkflow(await input(phase))).toBe(
+				status,
+			);
+			expect(mocks.start).not.toHaveBeenCalled();
+		},
+	);
+	it("starts after atomically claiming upload and stores the workflow receipt", async () => {
+		const value = await input();
+		expect(await startVideoProcessingWorkflow(value)).toBe("started");
+		const [video] = await fixture.database
+			.select()
+			.from(videos)
+			.where(eq(videos.id, value.videoId));
+		expect(video?.metadata?.processingRun).toMatchObject({
+			dispatch: "accepted",
+			workflowRunId: "wrun_test",
+			workflowQueue: "__wkf_workflow_process",
+			rawFileKey: value.rawFileKey,
+		});
+		expect(mocks.start.mock.calls[0]?.[1]?.[0]?.processingToken).toBe(
+			video?.metadata?.processingRun?.token,
 		);
-
-		await expect(
-			startVideoProcessingWorkflow({
-				videoId: "video-123" as never,
-				userId: "user-123",
-				rawFileKey: "user-123/video-123/raw-upload.webm",
-				bucketId: null,
-				processingMessage: "Starting video processing...",
-				startFailureMessage: "Video processing could not start.",
-			}),
-		).resolves.toBe(status);
-
-		expect(startMock).not.toHaveBeenCalled();
-		const condition = updateWhereMock.mock.calls[0]?.[0];
-		const query = new MySqlDialect().sqlToQuery(condition);
-		expect(query.params).toContain(phase);
-		expect(query.sql).toContain("`video_uploads`.`phase` <> ?");
 	});
-
-	it("starts the workflow after claiming the upload row", async () => {
-		updateWhereMock.mockResolvedValueOnce({ affectedRows: 1 });
-		startMock.mockResolvedValueOnce(undefined);
-
-		const { startVideoProcessingWorkflow } = await import(
-			"@/lib/video-processing"
+	it("retains uncertain dispatch and requeues the same durable run after a missing acknowledgement", async () => {
+		const value = await input();
+		mocks.queue.mockRejectedValueOnce(new Error("response lost"));
+		await expect(startVideoProcessingWorkflow(value)).rejects.toThrow(
+			"Video processing could not start",
 		);
-
-		await expect(
-			startVideoProcessingWorkflow({
-				videoId: "video-123" as never,
-				userId: "user-123",
-				rawFileKey: "user-123/video-123/raw-upload.webm",
-				bucketId: null,
-				processingMessage: "Starting video processing...",
-				startFailureMessage: "Video processing could not start.",
-				mode: "multipart",
-			}),
-		).resolves.toBe("started");
-
-		expect(startMock).toHaveBeenCalledTimes(1);
+		const [video] = await fixture.database
+			.select()
+			.from(videos)
+			.where(eq(videos.id, value.videoId));
+		const run = video?.metadata?.processingRun;
+		if (!video || !run) throw new Error("Missing receipt");
+		expect(run.dispatch).toBe("uncertain");
+		await fixture.database
+			.update(videos)
+			.set({
+				metadata: {
+					...video.metadata,
+					processingRun: { ...run, dispatchStartedAt: Date.now() - 31000 },
+				},
+			})
+			.where(eq(videos.id, value.videoId));
+		expect(await startVideoProcessingWorkflow(value)).toBe("started");
+		expect(mocks.start).toHaveBeenCalledTimes(1);
+		expect(mocks.queue).toHaveBeenLastCalledWith(
+			"__wkf_workflow_process",
+			{ runId: "wrun_test" },
+			{ deploymentId: "deployment-test" },
+		);
 	});
-
-	it("starts the workflow when mysql returns affectedRows in the first tuple slot", async () => {
-		updateWhereMock.mockResolvedValueOnce([{ affectedRows: 1 }]);
-		startMock.mockResolvedValueOnce(undefined);
-
-		const { startVideoProcessingWorkflow } = await import(
-			"@/lib/video-processing"
+	it("does not reset a claimed upload to error after an ambiguous start", async () => {
+		const value = await input();
+		mocks.queue.mockRejectedValueOnce(new Error("response lost"));
+		await expect(startVideoProcessingWorkflow(value)).rejects.toThrow();
+		expect(
+			(
+				await fixture.database
+					.select()
+					.from(videoUploads)
+					.where(eq(videoUploads.videoId, value.videoId))
+			)[0]?.phase,
+		).toBe("processing");
+		expect(await startVideoProcessingWorkflow(value)).toBe(
+			"already-processing",
 		);
-
-		await expect(
-			startVideoProcessingWorkflow({
-				videoId: "video-123" as never,
-				userId: "user-123",
-				rawFileKey: "user-123/video-123/raw-upload.webm",
-				bucketId: null,
-				processingMessage: "Starting video processing...",
-				startFailureMessage: "Video processing could not start.",
-				mode: "multipart",
-			}),
-		).resolves.toBe("started");
-
-		expect(startMock).toHaveBeenCalledTimes(1);
 	});
-
-	it("force restarts a stale processing row", async () => {
-		updateWhereMock.mockResolvedValueOnce({ affectedRows: 1 });
-		startMock.mockResolvedValueOnce(undefined);
-
-		const { startVideoProcessingWorkflow } = await import(
-			"@/lib/video-processing"
-		);
-
-		await expect(
-			startVideoProcessingWorkflow({
-				videoId: "video-123" as never,
-				userId: "user-123",
-				rawFileKey: "user-123/video-123/raw-upload.webm",
-				bucketId: null,
-				processingMessage: "Retrying video processing...",
-				startFailureMessage: "Video processing could not restart.",
+	it("requires the observed upload revision before a forced restart", async () => {
+		const value = await input();
+		await startVideoProcessingWorkflow(value);
+		const [upload] = await fixture.database
+			.select()
+			.from(videoUploads)
+			.where(eq(videoUploads.videoId, value.videoId));
+		if (!upload) throw new Error("Missing upload");
+		const [video] = await fixture.database
+			.select()
+			.from(videos)
+			.where(eq(videos.id, value.videoId));
+		const expectedProcessingToken =
+			video?.metadata?.processingRun?.token ?? null;
+		expect(
+			await startVideoProcessingWorkflow({
+				...value,
 				forceRestart: true,
+				expectedUpdatedAt: new Date(0),
+				expectedProcessingToken,
 			}),
-		).resolves.toBe("started");
-
-		expect(startMock).toHaveBeenCalledTimes(1);
-		const condition = updateWhereMock.mock.calls[0]?.[0];
-		expect(new MySqlDialect().sqlToQuery(condition).params).toEqual([
-			"video-123",
-		]);
-	});
-
-	it("marks the upload as errored when workflow start fails", async () => {
-		updateWhereMock
-			.mockResolvedValueOnce({ affectedRows: 1 })
-			.mockResolvedValueOnce({ affectedRows: 1 });
-		startMock.mockRejectedValueOnce(new Error("temporary failure"));
-
-		const { startVideoProcessingWorkflow } = await import(
-			"@/lib/video-processing"
-		);
-
-		await expect(
-			startVideoProcessingWorkflow({
-				videoId: "video-123" as never,
-				userId: "user-123",
-				rawFileKey: "user-123/video-123/raw-upload.webm",
-				bucketId: null,
-				processingMessage: "Starting video processing...",
-				startFailureMessage: "Video processing could not start.",
+		).toBe("already-processing");
+		expect(
+			await startVideoProcessingWorkflow({
+				...value,
+				forceRestart: true,
+				expectedUpdatedAt: upload.updatedAt,
+				expectedProcessingToken,
 			}),
-		).rejects.toThrow("temporary failure");
-
-		expect(startMock).toHaveBeenCalledTimes(1);
-		expect(updateWhereMock).toHaveBeenCalledTimes(2);
+		).toBe("started");
+		expect(mocks.start).toHaveBeenCalledTimes(2);
 	});
 });

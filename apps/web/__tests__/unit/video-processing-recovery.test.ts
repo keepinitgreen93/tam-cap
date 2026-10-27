@@ -7,11 +7,11 @@ const mockSetVideoProcessingError = vi.fn();
 const mockGetLoomImportRunState = vi.fn();
 const mockStartLoomImportWorkflow = vi.fn();
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: mockDb,
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	importedVideos: {
 		id: "importedVideos.id",
 		orgId: "importedVideos.orgId",
@@ -58,6 +58,7 @@ vi.mock("workflow/api", () => ({
 
 vi.mock("@/lib/video-processing", () => ({
 	setVideoProcessingError: mockSetVideoProcessingError,
+	startVideoProcessingWorkflow: mockStart,
 }));
 
 vi.mock("@/lib/loom-import-start", () => ({
@@ -119,7 +120,7 @@ function makeUpdateChain(affectedRows: number) {
 	};
 	chain.update.mockReturnValue(chain);
 	chain.set.mockReturnValue(chain);
-	chain.where.mockResolvedValue([{ affectedRows }]);
+	chain.where.mockResolvedValue({ meta: { changes: affectedRows } });
 	return chain;
 }
 
@@ -133,7 +134,7 @@ const candidate: Candidate = {
 
 beforeEach(() => {
 	vi.resetAllMocks();
-	mockStart.mockResolvedValue({ runId: "run-1" });
+	mockStart.mockResolvedValue("started");
 	mockSetVideoProcessingError.mockResolvedValue(undefined);
 	mockGetLoomImportRunState.mockResolvedValue("inactive");
 	mockStartLoomImportWorkflow.mockResolvedValue(undefined);
@@ -226,7 +227,7 @@ describe("recoverFailedVideoProcessing", () => {
 						)?.right;
 						const row = [...holds, pending].find((row) => row.videoId === id);
 						if (row && values.updatedAt) row.uploadUpdatedAt = values.updatedAt;
-						return [{ affectedRows: 1 }];
+						return { meta: { changes: 1 } };
 					},
 				}),
 			}),
@@ -317,9 +318,10 @@ describe("recoverFailedVideoProcessing", () => {
 			"@/lib/video-processing-recovery"
 		);
 
+		mockStart.mockResolvedValueOnce("already-processing");
 		const result = await recoverFailedVideoProcessing();
 
-		expect(mockStart).not.toHaveBeenCalled();
+		expect(mockStart).toHaveBeenCalledOnce();
 		expect(result.statuses).toEqual({ "already-claimed": 1 });
 	});
 
@@ -337,11 +339,11 @@ describe("recoverFailedVideoProcessing", () => {
 
 		const result = await recoverFailedVideoProcessing();
 
-		expect(mockSetVideoProcessingError).toHaveBeenCalledWith(
-			"video-1",
-			"Processing recovery will retry automatically",
+		expect(mockSetVideoProcessingError).not.toHaveBeenCalled();
+		expect(mockStart).toHaveBeenCalledWith(
 			expect.objectContaining({
-				message: expect.stringContaining("temporary failure"),
+				startFailureMessage: "Processing recovery will retry automatically",
+				forceRestart: true,
 			}),
 		);
 		expect(result.statuses).toEqual({ "retry-scheduled": 1 });

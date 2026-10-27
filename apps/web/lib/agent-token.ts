@@ -1,8 +1,9 @@
+import { atomic } from "@cap/database/cloudflare/atomic";
 import "server-only";
 
+import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
-import { Database } from "@cap/web-backend";
+import { CloudflareDatabase as Database } from "@cap/web-backend";
 import { Agent } from "@cap/web-domain";
 import { and, eq, gt, isNull } from "drizzle-orm";
 import { Effect } from "effect";
@@ -14,14 +15,8 @@ import {
 	verifyAgentCodeChallenge,
 } from "./agent-auth";
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
+const getAffectedRows = (result: { meta: { changes: number } }) =>
+	result.meta.changes;
 
 const commonError = (requestId: string, message: string) => ({
 	message,
@@ -59,58 +54,66 @@ export const exchangeAgentAuthorizationCode = Effect.fn(
 
 	const database = yield* Database;
 	const now = new Date();
+	const accessToken = createAgentAccessToken();
+	const keyId = nanoId();
+	type ExchangeResult =
+		| { state: "invalid" }
+		| { state: "expired" }
+		| {
+				state: "issued";
+				accessToken: string;
+				expiresAt: Date;
+				scopes: typeof Db.agentApiKeys.$inferSelect.scopes;
+		  };
 	const result = yield* database.use((db) =>
-		db.transaction(async (tx) => {
-			const [grant] = await tx
-				.select()
-				.from(Db.agentApiAuthorizationCodes)
-				.where(
-					eq(
-						Db.agentApiAuthorizationCodes.codeHash,
-						hashAgentSecret(payload.code),
-					),
-				)
-				.limit(1);
-			if (!grant || grant.redirectUri !== payload.redirectUri) {
-				return { state: "invalid" as const };
-			}
-			if (grant.consumedAt || grant.expiresAt.getTime() <= now.getTime()) {
-				return { state: "expired" as const };
-			}
+		atomic<ExchangeResult>(db, async (snapshot) => {
+			const [grant] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(Db.agentApiAuthorizationCodes)
+					.where(
+						eq(
+							Db.agentApiAuthorizationCodes.codeHash,
+							hashAgentSecret(payload.code),
+						),
+					)
+					.limit(1),
+			);
 			if (
+				!grant ||
+				grant.redirectUri !== payload.redirectUri ||
 				!verifyAgentCodeChallenge(payload.codeVerifier, grant.codeChallenge)
-			) {
-				return { state: "invalid" as const };
-			}
-
-			const consumed = await tx
-				.update(Db.agentApiAuthorizationCodes)
-				.set({ consumedAt: now })
-				.where(
-					and(
-						eq(Db.agentApiAuthorizationCodes.id, grant.id),
-						isNull(Db.agentApiAuthorizationCodes.consumedAt),
-						gt(Db.agentApiAuthorizationCodes.expiresAt, now),
-					),
-				);
-			if (getAffectedRows(consumed) !== 1) {
-				return { state: "expired" as const };
-			}
-
-			const accessToken = createAgentAccessToken();
+			)
+				return { statements: [], result: { state: "invalid" } };
+			if (grant.consumedAt || grant.expiresAt <= now)
+				return { statements: [], result: { state: "expired" } };
 			const expiresAt = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
-			await tx.insert(Db.agentApiKeys).values({
-				id: nanoId(),
-				userId: grant.userId,
-				tokenHash: hashAgentSecret(accessToken),
-				scopes: grant.scopes,
-				expiresAt,
-			});
 			return {
-				state: "issued" as const,
-				accessToken,
-				expiresAt,
-				scopes: grant.scopes,
+				statements: [
+					db
+						.update(Db.agentApiAuthorizationCodes)
+						.set({ consumedAt: now })
+						.where(
+							and(
+								eq(Db.agentApiAuthorizationCodes.id, grant.id),
+								isNull(Db.agentApiAuthorizationCodes.consumedAt),
+								gt(Db.agentApiAuthorizationCodes.expiresAt, now),
+							),
+						),
+					db.insert(Db.agentApiKeys).values({
+						id: keyId,
+						userId: grant.userId,
+						tokenHash: hashAgentSecret(accessToken),
+						scopes: grant.scopes,
+						expiresAt,
+					}),
+				],
+				result: {
+					state: "issued",
+					accessToken,
+					expiresAt,
+					scopes: grant.scopes,
+				},
 			};
 		}),
 	);

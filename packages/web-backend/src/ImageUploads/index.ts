@@ -1,7 +1,11 @@
+import { randomUUID } from "node:crypto";
 import { ImageUpload } from "@cap/web-domain";
 import { Effect, Option } from "effect";
 
-import { Database, type DbClient } from "../Database";
+import {
+	CloudflareDatabase as Database,
+	type CloudflareDbClient as DbClient,
+} from "../CloudflareDatabase";
 import { S3Buckets } from "../S3Buckets";
 
 export class ImageUploads extends Effect.Service<ImageUploads>()(
@@ -27,7 +31,7 @@ export class ImageUploads extends Effect.Service<ImageUploads>()(
 						onSome: Effect.fn(function* (image) {
 							const fileExtension = image.fileName.split(".").pop() || "jpg";
 							const s3Key = ImageUpload.ImageKey.make(
-								`${args.keyPrefix}/${Date.now()}.${fileExtension}`,
+								`${args.keyPrefix}/${randomUUID()}.${fileExtension}`,
 							);
 
 							yield* s3.putObject(s3Key, image.data, {

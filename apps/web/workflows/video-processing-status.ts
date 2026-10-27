@@ -1,8 +1,9 @@
-import { db } from "@cap/database";
-import { videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
 import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { FatalError, sleep } from "workflow";
+import { matchesProcessingRun } from "@/lib/video-processing-state";
 
 export interface ProcessedVideoMetadata {
 	duration: number;
@@ -25,8 +26,57 @@ function isPositiveNumber(value: number | null): value is number {
 
 export async function readVideoProcessingStatus(
 	videoId: string,
+	processingToken?: string,
+	attemptId?: string,
 ): Promise<ProcessingStatus> {
 	"use step";
+	if (processingToken) {
+		const [video] = await db()
+			.select()
+			.from(videos)
+			.where(eq(videos.id, Video.VideoId.make(videoId)));
+		if (!video || !matchesProcessingRun(video, processingToken, attemptId))
+			return {
+				status: "error",
+				message: "Video processing run was superseded",
+			};
+		const run = video.metadata?.processingRun;
+		if (run?.state === "complete") {
+			if (
+				!isPositiveNumber(video.width) ||
+				!isPositiveNumber(video.height) ||
+				!isPositiveNumber(video.fps)
+			)
+				return {
+					status: "error",
+					message: "Processing completed but video metadata is missing",
+				};
+			return {
+				status: "complete",
+				metadata: {
+					duration: video.duration ?? 0,
+					width: video.width,
+					height: video.height,
+					fps: video.fps,
+				},
+			};
+		}
+		if (run?.state === "error")
+			return {
+				status: "failed",
+				message: run.error ?? "Video processing failed",
+			};
+		const [pendingUpload] = await db()
+			.select()
+			.from(videoUploads)
+			.where(eq(videoUploads.videoId, Video.VideoId.make(videoId)));
+		return pendingUpload
+			? {
+					status: "pending",
+					message: pendingUpload.processingMessage ?? "Video processing",
+				}
+			: { status: "error", message: "Processing upload record is missing" };
+	}
 
 	const [upload] = await db()
 		.select({
@@ -94,11 +144,17 @@ export async function readVideoProcessingStatus(
 
 export async function waitForVideoProcessing(
 	videoId: string,
+	processingToken?: string,
+	attemptId?: string,
 ): Promise<ProcessedVideoMetadata> {
 	const deadline = Date.now() + 60 * 60 * 1000;
 	let lastStatus = "processing";
 	for (let attempt = 0; Date.now() < deadline; attempt++) {
-		const result = await readVideoProcessingStatus(videoId);
+		const result = await readVideoProcessingStatus(
+			videoId,
+			processingToken,
+			attemptId,
+		);
 		if (result.status === "complete") return result.metadata;
 		if (result.status === "failed") {
 			throw new VideoProcessingFailedError(result.message);

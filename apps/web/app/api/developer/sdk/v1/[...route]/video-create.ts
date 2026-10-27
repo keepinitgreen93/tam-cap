@@ -1,9 +1,14 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import {
+	developerApps,
+	developerCreditAccounts,
+	developerVideos,
+} from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import { developerCreditAccounts, developerVideos } from "@cap/database/schema";
 import { buildEnv } from "@cap/env";
 import { zValidator } from "@hono/zod-validator";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import { withDeveloperPublicAuth } from "../../../../utils";
@@ -37,31 +42,60 @@ app.post(
 		const appId = c.get("developerAppId");
 		const body = c.req.valid("json");
 
-		const [account] = await db()
-			.select({
-				balanceMicroCredits: developerCreditAccounts.balanceMicroCredits,
-			})
-			.from(developerCreditAccounts)
-			.where(eq(developerCreditAccounts.appId, appId))
-			.limit(1);
-
-		if (!account || account.balanceMicroCredits < MIN_BALANCE_MICRO_CREDITS) {
-			return c.json({ error: "Insufficient credits" }, 402);
-		}
-
 		const videoId = nanoId();
 		const s3Key = `developer/${appId}/${videoId}/video`;
-
-		await db()
-			.insert(developerVideos)
-			.values({
-				id: videoId,
-				appId,
-				externalUserId: body.userId,
-				name: body.name ?? "Untitled",
-				s3Key,
-				metadata: body.metadata,
-			});
+		const database = db();
+		const created = await atomic(database, async (snapshot) => {
+			const [activeApp] = await snapshot.read((reader) =>
+				reader
+					.select({ id: developerApps.id })
+					.from(developerApps)
+					.where(
+						and(eq(developerApps.id, appId), isNull(developerApps.deletedAt)),
+					)
+					.limit(1),
+			);
+			if (!activeApp) return { statements: [], result: false };
+			const [account] = await snapshot.read((reader) =>
+				reader
+					.select({
+						balanceMicroCredits: developerCreditAccounts.balanceMicroCredits,
+					})
+					.from(developerCreditAccounts)
+					.where(eq(developerCreditAccounts.appId, appId))
+					.limit(1),
+			);
+			if (
+				buildEnv.NEXT_PUBLIC_IS_CAP === "true" &&
+				(!account || account.balanceMicroCredits < MIN_BALANCE_MICRO_CREDITS)
+			)
+				return { statements: [], result: false };
+			return {
+				statements: [
+					database
+						.insert(developerVideos)
+						.values({
+							id: videoId,
+							appId,
+							externalUserId: body.userId,
+							name: body.name ?? "Untitled",
+							s3Key,
+							metadata: body.metadata,
+						}),
+				],
+				result: true,
+			};
+		});
+		if (!created)
+			return c.json(
+				{
+					error:
+						buildEnv.NEXT_PUBLIC_IS_CAP === "true"
+							? "Insufficient credits"
+							: "App unavailable",
+				},
+				buildEnv.NEXT_PUBLIC_IS_CAP === "true" ? 402 : 404,
+			);
 
 		const webUrl = buildEnv.NEXT_PUBLIC_WEB_URL;
 

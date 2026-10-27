@@ -1,16 +1,19 @@
 import crypto from "node:crypto";
 import { authOptions } from "@cap/database/auth/auth-options";
-import { isEmailAllowedForSignup } from "@cap/database/auth/domain-utils";
+import { cloudflareAccessPolicy, normalizeEmail } from "@cap/database/auth/identity";
+import { db as cloudflareDb } from "@cap/database/cloudflare/application";
+import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
+import { canSignInCloudflare } from "@cap/database/cloudflare/team";
 import { hashPassword } from "@cap/database/crypto";
 import { getEmailDeliveryStatus, sendEmail } from "@cap/database/emails/config";
 import { OTPEmail } from "@cap/database/emails/otp-email";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
 import { buildEnv, serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
-	Database,
+	CloudflareDatabase,
 	findScreenshotObjectKey,
 	getCurrentUser,
 	ImageUploads,
@@ -70,6 +73,7 @@ import { createNotification } from "@/lib/Notification";
 import { isRateLimited, RATE_LIMIT_IDS } from "@/lib/rate-limit";
 import { apiToHandler } from "@/lib/server";
 import { enqueueVideoStorageNameSync } from "@/lib/sync-video-storage-names";
+import { getTranscriptObjectKey } from "@/lib/transcript-publication";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { importLoomVideoWorkflow } from "@/workflows/import-loom-video";
 
@@ -126,6 +130,30 @@ type MobileOrganizationIconInput =
 type MobileProfileInput = (typeof Mobile.MobileProfileInput)["Type"];
 type MobileProfileImageInput = (typeof Mobile.MobileProfileImageInput)["Type"];
 
+const getNewVideoPublic = async (
+	organizationId: Organisation.OrganisationId,
+	snapshot?: AtomicSnapshot,
+) => {
+	const read = (reader: Pick<ReturnType<typeof cloudflareDb>, "select">) =>
+		reader
+			.select({
+				visibility: Db.organizations.defaultVideoVisibility,
+				tombstoneAt: Db.organizations.tombstoneAt,
+			})
+			.from(Db.organizations)
+			.where(eq(Db.organizations.id, organizationId))
+			.limit(1);
+	const [organization] = snapshot
+		? await snapshot.read(read)
+		: await read(cloudflareDb());
+	if (!organization || organization.tombstoneAt)
+		throw new Error("Organization unavailable");
+	return (
+		organization.visibility !== "private" &&
+		serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC
+	);
+};
+
 const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const emailCodePattern = /^\d{6}$/;
 const emailCodeTtlMs = 10 * 60 * 1000;
@@ -136,20 +164,11 @@ const domainPattern =
 
 const toIsoString = (value: Date) => value.toISOString();
 
-const normalizeEmail = (email: string) => email.trim().toLowerCase();
-
 const getMobileEmailVerificationIdentifier = (email: string) =>
 	`mobile:${crypto.createHash("sha256").update(email).digest("hex")}`;
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
+const getAffectedRows = (result: { meta: { changes: number } }) =>
+	result.meta.changes;
 
 const hashEmailCode = (code: string) =>
 	crypto
@@ -423,21 +442,9 @@ const ensureEmailSignInAllowed = Effect.fn("Mobile.ensureEmailSignInAllowed")(
 			return yield* Effect.fail(new HttpApiError.BadRequest());
 		}
 
-		const allowedDomains = serverEnv().CAP_ALLOWED_SIGNUP_DOMAINS;
-		if (!allowedDomains) return;
-
-		const database = yield* Database;
-		const [existingUser] = yield* database.use((db) =>
-			db
-				.select({ id: Db.users.id })
-				.from(Db.users)
-				.where(eq(Db.users.email, email))
-				.limit(1),
-		);
-
-		if (!existingUser && !isEmailAllowedForSignup(email, allowedDomains)) {
-			return yield* Effect.fail(new HttpApiError.Forbidden());
-		}
+		const database = yield* CloudflareDatabase;
+		const allowed = yield* database.use((db) => canSignInCloudflare(db, email, cloudflareAccessPolicy()));
+		if (!allowed) return yield* Effect.fail(new HttpApiError.Forbidden());
 	},
 );
 
@@ -457,23 +464,32 @@ const createMobileApiKey = Effect.fn("Mobile.createMobileApiKey")(function* (
 	userId: User.UserId,
 ) {
 	yield* ensureAccountDeletionNotPending({ userId });
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const apiKey = crypto.randomUUID();
 	yield* database.use((db) =>
-		db.transaction(async (tx) => {
-			await tx
-				.delete(Db.authApiKeys)
-				.where(
-					and(
-						eq(Db.authApiKeys.userId, userId),
-						eq(Db.authApiKeys.source, "mobile"),
+		atomic(db, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+const [account] = await snapshot.read((reader)=>reader.select({id:Db.users.id}).from(Db.users).where(eq(Db.users.id,userId)).limit(1));
+if(!account)throw new Error("Mobile account no longer exists");
+			statements.push(
+				db
+					.delete(Db.authApiKeys)
+					.where(
+						and(
+							eq(Db.authApiKeys.userId, userId),
+							eq(Db.authApiKeys.source, "mobile"),
+						),
 					),
-				);
-			await tx.insert(Db.authApiKeys).values({
-				id: apiKey,
-				userId,
-				source: "mobile",
-			});
+			);
+			statements.push(
+				db.insert(Db.authApiKeys).values({
+					id: apiKey,
+					userId,
+					source: "mobile",
+				}),
+			);
+
+			return { statements, result: undefined };
 		}),
 	);
 
@@ -488,7 +504,10 @@ const requestEmailSession = Effect.fn("Mobile.requestEmailSession")(function* (
 	rawEmail: string,
 	headers: Headers,
 ) {
-	const email = normalizeEmail(rawEmail);
+	const email = yield* Effect.try({
+		try: () => normalizeEmail(rawEmail),
+		catch: () => new HttpApiError.BadRequest(),
+	});
 	yield* ensureEmailSignInAllowed(email);
 	yield* ensureAccountDeletionNotPending({ email });
 
@@ -500,29 +519,16 @@ const requestEmailSession = Effect.fn("Mobile.requestEmailSession")(function* (
 	const token = hashEmailCode(code);
 	const expires = new Date(Date.now() + emailCodeTtlMs);
 	const identifier = getMobileEmailVerificationIdentifier(email);
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 
-	yield* database.use(async (db) => {
-		const [existingToken] = await db
-			.select({ identifier: Db.verificationTokens.identifier })
-			.from(Db.verificationTokens)
-			.where(eq(Db.verificationTokens.identifier, identifier))
-			.limit(1);
-
-		if (existingToken) {
-			await db
-				.update(Db.verificationTokens)
-				.set({ token, expires })
-				.where(eq(Db.verificationTokens.identifier, identifier));
-			return;
-		}
-
-		await db.insert(Db.verificationTokens).values({
-			identifier,
-			token,
-			expires,
-		});
-	});
+	yield* database.use((db) =>
+		db.batch([
+			db
+				.delete(Db.verificationTokens)
+				.where(eq(Db.verificationTokens.identifier, identifier)),
+			db.insert(Db.verificationTokens).values({ identifier, token, expires }),
+		]),
+	);
 
 	yield* Effect.tryPromise({
 		try: () => sendMobileEmailCode(email, code),
@@ -539,7 +545,10 @@ const verifyEmailSession = Effect.fn("Mobile.verifyEmailSession")(function* (
 	}: (typeof Mobile.MobileEmailSessionVerifyInput)["Type"],
 	headers: Headers,
 ) {
-	const email = normalizeEmail(rawEmail);
+	const email = yield* Effect.try({
+		try: () => normalizeEmail(rawEmail),
+		catch: () => new HttpApiError.BadRequest(),
+	});
 	const code = rawCode.trim();
 
 	if (!emailPattern.test(email) || !emailCodePattern.test(code)) {
@@ -553,7 +562,7 @@ const verifyEmailSession = Effect.fn("Mobile.verifyEmailSession")(function* (
 		return yield* Effect.fail(new Mobile.MobileTooManyRequests());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const token = hashEmailCode(code);
 	const identifier = getMobileEmailVerificationIdentifier(email);
 	const verificationStatus = yield* database.use(async (db) => {
@@ -608,19 +617,26 @@ const requestAccountDeletion = Effect.fn("Mobile.requestAccountDeletion")(
 			catch: () => new HttpApiError.InternalServerError(),
 		});
 
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		yield* database.use((db) =>
-			db.transaction(async (tx) => {
-				await tx
-					.update(Db.users)
-					.set({
-						authSessionVersion: sql`${Db.users.authSessionVersion} + 1`,
-					})
-					.where(eq(Db.users.id, user.id));
-				await tx.delete(Db.sessions).where(eq(Db.sessions.userId, user.id));
-				await tx
-					.delete(Db.authApiKeys)
-					.where(eq(Db.authApiKeys.userId, user.id));
+			atomic(db, async () => {
+				const statements: AtomicStatement[] = [];
+				statements.push(
+					db
+						.update(Db.users)
+						.set({
+							authSessionVersion: sql`${Db.users.authSessionVersion} + 1`,
+						})
+						.where(eq(Db.users.id, user.id)),
+				);
+				statements.push(
+					db.delete(Db.sessions).where(eq(Db.sessions.userId, user.id)),
+				);
+				statements.push(
+					db.delete(Db.authApiKeys).where(eq(Db.authApiKeys.userId, user.id)),
+				);
+
+				return { statements, result: undefined };
 			}),
 		);
 
@@ -645,7 +661,7 @@ const getBlockedUserIds = (preferences: unknown) => {
 const getCurrentBlockedUserIds = Effect.fn("Mobile.getBlockedUserIds")(
 	function* () {
 		const user = yield* CurrentUser;
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [row] = yield* database.use((db) =>
 			db
 				.select({ preferences: Db.users.preferences })
@@ -665,7 +681,7 @@ const blockMobileUser = Effect.fn("Mobile.blockUser")(function* (
 		return yield* Effect.fail(new HttpApiError.BadRequest());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [blockedUser] = yield* database.use((db) =>
 		db
 			.select({ id: Db.users.id })
@@ -678,25 +694,29 @@ const blockMobileUser = Effect.fn("Mobile.blockUser")(function* (
 	}
 
 	const currentUserFound = yield* database.use((db) =>
-		db.transaction(async (tx) => {
-			const [currentUser] = await tx
-				.select({ preferences: Db.users.preferences })
-				.from(Db.users)
-				.where(eq(Db.users.id, user.id))
-				.for("update");
-			if (!currentUser) return false;
+		atomic(db, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [currentUser] = await snapshot.read((reader) =>
+				reader
+					.select({ preferences: Db.users.preferences })
+					.from(Db.users)
+					.where(eq(Db.users.id, user.id)),
+			);
+			if (!currentUser) return { statements, result: false };
 
 			const blockedUserIds = getBlockedUserIds(currentUser.preferences);
 			if (!blockedUserIds.includes(blockedUserId)) {
 				blockedUserIds.push(blockedUserId);
-				await tx
-					.update(Db.users)
-					.set({
-						preferences: sql`JSON_SET(COALESCE(${Db.users.preferences}, JSON_OBJECT()), '$.blockedUserIds', CAST(${JSON.stringify(blockedUserIds)} AS JSON))`,
-					})
-					.where(eq(Db.users.id, user.id));
+				statements.push(
+					db
+						.update(Db.users)
+						.set({
+							preferences: sql`json_set(coalesce(${Db.users.preferences}, json_object()), '$.blockedUserIds', json(${JSON.stringify(blockedUserIds)}))`,
+						})
+						.where(eq(Db.users.id, user.id)),
+				);
 			}
-			return true;
+			return { statements, result: true };
 		}),
 	);
 	if (!currentUserFound) {
@@ -709,7 +729,7 @@ const blockMobileUser = Effect.fn("Mobile.blockUser")(function* (
 const getAccessibleOrganizations = Effect.fn(
 	"Mobile.getAccessibleOrganizations",
 )(function* (userId: User.UserId) {
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const imageUploads = yield* ImageUploads;
 
 	const rows = yield* database.use((db) =>
@@ -765,7 +785,7 @@ const getAccessibleSpaces = Effect.fn("Mobile.getAccessibleSpaces")(function* (
 	organization: MobileOrganization,
 ) {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const rows = yield* database.use((db) => {
 		const membership = db
 			.select({ role: Db.spaceMembers.role })
@@ -838,7 +858,7 @@ const getSelectedSpace = Effect.fn("Mobile.getSelectedSpace")(function* (
 	if (!spaceId) return null;
 
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [organization] = yield* database.use((db) =>
 		db
 			.select({
@@ -946,7 +966,7 @@ const getRootFolders = Effect.fn("Mobile.getRootFolders")(function* (
 	organizationId: Organisation.OrganisationId,
 ) {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 
 	const rows = yield* database.use((db) => {
 		const videoCount = db
@@ -986,7 +1006,7 @@ const getSpaceRootFolders = Effect.fn("Mobile.getSpaceRootFolders")(function* (
 	space: MobileSpace,
 ) {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const rows = yield* database.use((db) => {
 		const videoCount =
 			space.kind === "organization"
@@ -1033,7 +1053,7 @@ const getSpaceRootFolders = Effect.fn("Mobile.getSpaceRootFolders")(function* (
 const hasOrganizationAccess = Effect.fn("Mobile.hasOrganizationAccess")(
 	function* (organizationId: Organisation.OrganisationId) {
 		const user = yield* CurrentUser;
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [row] = yield* database.use((db) =>
 			db
 				.select({ id: Db.organizations.id })
@@ -1073,7 +1093,7 @@ const assertOrganizationAccess = Effect.fn("Mobile.assertOrganizationAccess")(
 const getOrganizationSettings = Effect.fn("Mobile.getOrganizationSettings")(
 	function* () {
 		const user = yield* CurrentUser;
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const imageUploads = yield* ImageUploads;
 		const [row] = yield* database.use((db) =>
 			db
@@ -1165,7 +1185,7 @@ const updateOrganizationSettings = Effect.fn(
 		return yield* Effect.fail(new HttpApiError.BadRequest());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	yield* database.use((db) =>
 		db
 			.update(Db.organizations)
@@ -1238,7 +1258,7 @@ const updateOrganizationIcon = Effect.fn("Mobile.updateOrganizationIcon")(
 			return yield* Effect.fail(new HttpApiError.BadRequest());
 		}
 
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const imageUploads = yield* ImageUploads;
 		const [organization] = yield* database.use((db) =>
 			db
@@ -1271,7 +1291,7 @@ const updateOrganizationIcon = Effect.fn("Mobile.updateOrganizationIcon")(
 
 const getMobileUser = Effect.fn("Mobile.getUser")(function* () {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const imageUploads = yield* ImageUploads;
 	const [userRow] = yield* database.use((db) =>
 		db
@@ -1312,7 +1332,7 @@ const updateProfile = Effect.fn("Mobile.updateProfile")(function* (
 		return yield* Effect.fail(new HttpApiError.BadRequest());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	yield* database.use((db) =>
 		db.update(Db.users).set({ name, lastName }).where(eq(Db.users.id, user.id)),
 	);
@@ -1390,7 +1410,7 @@ const getCapLocations = Effect.fn("Mobile.getCapLocations")(function* ({
 	space: MobileSpace | null;
 }) {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const offset = (page - 1) * limit;
 
 	if (!space) {
@@ -1561,7 +1581,7 @@ const getCapRows = Effect.fn("Mobile.getCapRows")(function* (
 ) {
 	if (locations.length === 0) return [];
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const folderIds = new Map(
 		locations.map((location) => [location.id, location.folderId]),
 	);
@@ -1725,7 +1745,7 @@ const getCapStatuses = Effect.fn("Mobile.getCapStatuses")(function* (
 	}
 
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const rows = yield* database.use((db) =>
 		db
 			.select({
@@ -1777,7 +1797,7 @@ const createMobileFolder = Effect.fn("Mobile.createFolder")(function* (
 
 	const color = input.color ?? "normal";
 	const id = Folder.FolderId.make(nanoId());
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 
 	yield* database.use((db) =>
 		db.insert(Db.folders).values({
@@ -1810,7 +1830,7 @@ const assertMobileVideoAccess = Effect.fn("Mobile.assertVideoAccess")(
 		const user = yield* CurrentUser;
 		const blockedUserIds = yield* getCurrentBlockedUserIds();
 		yield* assertOrganizationAccess(user.activeOrganizationId);
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [row] = yield* database.use((db) => {
 			const inheritedPassword = db
 				.select({ value: sql`1` })
@@ -1911,7 +1931,7 @@ const getCapById = Effect.fn("Mobile.getCapById")(function* (
 ) {
 	const user = yield* CurrentUser;
 	const access = yield* assertMobileVideoAccess(videoId);
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 
 	const [row] = yield* database.use((db) =>
 		db
@@ -2002,7 +2022,7 @@ const getComments = Effect.fn("Mobile.getComments")(function* (
 	commentId?: Comment.CommentId,
 ) {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const imageUploads = yield* ImageUploads;
 	const blockedUserIds = yield* getCurrentBlockedUserIds();
 
@@ -2150,7 +2170,7 @@ const createMobileComment = Effect.fn("Mobile.createComment")(function* ({
 
 	const id = Comment.CommentId.make(nanoId());
 	const now = new Date();
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	if (parentCommentId) {
 		const [parent] = yield* database.use((db) =>
 			db
@@ -2220,14 +2240,23 @@ const getPlayback = Effect.fn("Mobile.getPlayback")(function* (
 	const [bucket] = yield* storage.getAccessForVideo(video);
 	const source = Video.Video.getSource(video);
 
-	const transcriptKey = `${video.ownerId}/${video.id}/transcription.vtt`;
-	const transcriptUrl = yield* bucket.headObject(transcriptKey).pipe(
-		Effect.flatMap(() => bucket.getSignedObjectUrl(transcriptKey)),
-		Effect.map((url) =>
-			resolveMobileWebResourceUrl(url, serverEnv().WEB_URL, publicOrigin),
-		),
-		Effect.catchAll(() => Effect.succeed(null)),
+	const transcriptKey = getTranscriptObjectKey(
+		{
+			id: video.id,
+			ownerId: video.ownerId,
+			metadata: Option.getOrNull(video.metadata),
+		},
+		"vtt",
 	);
+	const transcriptUrl = transcriptKey
+		? yield* bucket.headObject(transcriptKey).pipe(
+				Effect.flatMap(() => bucket.getSignedObjectUrl(transcriptKey)),
+				Effect.map((url) =>
+					resolveMobileWebResourceUrl(url, serverEnv().WEB_URL, publicOrigin),
+				),
+				Effect.catchAll(() => Effect.succeed(null)),
+			)
+		: null;
 
 	if (source instanceof Video.Mp4Source) {
 		const signedUrl = yield* bucket.getSignedObjectUrl(source.getFileKey());
@@ -2267,7 +2296,7 @@ const getCapAnalytics = Effect.fn("Mobile.getCapAnalytics")(function* (
 	range: (typeof Mobile.MobileAnalyticsRange)["Type"],
 ) {
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [video] = yield* database.use((db) =>
 		db
 			.select({ name: Db.videos.name, orgId: Db.videos.orgId })
@@ -2367,7 +2396,7 @@ const importLoom = Effect.fn("Mobile.importLoom")(function* (
 	}
 
 	const user = yield* CurrentUser;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [userRow] = yield* database.use((db) =>
 		db.select().from(Db.users).where(eq(Db.users.id, user.id)).limit(1),
 	);
@@ -2402,69 +2431,80 @@ const importLoom = Effect.fn("Mobile.importLoom")(function* (
 	const videoId = Video.VideoId.make(nanoId());
 	const now = new Date();
 	const importState = yield* database.use((db) =>
-		db.transaction(async (tx) => {
-			const [existing] = await tx
-				.select({
-					importId: Db.importedVideos.id,
-					videoId: Db.videos.id,
-				})
-				.from(Db.importedVideos)
-				.leftJoin(
-					Db.videos,
-					and(
-						eq(Db.videos.id, Db.importedVideos.id),
-						eq(Db.videos.orgId, Db.importedVideos.orgId),
-					),
-				)
-				.where(
-					and(
-						eq(Db.importedVideos.orgId, user.activeOrganizationId),
-						eq(Db.importedVideos.source, "loom"),
-						eq(Db.importedVideos.sourceId, loomVideoId),
-					),
-				)
-				.limit(1);
-			if (existing?.videoId) return "conflict" as const;
-			if (existing) {
-				await tx
-					.delete(Db.importedVideos)
+		atomic(db, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [existing] = await snapshot.read((reader) =>
+				reader
+					.select({
+						importId: Db.importedVideos.id,
+						videoId: Db.videos.id,
+					})
+					.from(Db.importedVideos)
+					.leftJoin(
+						Db.videos,
+						and(
+							eq(Db.videos.id, Db.importedVideos.id),
+							eq(Db.videos.orgId, Db.importedVideos.orgId),
+						),
+					)
 					.where(
 						and(
 							eq(Db.importedVideos.orgId, user.activeOrganizationId),
 							eq(Db.importedVideos.source, "loom"),
 							eq(Db.importedVideos.sourceId, loomVideoId),
 						),
-					);
+					)
+					.limit(1),
+			);
+			if (existing?.videoId) return { statements, result: "conflict" as const };
+			if (existing) {
+				statements.push(
+					db
+						.delete(Db.importedVideos)
+						.where(
+							and(
+								eq(Db.importedVideos.orgId, user.activeOrganizationId),
+								eq(Db.importedVideos.source, "loom"),
+								eq(Db.importedVideos.sourceId, loomVideoId),
+							),
+						),
+				);
 			}
 
-			await tx.insert(Db.videos).values({
-				id: videoId,
-				name:
-					download.videoName?.slice(0, 255) ??
-					`Loom Import - ${now.toISOString().slice(0, 10)}`,
-				ownerId: user.id,
-				orgId: user.activeOrganizationId,
-				source: { type: "webMP4" },
-				bucket: Option.getOrNull(writable.bucketId),
-				storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
-				public: await getNewVideoPublic(user.activeOrganizationId),
-				duration: download.durationSeconds,
-				width: download.width,
-				height: download.height,
-			});
-			await tx.insert(Db.videoUploads).values({
-				videoId,
-				phase: "uploading",
-				processingProgress: 0,
-				processingMessage: "Importing from Loom...",
-			});
-			await tx.insert(Db.importedVideos).values({
-				id: videoId,
-				orgId: user.activeOrganizationId,
-				source: "loom",
-				sourceId: loomVideoId,
-			});
-			return "ready" as const;
+			statements.push(
+				db.insert(Db.videos).values({
+					id: videoId,
+					name:
+						download.videoName?.slice(0, 255) ??
+						`Loom Import - ${now.toISOString().slice(0, 10)}`,
+					ownerId: user.id,
+					orgId: user.activeOrganizationId,
+					source: { type: "webMP4" },
+					bucket: Option.getOrNull(writable.bucketId),
+					storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
+					public: await getNewVideoPublic(user.activeOrganizationId, snapshot),
+					duration: download.durationSeconds,
+					width: download.width,
+					height: download.height,
+				}),
+			);
+			statements.push(
+				db.insert(Db.videoUploads).values({
+					videoId,
+					phase: "uploading",
+					processingProgress: 0,
+					processingMessage: "Importing from Loom...",
+				}),
+			);
+			statements.push(
+				db.insert(Db.importedVideos).values({
+					id: videoId,
+					orgId: user.activeOrganizationId,
+					source: "loom",
+					sourceId: loomVideoId,
+				}),
+			);
+			return { statements, result: "ready" as const };
 		}),
 	);
 	if (importState === "conflict") {
@@ -2504,7 +2544,7 @@ const createUpload = Effect.fn("Mobile.createUpload")(function* (
 		return yield* Effect.fail(new HttpApiError.BadRequest());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const storage = yield* Storage;
 	const repo = yield* VideosRepo;
 	const folderId = input.folderId;
@@ -2598,7 +2638,7 @@ const createRecording = Effect.fn("Mobile.createRecording")(function* (
 		return yield* Effect.fail(new HttpApiError.BadRequest());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const storage = yield* Storage;
 	const repo = yield* VideosRepo;
 	const folderId = input.folderId;
@@ -2747,7 +2787,7 @@ const completeRecording = Effect.fn("Mobile.completeRecording")(function* (
 		return yield* Effect.fail(new HttpApiError.BadRequest());
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [userRow] = yield* database.use((db) =>
 		db
 			.select({
@@ -2819,7 +2859,7 @@ const ApiLive = HttpApiBuilder.api(Mobile.MobileApiContract).pipe(
 		HttpApiBuilder.group(Mobile.MobileApiContract, "mobile", (handlers) =>
 			Effect.gen(function* () {
 				const videos = yield* Videos;
-				const database = yield* Database;
+				const database = yield* CloudflareDatabase;
 
 				return handlers
 					.handle("getAuthConfig", () =>
@@ -3002,7 +3042,7 @@ const ApiLive = HttpApiBuilder.api(Mobile.MobileApiContract).pipe(
 										.update(Db.videos)
 										.set({
 											name: title,
-											metadata: sql`JSON_SET(COALESCE(${Db.videos.metadata}, JSON_OBJECT()), '$.titleManuallyEdited', true)`,
+											metadata: sql`json_set(COALESCE(${Db.videos.metadata}, json_object()), '$.titleManuallyEdited', json('true'))`,
 										})
 										.where(
 											and(

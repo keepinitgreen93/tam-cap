@@ -66,6 +66,7 @@ export class StorageError extends Schema.TaggedError<StorageError>()(
 ) {}
 
 export type StorageObjectMetadata = {
+	copySourceVideoId?: VideoId;
 	videoId?: VideoId;
 	fileName?: string;
 	contentType?: string;

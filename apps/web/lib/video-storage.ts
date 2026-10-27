@@ -1,4 +1,4 @@
-import type { videos } from "@cap/database/schema";
+import type { videos } from "@cap/database/cloudflare/schema";
 import { Video } from "@cap/web-domain";
 import { Option } from "effect";
 

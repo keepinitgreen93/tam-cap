@@ -1,4 +1,4 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import {
 	type Organisation,
 	S3Bucket,
@@ -8,13 +8,14 @@ import {
 import * as Dz from "drizzle-orm";
 import { Effect, Option } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 
 export class S3BucketsRepo extends Effect.Service<S3BucketsRepo>()(
 	"S3BucketsRepo",
 	{
 		effect: Effect.gen(function* () {
 			const db = yield* Database;
+			const activeBucket = Dz.sql`(${Db.s3Buckets.organizationId} is null or exists (select 1 from ${Db.organizations} where ${Db.organizations.id} = ${Db.s3Buckets.organizationId} and ${Db.organizations.tombstoneAt} is null))`;
 
 			const getForVideo = Effect.fn("S3BucketsRepo.getForVideo")(
 				(videoId: Video.VideoId) =>
@@ -24,7 +25,13 @@ export class S3BucketsRepo extends Effect.Service<S3BucketsRepo>()(
 								.select({ bucket: Db.s3Buckets })
 								.from(Db.s3Buckets)
 								.leftJoin(Db.videos, Dz.eq(Db.videos.bucket, Db.s3Buckets.id))
-								.where(Dz.and(Dz.eq(Db.videos.id, videoId))),
+								.where(
+									Dz.and(
+										Dz.eq(Db.videos.id, videoId),
+										activeBucket,
+										Dz.sql`exists (select 1 from ${Db.organizations} where ${Db.organizations.id} = ${Db.videos.orgId} and ${Db.organizations.tombstoneAt} is null)`,
+									),
+								),
 						);
 
 						return Option.fromNullable(res).pipe(
@@ -42,7 +49,7 @@ export class S3BucketsRepo extends Effect.Service<S3BucketsRepo>()(
 							db
 								.select({ bucket: Db.s3Buckets })
 								.from(Db.s3Buckets)
-								.where(Dz.eq(Db.s3Buckets.id, id)),
+								.where(Dz.and(Dz.eq(Db.s3Buckets.id, id), activeBucket)),
 						);
 
 						return Option.fromNullable(res).pipe(
@@ -88,6 +95,7 @@ export class S3BucketsRepo extends Effect.Service<S3BucketsRepo>()(
 								.where(
 									Dz.and(
 										Dz.eq(Db.s3Buckets.organizationId, organizationId),
+										activeBucket,
 										Dz.eq(Db.s3Buckets.active, true),
 									),
 								)

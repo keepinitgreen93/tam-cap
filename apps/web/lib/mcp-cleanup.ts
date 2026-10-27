@@ -1,18 +1,16 @@
 import "server-only";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	mcpOAuthClients,
 	mcpOAuthCodes,
 	mcpOAuthRegistrationQuotas,
 	mcpOAuthTokens,
-} from "@cap/database/schema";
-import { and, eq, gt, isNull, lt, notExists } from "drizzle-orm";
+} from "@cap/database/cloudflare/schema";
+import { and, eq, gt, inArray, isNull, lt, notExists } from "drizzle-orm";
 
-const affectedRows = (value: unknown) => {
-	const result = Array.isArray(value) ? value[0] : value;
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
+const affectedRows = (value: { meta: { changes: number } }) =>
+	value.meta.changes;
 
 export const cleanupExpiredMcpRecords = async (now = new Date()) => {
 	const database = db();
@@ -24,8 +22,16 @@ export const cleanupExpiredMcpRecords = async (now = new Date()) => {
 		const deleted = affectedRows(
 			await database
 				.delete(mcpOAuthCodes)
-				.where(lt(mcpOAuthCodes.expiresAt, now))
-				.limit(1_000),
+				.where(
+					inArray(
+						mcpOAuthCodes.id,
+						database
+							.select({ id: mcpOAuthCodes.id })
+							.from(mcpOAuthCodes)
+							.where(lt(mcpOAuthCodes.expiresAt, now))
+							.limit(1_000),
+					),
+				),
 		);
 		codes += deleted;
 		if (deleted < 1_000) break;
@@ -34,8 +40,16 @@ export const cleanupExpiredMcpRecords = async (now = new Date()) => {
 		const deleted = affectedRows(
 			await database
 				.delete(mcpOAuthTokens)
-				.where(lt(mcpOAuthTokens.refreshExpiresAt, now))
-				.limit(1_000),
+				.where(
+					inArray(
+						mcpOAuthTokens.id,
+						database
+							.select({ id: mcpOAuthTokens.id })
+							.from(mcpOAuthTokens)
+							.where(lt(mcpOAuthTokens.refreshExpiresAt, now))
+							.limit(1_000),
+					),
+				),
 		);
 		tokens += deleted;
 		if (deleted < 1_000) break;
@@ -43,15 +57,21 @@ export const cleanupExpiredMcpRecords = async (now = new Date()) => {
 	const unusedBefore = new Date(now.getTime() - 24 * 60 * 60_000);
 	for (let batch = 0; batch < 10; batch += 1) {
 		const deleted = affectedRows(
-			await database
-				.delete(mcpOAuthClients)
-				.where(
-					and(
-						isNull(mcpOAuthClients.activatedAt),
-						lt(mcpOAuthClients.createdAt, unusedBefore),
-					),
-				)
-				.limit(1_000),
+			await database.delete(mcpOAuthClients).where(
+				inArray(
+					mcpOAuthClients.id,
+					database
+						.select({ id: mcpOAuthClients.id })
+						.from(mcpOAuthClients)
+						.where(
+							and(
+								isNull(mcpOAuthClients.activatedAt),
+								lt(mcpOAuthClients.createdAt, unusedBefore),
+							),
+						)
+						.limit(1_000),
+				),
+			),
 		);
 		clients += deleted;
 		if (deleted < 1_000) break;
@@ -59,26 +79,32 @@ export const cleanupExpiredMcpRecords = async (now = new Date()) => {
 	const staleBefore = new Date(now.getTime() - 90 * 24 * 60 * 60_000);
 	for (let batch = 0; batch < 10; batch += 1) {
 		const deleted = affectedRows(
-			await database
-				.delete(mcpOAuthClients)
-				.where(
-					and(
-						lt(mcpOAuthClients.activatedAt, staleBefore),
-						notExists(
-							database
-								.select({ id: mcpOAuthTokens.id })
-								.from(mcpOAuthTokens)
-								.where(
-									and(
-										eq(mcpOAuthTokens.clientId, mcpOAuthClients.clientId),
-										isNull(mcpOAuthTokens.revokedAt),
-										gt(mcpOAuthTokens.refreshExpiresAt, now),
-									),
+			await database.delete(mcpOAuthClients).where(
+				inArray(
+					mcpOAuthClients.id,
+					database
+						.select({ id: mcpOAuthClients.id })
+						.from(mcpOAuthClients)
+						.where(
+							and(
+								lt(mcpOAuthClients.activatedAt, staleBefore),
+								notExists(
+									database
+										.select({ id: mcpOAuthTokens.id })
+										.from(mcpOAuthTokens)
+										.where(
+											and(
+												eq(mcpOAuthTokens.clientId, mcpOAuthClients.clientId),
+												isNull(mcpOAuthTokens.revokedAt),
+												gt(mcpOAuthTokens.refreshExpiresAt, now),
+											),
+										),
 								),
-						),
-					),
-				)
-				.limit(1_000),
+							),
+						)
+						.limit(1_000),
+				),
+			),
 		);
 		clients += deleted;
 		if (deleted < 1_000) break;
@@ -87,8 +113,16 @@ export const cleanupExpiredMcpRecords = async (now = new Date()) => {
 		const deleted = affectedRows(
 			await database
 				.delete(mcpOAuthRegistrationQuotas)
-				.where(lt(mcpOAuthRegistrationQuotas.expiresAt, now))
-				.limit(1_000),
+				.where(
+					inArray(
+						mcpOAuthRegistrationQuotas.windowId,
+						database
+							.select({ id: mcpOAuthRegistrationQuotas.windowId })
+							.from(mcpOAuthRegistrationQuotas)
+							.where(lt(mcpOAuthRegistrationQuotas.expiresAt, now))
+							.limit(1_000),
+					),
+				),
 		);
 		quotas += deleted;
 		if (deleted < 1_000) break;

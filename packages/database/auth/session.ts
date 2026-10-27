@@ -2,8 +2,8 @@ import { User } from "@cap/web-domain";
 import { eq, type InferSelectModel } from "drizzle-orm";
 import { getServerSession } from "next-auth";
 import { cache } from "react";
-import { db } from "../";
-import { users } from "../schema";
+import { db } from "../cloudflare/application.ts";
+import { users } from "../cloudflare/schema.ts";
 import { authOptions } from "./auth-options";
 
 export const getSession = async () => {
@@ -16,12 +16,18 @@ export const getCurrentUser = cache(
 	async (): Promise<InferSelectModel<typeof users> | null> => {
 		const session = await getServerSession(authOptions());
 
-		if (!session) return null;
+		const userId =
+			session?.user &&
+			"id" in session.user &&
+			typeof session.user.id === "string"
+				? session.user.id
+				: null;
+		if (!userId) return null;
 
 		const [currentUser] = await db()
 			.select()
 			.from(users)
-			.where(eq(users.id, User.UserId.make(session.user.id)));
+			.where(eq(users.id, User.UserId.make(userId)));
 
 		return currentUser ?? null;
 	},

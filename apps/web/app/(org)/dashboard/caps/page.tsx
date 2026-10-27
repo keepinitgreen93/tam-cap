@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	comments,
 	folders,
@@ -10,10 +10,10 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	ImageUploads,
 	resolveEffectiveVideoRules,
 } from "@cap/web-backend";
@@ -53,7 +53,12 @@ const getSharedSpacesForVideos = Effect.fn(function* (
 					.from(spaceVideos)
 					.innerJoin(spaces, eq(spaceVideos.spaceId, spaces.id))
 					.innerJoin(organizations, eq(spaces.organizationId, organizations.id))
-					.where(inArray(spaceVideos.videoId, videoIds)),
+					.where(
+						and(
+							inArray(spaceVideos.videoId, videoIds),
+							isNull(organizations.tombstoneAt),
+						),
+					),
 			),
 			db.use((db) =>
 				db
@@ -69,7 +74,12 @@ const getSharedSpacesForVideos = Effect.fn(function* (
 						organizations,
 						eq(sharedVideos.organizationId, organizations.id),
 					)
-					.where(inArray(sharedVideos.videoId, videoIds)),
+					.where(
+						and(
+							inArray(sharedVideos.videoId, videoIds),
+							isNull(organizations.tombstoneAt),
+						),
+					),
 			),
 		],
 		{ concurrency: "unbounded" },
@@ -132,8 +142,16 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 		redirect("/login");
 	}
 
-	const page = Number(searchParams.page) || 1;
-	const limit = Number(searchParams.limit) || 15;
+	const requestedPage = Number(searchParams.page);
+	const page =
+		Number.isSafeInteger(requestedPage) && requestedPage > 0
+			? requestedPage
+			: 1;
+	const requestedLimit = Number(searchParams.limit);
+	const limit =
+		Number.isSafeInteger(requestedLimit) && requestedLimit > 0
+			? Math.min(requestedLimit, 100)
+			: 15;
 
 	const userId = user.id;
 	const offset = (page - 1) * limit;
@@ -181,24 +199,11 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 			public: videos.public,
 			totalComments: sql<number>`COUNT(DISTINCT CASE WHEN ${comments.type} = 'text' THEN ${comments.id} END)`,
 			totalReactions: sql<number>`COUNT(DISTINCT CASE WHEN ${comments.type} = 'emoji' THEN ${comments.id} END)`,
-			sharedOrganizations: sql<
-				{
-					id: string;
-					name: string;
-					iconUrl: ImageUpload.ImageUrlOrKey | null;
-				}[]
-			>`
-        COALESCE(
-          JSON_ARRAYAGG(
-            JSON_OBJECT(
-              'id', ${organizations.id},
-              'name', ${organizations.name},
-              'iconUrl', ${organizations.iconUrl}
-            )
-          ),
-          JSON_ARRAY()
-        )
-      `,
+			organization: {
+				id: organizations.id,
+				name: organizations.name,
+				iconUrl: organizations.iconUrl,
+			},
 			ownerName: users.name,
 			effectiveDate: videos.effectiveCreatedAt,
 			hasPassword: sql`${videos.password} IS NOT NULL`.mapWith(Boolean),
@@ -244,12 +249,14 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
       )`,
 		})
 		.from(folders)
+		.innerJoin(organizations, eq(folders.organizationId, organizations.id))
 		.where(
 			and(
 				eq(folders.organizationId, user.activeOrganizationId),
 				eq(folders.createdById, user.id),
 				isNull(folders.parentId),
 				isNull(folders.spaceId),
+				isNull(organizations.tombstoneAt),
 			),
 		);
 
@@ -257,7 +264,12 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 		? db()
 				.select({ settings: organizations.settings })
 				.from(organizations)
-				.where(eq(organizations.id, user.activeOrganizationId))
+				.where(
+					and(
+						eq(organizations.id, user.activeOrganizationId),
+						isNull(organizations.tombstoneAt),
+					),
+				)
 				.limit(1)
 		: Promise.resolve([]);
 
@@ -280,8 +292,11 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 			Effect.fn(function* (video) {
 				const imageUploads = yield* ImageUploads;
 
-				const { effectiveDate: _effectiveDate, ...videoWithoutEffectiveDate } =
-					video;
+				const {
+					effectiveDate: _effectiveDate,
+					organization,
+					...videoWithoutEffectiveDate
+				} = video;
 				const sharedSpaces = sharedSpacesMap[video.id] ?? [];
 				const rules = resolveEffectiveVideoRules({
 					videoSettings: video.settings,
@@ -298,7 +313,7 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 					inheritedPasswordSources: rules.inheritedPasswordSources,
 					inheritedSpaceSettings: rules.inheritedSettings,
 					sharedOrganizations: yield* Effect.all(
-						(video.sharedOrganizations ?? [])
+						(organization ? [organization] : [])
 							.filter((organization) => organization.id !== null)
 							.map(
 								Effect.fn(function* (org) {

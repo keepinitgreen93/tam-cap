@@ -1,12 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	organizationMembers,
 	organizations,
 	spaceMembers,
 	spaces,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { Organisation, Space, User } from "@cap/web-domain";
 import { and, eq, isNull } from "drizzle-orm";
 import {

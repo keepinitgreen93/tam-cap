@@ -8,6 +8,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
 	getEditTranscript: vi.fn(),
 	scrollToIndex: vi.fn(),
+	requestSilenceAnalysis: vi.fn(),
+	getSilenceAnalysis: vi.fn(),
+	getSilenceSourceRevision: vi.fn(),
+	onDeleteRanges: vi.fn(),
+}));
+
+vi.mock("@/actions/videos/silence-analysis", () => ({
+	requestSilenceAnalysis: mocks.requestSilenceAnalysis,
+	getSilenceAnalysis: mocks.getSilenceAnalysis,
+	getSilenceSourceRevision: mocks.getSilenceSourceRevision,
 }));
 
 vi.mock("@/actions/videos/get-edit-transcript", () => ({
@@ -36,6 +46,7 @@ vi.mock("@virtual-grid/react", () => ({
 import { TranscriptSidebar } from "@/app/s/[videoId]/edit/TranscriptSidebar";
 
 const videoId = "video-id" as Video.VideoId;
+const sourceRevision = "a".repeat(64);
 const transcript = {
 	version: 3 as const,
 	speechModelUsed: "fixture",
@@ -126,19 +137,37 @@ beforeEach(async () => {
 	});
 	HTMLElement.prototype.scrollIntoView = vi.fn();
 	mocks.getEditTranscript.mockResolvedValue({ status: "ready", transcript });
+	mocks.getSilenceSourceRevision.mockResolvedValue(sourceRevision);
+	mocks.requestSilenceAnalysis.mockResolvedValue({
+		status: "ready",
+		revision: sourceRevision,
+		result: {
+			version: 1,
+			profile: "pcm-quiet-v1",
+			durationMs: 5000,
+			audioTracks: 1,
+			ranges: [{ startMs: 3700, endMs: 4500 }],
+		},
+	});
 	container = document.createElement("div");
 	document.body.append(container);
 	root = createRoot(container);
 	video = document.createElement("video");
+	Object.defineProperty(video, "currentSrc", {
+		value: "https://example.test/playback",
+		configurable: true,
+	});
+	Object.defineProperty(video, "duration", { value: 5, configurable: true });
 	const videoRef: RefObject<HTMLVideoElement | null> = { current: video };
 
 	await act(async () => {
 		root.render(
 			createElement(TranscriptSidebar, {
 				videoId,
+				sourceRevision,
 				videoRef,
 				keepRanges: [{ start: 0, end: 5 }],
-				onDeleteRanges: vi.fn(),
+				onDeleteRanges: mocks.onDeleteRanges,
 			}),
 		);
 	});
@@ -147,6 +176,71 @@ beforeEach(async () => {
 			container.querySelector('input[placeholder="Search transcript"]'),
 		).not.toBeNull(),
 	);
+});
+
+function button(label: string) {
+	const result = Array.from(container.querySelectorAll("button")).find(
+		(element) => element.textContent?.trim() === label,
+	);
+	if (!result) throw new Error(`Missing button: ${label}`);
+	return result;
+}
+
+async function scanAndSelect() {
+	await act(async () => button("Find quiet ranges").click());
+	const checkbox = container.querySelector<HTMLInputElement>(
+		'input[type="checkbox"]',
+	);
+	if (!checkbox) throw new Error("Missing silence candidate");
+	await act(async () => checkbox.click());
+}
+
+describe("server silence review", () => {
+	it("requires selection and explicit Apply before creating cuts", async () => {
+		await act(async () => button("Find quiet ranges").click());
+		expect(mocks.requestSilenceAnalysis).toHaveBeenCalledWith(
+			videoId,
+			sourceRevision,
+		);
+		expect(mocks.onDeleteRanges).not.toHaveBeenCalled();
+		expect(button("Apply selected cuts").disabled).toBe(true);
+		const checkbox = container.querySelector<HTMLInputElement>(
+			'input[type="checkbox"]',
+		);
+		if (!checkbox) throw new Error("Missing silence candidate");
+		await act(async () => checkbox.click());
+		await act(async () => button("Apply selected cuts").click());
+		expect(mocks.onDeleteRanges).toHaveBeenCalledWith([
+			{ start: 3.7, end: 4.5 },
+		]);
+	});
+
+	it("rejects applying analysis after the server source revision changes", async () => {
+		await scanAndSelect();
+		mocks.getSilenceSourceRevision.mockResolvedValue("b".repeat(64));
+		await act(async () => button("Apply selected cuts").click());
+		expect(mocks.onDeleteRanges).not.toHaveBeenCalled();
+		expect(container.textContent).toContain("Reload before applying cuts");
+	});
+
+	it("clears candidates when playback loads a different source", async () => {
+		await scanAndSelect();
+		await act(async () => {
+			video.dispatchEvent(new Event("loadstart"));
+		});
+		expect(container.querySelector('input[type="checkbox"]')).toBeNull();
+		expect(mocks.onDeleteRanges).not.toHaveBeenCalled();
+	});
+
+	it("shows processing failures without changing the timeline", async () => {
+		mocks.requestSilenceAnalysis.mockResolvedValue({
+			status: "error",
+			message: "No audio track",
+		});
+		await act(async () => button("Find quiet ranges").click());
+		expect(container.textContent).toContain("No audio track");
+		expect(mocks.onDeleteRanges).not.toHaveBeenCalled();
+	});
 });
 
 afterEach(async () => {

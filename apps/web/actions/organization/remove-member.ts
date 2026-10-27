@@ -1,15 +1,18 @@
 "use server";
 
-import { db } from "@cap/database";
+import { normalizeEmail } from "@cap/database/auth/identity";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { releaseProSeatSubscription } from "@cap/database/pro-seat-subscription";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import { releaseProSeatStatement } from "@cap/database/cloudflare/pro-seat";
 import {
 	organizationInvites,
 	organizationMembers,
+	organizations,
 	spaceMembers,
 	spaces,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { Organisation } from "@cap/web-domain";
 import { and, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -26,93 +29,107 @@ export async function removeOrganizationMember(
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 
-	const actor = await requireOrganizationSettingsManager(
-		user.id,
-		organizationId,
-	);
+	await requireOrganizationSettingsManager(user.id, organizationId);
 
-	await db().transaction(async (tx) => {
-		const [member] = await tx
-			.select({
-				id: organizationMembers.id,
-				userId: organizationMembers.userId,
-				role: organizationMembers.role,
-				hasProSeat: organizationMembers.hasProSeat,
-				email: users.email,
-			})
-			.from(organizationMembers)
-			.innerJoin(users, eq(organizationMembers.userId, users.id))
-			.where(
-				and(
-					eq(organizationMembers.id, memberId),
-					eq(organizationMembers.organizationId, organizationId),
-				),
-			)
-			.limit(1)
-			.for("update");
-
-		if (!member) {
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const [organization] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(organizations)
+				.where(eq(organizations.id, organizationId))
+				.limit(1),
+		);
+		const [actorMember] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(organizationMembers)
+				.where(
+					and(
+						eq(organizationMembers.organizationId, organizationId),
+						eq(organizationMembers.userId, user.id),
+					),
+				)
+				.limit(1),
+		);
+		const [member] = await snapshot.read((reader) =>
+			reader
+				.select({
+					id: organizationMembers.id,
+					userId: organizationMembers.userId,
+					role: organizationMembers.role,
+					hasProSeat: organizationMembers.hasProSeat,
+					email: users.email,
+				})
+				.from(organizationMembers)
+				.innerJoin(users, eq(organizationMembers.userId, users.id))
+				.where(
+					and(
+						eq(organizationMembers.id, memberId),
+						eq(organizationMembers.organizationId, organizationId),
+					),
+				)
+				.limit(1),
+		);
+		if (!organization || organization.tombstoneAt || !member)
 			throw new Error("Member not found");
-		}
-
+		const actorRole = getEffectiveOrganizationRole({
+			userId: user.id,
+			ownerId: organization.ownerId,
+			memberRole: actorMember?.role,
+		});
 		const targetRole = getEffectiveOrganizationRole({
 			userId: member.userId,
-			ownerId: actor.ownerId,
+			ownerId: organization.ownerId,
 			memberRole: member.role,
 		});
-
 		if (
 			!canRemoveOrganizationMember({
-				actorRole: actor.role,
+				actorRole,
 				actorUserId: user.id,
 				targetUserId: member.userId,
-				ownerId: actor.ownerId,
+				ownerId: organization.ownerId,
 				targetRole,
 			})
-		) {
+		)
 			throw new Error("You do not have permission to remove this member");
-		}
-
-		const [result] = await tx
-			.delete(organizationMembers)
-			.where(
-				and(
-					eq(organizationMembers.id, memberId),
-					eq(organizationMembers.organizationId, organizationId),
+		const statements: AtomicStatement[] = [
+			database
+				.delete(organizationMembers)
+				.where(
+					and(
+						eq(organizationMembers.id, memberId),
+						eq(organizationMembers.organizationId, organizationId),
+					),
 				),
-			);
-
-		if (result.affectedRows === 0) throw new Error("Member not found");
-
-		if (member.hasProSeat) {
-			await releaseProSeatSubscription(tx, member.userId);
-		}
-
-		const organizationSpaces = await tx
+		];
+		if (member.hasProSeat)
+			statements.push(releaseProSeatStatement(database, member.userId));
+		const organizationSpaces = database
 			.select({ id: spaces.id })
 			.from(spaces)
 			.where(eq(spaces.organizationId, organizationId));
-		const spaceIds = organizationSpaces.map((space) => space.id);
-
-		if (spaceIds.length > 0) {
-			await tx
+		statements.push(
+			database
 				.delete(spaceMembers)
 				.where(
 					and(
 						eq(spaceMembers.userId, member.userId),
-						inArray(spaceMembers.spaceId, spaceIds),
+						inArray(spaceMembers.spaceId, organizationSpaces),
 					),
-				);
-		}
-
-		await tx
-			.delete(organizationInvites)
-			.where(
-				and(
-					eq(organizationInvites.organizationId, organizationId),
-					eq(organizationInvites.invitedEmail, member.email.toLowerCase()),
 				),
-			);
+		);
+		statements.push(
+			database
+				.delete(organizationInvites)
+				.where(
+					and(
+						eq(organizationInvites.organizationId, organizationId),
+						eq(organizationInvites.invitedEmail, normalizeEmail(member.email)),
+					),
+				),
+		);
+		return { statements, result: undefined };
 	});
 
 	revalidatePath("/dashboard/settings/organization");

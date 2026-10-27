@@ -1,261 +1,155 @@
-import { User, Video } from "@cap/web-domain";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const limitMock = vi.hoisted(() => vi.fn());
-const forUpdateMock = vi.hoisted(() => vi.fn());
-const valuesMock = vi.hoisted(() => vi.fn());
-const sendEmailMock = vi.hoisted(() => vi.fn());
-const messengerSupportEmailMock = vi.hoisted(() => vi.fn(() => null));
-const nanoIdMock = vi.hoisted(() =>
-	vi
-		.fn()
-		.mockReturnValueOnce("request-123")
-		.mockReturnValueOnce("conversation-123")
-		.mockReturnValueOnce("message-123"),
-);
-
-const mockDb = vi.hoisted(() => ({
-	select: vi.fn(() => mockDb),
-	from: vi.fn(() => mockDb),
-	where: vi.fn(() => mockDb),
-	for: forUpdateMock,
-	limit: limitMock,
-	insert: vi.fn(() => mockDb),
-	values: valuesMock,
-	transaction: vi.fn((callback: (tx: unknown) => unknown) => callback(mockDb)),
-}));
+import {
+	messengerConversations,
+	messengerMessages,
+	messengerSupportEmails,
+} from "@cap/database/cloudflare/schema";
+import { createCloudflareUser } from "@cap/database/cloudflare/team";
+import type { Video } from "@cap/web-domain";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
 
 vi.mock("server-only", () => ({}));
-
-vi.mock("@cap/database", () => ({
-	db: vi.fn(() => mockDb),
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	sendEmail: vi.fn(),
 }));
-
-vi.mock("@cap/database/helpers", () => ({
-	nanoId: nanoIdMock,
-}));
-
-vi.mock("@cap/database/schema", () => ({
-	messengerConversations: {
-		id: "conversationId",
-	},
-	messengerMessages: {
-		id: "messageId",
-	},
-	messengerSupportEmails: {
-		id: "id",
-		conversationId: "conversationId",
-		message: "message",
-		subject: "subject",
-		userEmail: "userEmail",
-		userId: "userId",
-	},
-	users: {
-		id: "userId",
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!state.database) throw new Error("Test database unavailable");
+		return state.database;
 	},
 }));
-
-vi.mock("@cap/database/emails/config", () => ({
-	sendEmail: sendEmailMock,
-}));
-
+vi.mock("@cap/database/emails/config", () => ({ sendEmail: state.sendEmail }));
 vi.mock("@cap/database/emails/messenger-support-email", () => ({
-	MessengerSupportEmail: messengerSupportEmailMock,
+	MessengerSupportEmail: (props: Record<string, unknown>) => props,
+}));
+vi.mock("@cap/env", () => ({
+	serverEnv: () => ({ WEB_URL: "https://videos.example.com" }),
 }));
 
-vi.mock("drizzle-orm", () => ({
-	and: vi.fn((...conditions: unknown[]) => ({ type: "and", conditions })),
-	eq: vi.fn((left: unknown, right: unknown) => ({ type: "eq", left, right })),
-	or: vi.fn((...conditions: unknown[]) => ({ type: "or", conditions })),
-}));
+import {
+	createAccountDeletionRequest,
+	createMobileContentReport,
+	hasPendingAccountDeletion,
+} from "@/lib/account-deletion-request";
 
-describe("account deletion requests", () => {
-	beforeEach(() => {
-		vi.clearAllMocks();
-		nanoIdMock
-			.mockReset()
-			.mockReturnValueOnce("request-123")
-			.mockReturnValueOnce("conversation-123")
-			.mockReturnValueOnce("message-123");
-		valuesMock.mockResolvedValue(undefined);
-		forUpdateMock.mockResolvedValue([{ id: "user-123" }]);
-		limitMock.mockResolvedValue([]);
-		sendEmailMock.mockResolvedValue(undefined);
-	});
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let user: Awaited<ReturnType<typeof createCloudflareUser>>;
 
-	it("durably records a pending deletion before notifying support", async () => {
-		const { createAccountDeletionRequest } = await import(
-			"@/lib/account-deletion-request"
-		);
-		const now = new Date("2026-07-23T10:00:00.000Z");
-
-		await expect(
-			createAccountDeletionRequest({
-				user: {
-					id: User.UserId.make("user-123"),
-					email: " User@Example.com ",
-					name: "Test User",
-				},
-				now,
-			}),
-		).resolves.toEqual({
-			id: "request-123",
-			status: "created",
-			notificationSent: true,
+describe("account requests on D1", () => {
+	beforeAll(async () => {
+		Object.assign(process.env, {
+			CAP_RUNTIME: "cloudflare",
+			DATABASE_PROVIDER: "d1",
+			CAP_OWNER_EMAIL: "operator@example.com",
 		});
-
-		expect(valuesMock).toHaveBeenNthCalledWith(
-			1,
-			expect.objectContaining({
-				id: "conversation-123",
-				agent: "Millie",
-				mode: "human",
-				userId: "user-123",
-				createdAt: now,
-			}),
-		);
-		expect(valuesMock).toHaveBeenNthCalledWith(
-			2,
-			expect.objectContaining({
-				id: "message-123",
-				conversationId: "conversation-123",
-				role: "user",
-				userId: "user-123",
-			}),
-		);
-		expect(valuesMock).toHaveBeenNthCalledWith(
-			3,
-			expect.objectContaining({
-				id: "request-123",
-				conversationId: "conversation-123",
-				userEmail: "user@example.com",
-				subject: "[PENDING] Account deletion request",
-			}),
-		);
-		expect(sendEmailMock).toHaveBeenCalledWith(
-			expect.objectContaining({
-				email: "hello@cap.so",
-				subject: "[PENDING] Account deletion request",
-				replyTo: "user@example.com",
-				idempotencyKey: "account-deletion-request-123",
-			}),
-		);
-		expect(valuesMock.mock.invocationCallOrder[2]).toBeLessThan(
-			sendEmailMock.mock.invocationCallOrder[0] ?? 0,
-		);
-	});
-
-	it("returns an existing request without inserting a duplicate", async () => {
-		limitMock.mockResolvedValueOnce([
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
+		user = await createCloudflareUser(
+			fixture.database,
 			{
-				id: "existing-request",
-				conversationId: "existing-conversation",
-				message: "Existing request",
+				email: "requester@example.com",
+				emailVerified: new Date(),
+				name: "Requester",
 			},
+			{ ownerEmail: "requester@example.com", inviteOnly: true },
+		);
+	});
+	afterAll(async () => fixture?.dispose());
+	beforeEach(async () => {
+		state.sendEmail.mockReset().mockResolvedValue({ error: null });
+		await fixture.database.batch([
+			fixture.database.delete(messengerSupportEmails),
+			fixture.database.delete(messengerMessages),
+			fixture.database.delete(messengerConversations),
 		]);
-		const { createAccountDeletionRequest } = await import(
-			"@/lib/account-deletion-request"
-		);
-
-		await expect(
-			createAccountDeletionRequest({
-				user: {
-					id: User.UserId.make("user-123"),
-					email: "user@example.com",
-				},
-			}),
-		).resolves.toEqual({
-			id: "existing-request",
-			status: "existing",
-			notificationSent: true,
+	});
+	it("records all request rows before notifying the configured operator", async () => {
+		state.sendEmail.mockImplementation(async () => {
+			expect(
+				await fixture.database.select().from(messengerSupportEmails),
+			).toHaveLength(1);
+			expect(
+				await fixture.database.select().from(messengerMessages),
+			).toHaveLength(1);
+			expect(
+				await fixture.database.select().from(messengerConversations),
+			).toHaveLength(1);
+			return { error: null };
 		});
-
-		expect(valuesMock).not.toHaveBeenCalled();
-		expect(sendEmailMock).toHaveBeenCalledWith(
+		const result = await createAccountDeletionRequest({ user });
+		expect(result).toMatchObject({ status: "created", notificationSent: true });
+		expect(state.sendEmail).toHaveBeenCalledWith(
 			expect.objectContaining({
-				idempotencyKey: "account-deletion-existing-request",
+				email: "operator@example.com",
+				replyTo: user.email,
+				idempotencyKey: `account-deletion-${result.id}`,
 			}),
+		);
+		expect(state.sendEmail.mock.calls[0]?.[0]).not.toHaveProperty(
+			"fromOverride",
 		);
 	});
-
-	it("keeps the durable request when notification delivery fails", async () => {
-		sendEmailMock.mockRejectedValueOnce(new Error("email unavailable"));
-		const { createAccountDeletionRequest } = await import(
-			"@/lib/account-deletion-request"
+	it("concurrent deletion requests share one durable record", async () => {
+		const results = await Promise.all(
+			Array.from({ length: 4 }, () => createAccountDeletionRequest({ user })),
 		);
-
-		await expect(
-			createAccountDeletionRequest({
-				user: {
-					id: User.UserId.make("user-123"),
-					email: "user@example.com",
-				},
-			}),
-		).resolves.toEqual({
-			id: "request-123",
-			status: "created",
-			notificationSent: false,
-		});
-		expect(valuesMock).toHaveBeenCalledTimes(3);
+		expect(new Set(results.map((result) => result.id)).size).toBe(1);
+		expect(
+			results.filter((result) => result.status === "created"),
+		).toHaveLength(1);
+		expect(
+			await fixture.database.select().from(messengerSupportEmails),
+		).toHaveLength(1);
 	});
-
-	it("finds pending requests by user identity", async () => {
-		limitMock.mockResolvedValueOnce([{ id: "request-123" }]);
-		const { hasPendingAccountDeletion } = await import(
-			"@/lib/account-deletion-request"
-		);
-
-		await expect(
-			hasPendingAccountDeletion({
-				userId: User.UserId.make("user-123"),
-				email: "User@Example.com",
-			}),
-		).resolves.toBe(true);
+	it("retains the durable request when email delivery fails", async () => {
+		state.sendEmail.mockRejectedValue(new Error("Synthetic mail failure"));
+		const result = await createAccountDeletionRequest({ user });
+		expect(result.notificationSent).toBe(false);
+		expect(
+			await fixture.database.select().from(messengerSupportEmails),
+		).toHaveLength(1);
 	});
-
-	it("durably records mobile content reports before notifying support", async () => {
-		const { createMobileContentReport } = await import(
-			"@/lib/account-deletion-request"
-		);
-		const now = new Date("2026-07-23T11:00:00.000Z");
-
-		await expect(
-			createMobileContentReport({
-				reporter: {
-					id: User.UserId.make("user-123"),
-					email: "Reporter@Example.com",
-					name: "Reporter",
-				},
-				content: {
-					id: Video.VideoId.make("video-123"),
-					ownerId: User.UserId.make("owner-123"),
-					title: "Reported Cap",
-				},
-				reason: "harassment",
-				now,
-			}),
-		).resolves.toEqual({
-			id: "request-123",
-			notificationSent: true,
+	it("finds pending requests through normalized email or user identity", async () => {
+		await createAccountDeletionRequest({ user });
+		expect(await hasPendingAccountDeletion({ userId: user.id })).toBe(true);
+		expect(
+			await hasPendingAccountDeletion({ email: user.email.toUpperCase() }),
+		).toBe(true);
+		expect(
+			await hasPendingAccountDeletion({ email: "someone@example.com" }),
+		).toBe(false);
+	});
+	it("stores content reports and uses the private application's URL", async () => {
+		const result = await createMobileContentReport({
+			reporter: user,
+			content: {
+				id: "reported-video" as Video.VideoId,
+				ownerId: user.id,
+				title: "Example",
+			},
+			reason: "other",
 		});
-
-		expect(valuesMock).toHaveBeenNthCalledWith(
-			3,
-			expect.objectContaining({
-				id: "request-123",
-				userEmail: "reporter@example.com",
-				subject: "[PENDING] Mobile content report",
-				message: expect.stringContaining("Cap ID: video-123"),
-			}),
+		expect(result.notificationSent).toBe(true);
+		const [request] = await fixture.database
+			.select()
+			.from(messengerSupportEmails);
+		expect(request?.message).toContain(
+			"https://videos.example.com/s/reported-video",
 		);
-		expect(sendEmailMock).toHaveBeenCalledWith(
-			expect.objectContaining({
-				idempotencyKey: "mobile-content-report-request-123",
-				subject: "[PENDING] Mobile content report",
-			}),
-		);
-		expect(valuesMock.mock.invocationCallOrder[2]).toBeLessThan(
-			sendEmailMock.mock.invocationCallOrder[0] ?? 0,
+		expect(request?.message).not.toContain("https://cap.so/");
+		expect(state.sendEmail).toHaveBeenCalledWith(
+			expect.objectContaining({ email: "operator@example.com" }),
 		);
 	});
 });

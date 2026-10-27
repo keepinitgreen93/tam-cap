@@ -1,6 +1,31 @@
+vi.mock("@cap/env", () => ({ buildEnv: { NEXT_PUBLIC_IS_CAP: "true" } }));
+
+import type {
+	AtomicPlan,
+	AtomicSnapshot,
+} from "@cap/database/cloudflare/atomic";
+
+vi.mock("@cap/database/cloudflare/atomic", () => ({
+	atomic: async (
+		_database: unknown,
+		plan: (snapshot: AtomicSnapshot) => Promise<AtomicPlan<unknown>>,
+	) => {
+		const planned = await plan({
+			read: async (reader) =>
+				reader(
+					mockDb as unknown as Parameters<
+						Parameters<AtomicSnapshot["read"]>[0]
+					>[0],
+				),
+		});
+		await mockDb.batch(planned.statements);
+		return planned.result;
+	},
+}));
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@cap/database", () => {
+vi.mock("@cap/database/cloudflare/application", () => {
 	const mockDb = {
 		select: vi.fn(() => mockDb),
 		insert: vi.fn(() => mockDb),
@@ -11,7 +36,7 @@ vi.mock("@cap/database", () => {
 		where: vi.fn(() => mockDb),
 		limit: vi.fn(() => Promise.resolve([])),
 		values: vi.fn(() => Promise.resolve()),
-		transaction: vi.fn((fn) => fn(mockDb)),
+		batch: vi.fn(async () => []),
 		leftJoin: vi.fn(() => mockDb),
 		orderBy: vi.fn(() => mockDb),
 		offset: vi.fn(() => mockDb),
@@ -35,7 +60,7 @@ vi.mock("@cap/database/crypto", () => ({
 	encrypt: vi.fn(async (value: string) => `encrypted:${value}`),
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	developerApps: {
 		id: "id",
 		ownerId: "ownerId",
@@ -86,8 +111,8 @@ vi.mock("drizzle-orm", () => ({
 	sql: vi.fn(),
 }));
 
-import * as capDatabase from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import * as capDatabase from "@cap/database/cloudflare/application";
 
 const mockGetCurrentUser = getCurrentUser as ReturnType<typeof vi.fn>;
 
@@ -102,7 +127,7 @@ interface MockDb {
 	where: MockFn;
 	limit: MockFn;
 	values: MockFn;
-	transaction: MockFn;
+	batch: MockFn;
 	leftJoin: MockFn;
 	orderBy: MockFn;
 	offset: MockFn;
@@ -139,7 +164,7 @@ function resetMockDb() {
 	mockDb.leftJoin.mockReturnValue(mockDb);
 	mockDb.orderBy.mockReturnValue(mockDb);
 	mockDb.offset.mockReturnValue(mockDb);
-	mockDb.transaction.mockImplementation((fn) => fn(mockDb));
+	mockDb.batch.mockResolvedValue([]);
 }
 
 describe("createDeveloperApp", () => {
@@ -558,22 +583,9 @@ describe("addCreditsToAccount", () => {
 	});
 
 	it("correctly calculates micro-credits from cents", async () => {
-		mockDb.transaction.mockImplementation(async (fn) => {
-			const txDb = { ...mockDb };
-			txDb.select = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.from = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.where = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.update = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.set = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.insert = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.values = vi.fn(() => Promise.resolve()) as unknown as ReturnType<
-				typeof vi.fn
-			>;
-			txDb.limit = vi.fn(() =>
-				Promise.resolve([{ balanceMicroCredits: 1000000 }]),
-			) as unknown as ReturnType<typeof vi.fn>;
-			return fn(txDb);
-		});
+		mockDb.limit
+			.mockResolvedValueOnce([{ balanceMicroCredits: 0 }])
+			.mockResolvedValueOnce([]);
 
 		const result = await addCreditsToAccount({
 			accountId: "account-001",
@@ -583,24 +595,9 @@ describe("addCreditsToAccount", () => {
 	});
 
 	it("creates topup transaction record with referenceType", async () => {
-		let capturedValues: Record<string, unknown> | null = null;
-		mockDb.transaction.mockImplementation(async (fn) => {
-			const txDb = { ...mockDb };
-			txDb.select = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.from = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.where = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.update = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.set = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.insert = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.values = vi.fn((vals: Record<string, unknown>) => {
-				capturedValues = vals;
-				return Promise.resolve();
-			}) as unknown as ReturnType<typeof vi.fn>;
-			txDb.limit = vi.fn(() =>
-				Promise.resolve([{ balanceMicroCredits: 500000 }]),
-			) as unknown as ReturnType<typeof vi.fn>;
-			return fn(txDb);
-		});
+		mockDb.limit
+			.mockResolvedValueOnce([{ balanceMicroCredits: 0 }])
+			.mockResolvedValueOnce([]);
 
 		await addCreditsToAccount({
 			accountId: "account-001",
@@ -608,7 +605,7 @@ describe("addCreditsToAccount", () => {
 			referenceId: "pi_test123",
 			referenceType: "stripe_payment_intent",
 		});
-		expect(capturedValues).toMatchObject({
+		expect(mockDb.values.mock.calls[0]?.[0]).toMatchObject({
 			type: "topup",
 			referenceId: "pi_test123",
 			referenceType: "stripe_payment_intent",
@@ -616,22 +613,9 @@ describe("addCreditsToAccount", () => {
 	});
 
 	it("returns the new balance", async () => {
-		mockDb.transaction.mockImplementation(async (fn) => {
-			const txDb = { ...mockDb };
-			txDb.select = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.from = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.where = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.update = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.set = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.insert = vi.fn(() => txDb) as unknown as ReturnType<typeof vi.fn>;
-			txDb.values = vi.fn(() => Promise.resolve()) as unknown as ReturnType<
-				typeof vi.fn
-			>;
-			txDb.limit = vi.fn(() =>
-				Promise.resolve([{ balanceMicroCredits: 750000 }]),
-			) as unknown as ReturnType<typeof vi.fn>;
-			return fn(txDb);
-		});
+		mockDb.limit
+			.mockResolvedValueOnce([{ balanceMicroCredits: 0 }])
+			.mockResolvedValueOnce([]);
 
 		const result = await addCreditsToAccount({
 			accountId: "account-001",

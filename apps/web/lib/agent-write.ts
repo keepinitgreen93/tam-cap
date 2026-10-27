@@ -1,23 +1,26 @@
 import "server-only";
 
 import { createHash } from "node:crypto";
+import {
+	type AtomicPlan,
+	type AtomicSnapshot,
+	type AtomicStatement,
+	atomic,
+} from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
-import { Database, type DbClient } from "@cap/web-backend";
+import { CloudflareDatabase, type CloudflareDbClient } from "@cap/web-backend";
 import {
 	Agent,
 	Comment,
 	type DatabaseError,
 	type Video,
 } from "@cap/web-domain";
-import { and, eq, sql } from "drizzle-orm";
-import { Effect, Schedule, Schema } from "effect";
+import { and, eq } from "drizzle-orm";
+import { Effect, Option, Schedule, Schema } from "effect";
 import { revalidatePath } from "next/cache";
 import { createNotification } from "@/lib/Notification";
 import { enqueueVideoStorageNameSync } from "@/lib/sync-video-storage-names";
-
-type TransactionCallback = Parameters<DbClient["transaction"]>[0];
-type Transaction = Parameters<TransactionCallback>[0];
 
 export type AgentMutationOutcome<A> =
 	| { state: "success"; response: A }
@@ -33,15 +36,6 @@ type IdempotencyInput = {
 	expiresAt: Date;
 };
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
-
 const hash = (value: string) =>
 	createHash("sha256").update(value).digest("hex");
 
@@ -54,66 +48,62 @@ export const isAgentIdempotencyKey = (value: string | undefined) =>
 	value.length <= 128 &&
 	/^[A-Za-z0-9._-]+$/.test(value);
 
-const acquireIdempotency = async (tx: Transaction, input: IdempotencyInput) => {
+const acquireIdempotency = async (
+	snapshot: AtomicSnapshot,
+	database: CloudflareDbClient,
+	input: IdempotencyInput,
+	candidateId: string,
+	now: Date,
+) => {
 	const keyHash = hash(input.key);
-	const candidateId = nanoId();
-	await tx
-		.insert(Db.agentApiIdempotency)
-		.values({
-			id: candidateId,
-			userId: input.userId,
-			operation: input.operation,
-			keyHash,
-			requestHash: input.requestHash,
-			expiresAt: input.expiresAt,
-		})
-		.onDuplicateKeyUpdate({
-			set: { keyHash: sql`${Db.agentApiIdempotency.keyHash}` },
-		});
-	const [record] = await tx
-		.select()
-		.from(Db.agentApiIdempotency)
-		.where(
-			and(
-				eq(Db.agentApiIdempotency.userId, input.userId),
-				eq(Db.agentApiIdempotency.operation, input.operation),
-				eq(Db.agentApiIdempotency.keyHash, keyHash),
-			),
-		)
-		.limit(1)
-		.for("update");
-	if (!record) return { state: "unavailable" as const };
-	if (record.expiresAt.getTime() <= Date.now()) {
-		await tx
-			.update(Db.agentApiIdempotency)
-			.set({
-				requestHash: input.requestHash,
-				state: "pending",
-				statusCode: null,
-				response: null,
-				expiresAt: input.expiresAt,
-			})
-			.where(eq(Db.agentApiIdempotency.id, record.id));
-		return { state: "new" as const, record };
-	}
-	if (record.requestHash !== input.requestHash) {
-		return { state: "conflict" as const };
-	}
-	if (record.state === "complete") {
-		return { state: "replay" as const, record };
-	}
-	if (record.id !== candidateId) {
+	const [record] = await snapshot.read((reader) =>
+		reader
+			.select()
+			.from(Db.agentApiIdempotency)
+			.where(
+				and(
+					eq(Db.agentApiIdempotency.userId, input.userId),
+					eq(Db.agentApiIdempotency.operation, input.operation),
+					eq(Db.agentApiIdempotency.keyHash, keyHash),
+				),
+			)
+			.limit(1),
+	);
+	if (record && record.expiresAt.getTime() > now.getTime()) {
+		if (record.requestHash !== input.requestHash)
+			return { state: "conflict" as const };
+		if (record.state === "complete")
+			return { state: "replay" as const, record };
 		return { state: "pending" as const };
 	}
-	return { state: "new" as const, record };
+	const projected: typeof Db.agentApiIdempotency.$inferSelect = {
+		id: record?.id ?? candidateId,
+		userId: input.userId,
+		operation: input.operation,
+		keyHash,
+		requestHash: input.requestHash,
+		expiresAt: input.expiresAt,
+		state: "pending",
+		response: null,
+		statusCode: null,
+		createdAt: record?.createdAt ?? now,
+		updatedAt: now,
+	};
+	const statement = record
+		? database
+				.update(Db.agentApiIdempotency)
+				.set(projected)
+				.where(eq(Db.agentApiIdempotency.id, record.id))
+		: database.insert(Db.agentApiIdempotency).values(projected);
+	return { state: "new" as const, record: projected, statements: [statement] };
 };
 
-const completeIdempotency = async (
-	tx: Transaction,
+const completeIdempotency = (
+	database: CloudflareDbClient,
 	id: string,
 	response: unknown,
-) => {
-	const result = await tx
+) =>
+	database
 		.update(Db.agentApiIdempotency)
 		.set({ state: "complete", statusCode: 200, response })
 		.where(
@@ -122,13 +112,8 @@ const completeIdempotency = async (
 				eq(Db.agentApiIdempotency.state, "pending"),
 			),
 		);
-	if (getAffectedRows(result) !== 1) {
-		throw new Error("Could not complete idempotent mutation");
-	}
-};
-
-const releaseIdempotency = (tx: Transaction, id: string) =>
-	tx
+const releaseIdempotency = (database: CloudflareDbClient, id: string) =>
+	database
 		.delete(Db.agentApiIdempotency)
 		.where(
 			and(
@@ -174,6 +159,46 @@ const idempotencyConflict = (requestId: string) =>
 		code: "IDEMPOTENCY_CONFLICT",
 	});
 
+export const readAgentMutationReplay = <A>(input: {
+	principal: Agent.AgentPrincipal["Type"];
+	operation: string;
+	idempotencyKey: string;
+	request: unknown;
+	requestId: string;
+	decodeReplay: (value: unknown) => A;
+}) =>
+	Effect.gen(function* () {
+		if (!isAgentIdempotencyKey(input.idempotencyKey))
+			return yield* badRequest(
+				input.requestId,
+				"A valid Idempotency-Key header is required",
+			);
+		const database = yield* CloudflareDatabase;
+		const [record] = yield* database.use((db) =>
+			db
+				.select()
+				.from(Db.agentApiIdempotency)
+				.where(
+					and(
+						eq(Db.agentApiIdempotency.userId, input.principal.id),
+						eq(Db.agentApiIdempotency.operation, input.operation),
+						eq(Db.agentApiIdempotency.keyHash, hash(input.idempotencyKey)),
+					),
+				)
+				.limit(1),
+		);
+		if (!record || record.expiresAt.getTime() <= Date.now())
+			return Option.none<A>();
+		if (
+			record.requestHash !==
+			agentMutationRequestHash(input.operation, input.request)
+		)
+			return yield* idempotencyConflict(input.requestId);
+		if (record.state !== "complete")
+			return yield* temporarilyUnavailable(input.requestId);
+		return Option.some(input.decodeReplay(record.response));
+	});
+
 export const runAgentMutation = <A>(input: {
 	principal: Agent.AgentPrincipal["Type"];
 	operation: string;
@@ -181,7 +206,10 @@ export const runAgentMutation = <A>(input: {
 	request: unknown;
 	requestId: string;
 	decodeReplay: (value: unknown) => A;
-	execute: (tx: Transaction) => Promise<AgentMutationOutcome<NoInfer<A>>>;
+	execute: (
+		snapshot: AtomicSnapshot,
+		database: CloudflareDbClient,
+	) => Promise<AtomicPlan<AgentMutationOutcome<NoInfer<A>>>>;
 }): Effect.Effect<
 	A,
 	| Agent.AgentBadRequestError
@@ -190,7 +218,7 @@ export const runAgentMutation = <A>(input: {
 	| Agent.AgentNotFoundError
 	| Agent.AgentForbiddenError
 	| DatabaseError,
-	Database
+	CloudflareDatabase
 > =>
 	Effect.gen(function* () {
 		if (!isAgentIdempotencyKey(input.idempotencyKey)) {
@@ -199,48 +227,71 @@ export const runAgentMutation = <A>(input: {
 				"A valid Idempotency-Key header is required",
 			);
 		}
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
+		const now = new Date();
+		const candidateId = nanoId();
 		const requestHash = agentMutationRequestHash(
 			input.operation,
 			input.request,
 		);
 		const result = yield* database.use((db) =>
-			db.transaction(async (tx) => {
-				const idempotency = await acquireIdempotency(tx, {
-					userId: input.principal.id,
-					operation: input.operation,
-					key: input.idempotencyKey,
-					requestHash,
-					expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-				});
+			atomic<
+				| AgentMutationOutcome<A>
+				| { state: "idempotency_conflict" | "pending" }
+				| { state: "replay"; response: A }
+			>(db, async (snapshot) => {
+				const statements: AtomicStatement[] = [];
+				const idempotency = await acquireIdempotency(
+					snapshot,
+					db,
+					{
+						userId: input.principal.id,
+						operation: input.operation,
+						key: input.idempotencyKey,
+						requestHash,
+						expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+					},
+					candidateId,
+					now,
+				);
+				if (idempotency.state === "new")
+					statements.push(...idempotency.statements);
 				if (idempotency.state === "conflict") {
-					return { state: "idempotency_conflict" as const };
+					return {
+						statements,
+						result: { state: "idempotency_conflict" as const },
+					};
 				}
-				if (idempotency.state === "unavailable") {
-					return { state: "unavailable" as const };
-				}
+
 				if (idempotency.state === "pending") {
-					return { state: "pending" as const };
+					return { statements, result: { state: "pending" as const } };
 				}
 				if (idempotency.state === "replay") {
 					return {
-						state: "replay" as const,
-						response: input.decodeReplay(idempotency.record.response),
+						statements,
+						result: {
+							state: "replay" as const,
+							response: input.decodeReplay(idempotency.record.response),
+						},
 					};
 				}
-				const outcome = await input.execute(tx);
+				const planned = await input.execute(snapshot, db);
+				const outcome = planned.result;
+				if (outcome.state === "success") statements.push(...planned.statements);
 				if (outcome.state !== "success") {
-					await releaseIdempotency(tx, idempotency.record.id);
-					return outcome;
+					statements.push(releaseIdempotency(db, idempotency.record.id));
+					return { statements, result: outcome };
 				}
-				await completeIdempotency(tx, idempotency.record.id, outcome.response);
-				return outcome;
+				statements.push(
+					completeIdempotency(db, idempotency.record.id, outcome.response),
+				);
+				return { statements, result: outcome };
 			}),
 		);
 		if (result.state === "idempotency_conflict") {
 			return yield* idempotencyConflict(input.requestId);
 		}
-		if (result.state === "unavailable" || result.state === "pending") {
+		if (result.state === "pending") {
 			return yield* temporarilyUnavailable(input.requestId);
 		}
 		if (result.state === "not_found") return yield* notFound(input.requestId);
@@ -280,7 +331,7 @@ export const runAgentExternalMutation = <A, E, R>(input: {
 	| Agent.AgentConflictError
 	| Agent.AgentTemporaryUnavailableError
 	| DatabaseError,
-	R | Database
+	R | CloudflareDatabase
 > =>
 	Effect.gen(function* () {
 		if (!isAgentIdempotencyKey(input.idempotencyKey)) {
@@ -289,33 +340,53 @@ export const runAgentExternalMutation = <A, E, R>(input: {
 				"A valid Idempotency-Key header is required",
 			);
 		}
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
+		const now = new Date();
+		const candidateId = nanoId();
 		const requestHash = agentMutationRequestHash(
 			input.operation,
 			input.request,
 		);
 		const acquired = yield* database.use((db) =>
-			db.transaction(async (tx) => {
-				const idempotency = await acquireIdempotency(tx, {
-					userId: input.principal.id,
-					operation: input.operation,
-					key: input.idempotencyKey,
-					requestHash,
-					expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-				});
+			atomic<
+				| Exclude<
+						Awaited<ReturnType<typeof acquireIdempotency>>,
+						{ state: "replay" }
+				  >
+				| { state: "replay"; response: A }
+			>(db, async (snapshot) => {
+				const statements: AtomicStatement[] = [];
+				const idempotency = await acquireIdempotency(
+					snapshot,
+					db,
+					{
+						userId: input.principal.id,
+						operation: input.operation,
+						key: input.idempotencyKey,
+						requestHash,
+						expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+					},
+					candidateId,
+					now,
+				);
+				if (idempotency.state === "new")
+					statements.push(...idempotency.statements);
 				if (idempotency.state === "replay") {
 					return {
-						state: "replay" as const,
-						response: input.decodeReplay(idempotency.record.response),
+						statements,
+						result: {
+							state: "replay" as const,
+							response: input.decodeReplay(idempotency.record.response),
+						},
 					};
 				}
-				return idempotency;
+				return { statements, result: idempotency };
 			}),
 		);
 		if (acquired.state === "conflict") {
 			return yield* idempotencyConflict(input.requestId);
 		}
-		if (acquired.state === "unavailable" || acquired.state === "pending") {
+		if (acquired.state === "pending") {
 			return yield* temporarilyUnavailable(input.requestId);
 		}
 		if (acquired.state === "replay") return acquired.response;
@@ -333,6 +404,11 @@ export const runAgentExternalMutation = <A, E, R>(input: {
 								and(
 									eq(Db.agentApiIdempotency.id, acquired.record.id),
 									eq(Db.agentApiIdempotency.state, "pending"),
+									eq(Db.agentApiIdempotency.requestHash, requestHash),
+									eq(
+										Db.agentApiIdempotency.expiresAt,
+										acquired.record.expiresAt,
+									),
 								),
 							),
 					),
@@ -340,21 +416,27 @@ export const runAgentExternalMutation = <A, E, R>(input: {
 			);
 		return yield* database
 			.use((db) =>
-				db.transaction(async (tx) => {
-					const [record] = await tx
-						.select()
-						.from(Db.agentApiIdempotency)
-						.where(eq(Db.agentApiIdempotency.id, acquired.record.id))
-						.limit(1)
-						.for("update");
-					if (!record || record.requestHash !== requestHash) {
+				atomic<A>(db, async (snapshot) => {
+					const statements: AtomicStatement[] = [];
+					const [record] = await snapshot.read((reader) =>
+						reader
+							.select()
+							.from(Db.agentApiIdempotency)
+							.where(eq(Db.agentApiIdempotency.id, acquired.record.id))
+							.limit(1),
+					);
+					if (
+						!record ||
+						record.requestHash !== requestHash ||
+						record.expiresAt.getTime() !== acquired.record.expiresAt.getTime()
+					) {
 						throw new Error("Could not complete external agent mutation");
 					}
 					if (record.state === "complete") {
-						return input.decodeReplay(record.response);
+						return { statements, result: input.decodeReplay(record.response) };
 					}
-					await completeIdempotency(tx, record.id, response);
-					return response;
+					statements.push(completeIdempotency(db, record.id, response));
+					return { statements, result: response };
 				}),
 			)
 			.pipe(
@@ -398,7 +480,9 @@ export const createAgentFeedback = Effect.fn("Agent.createFeedback")(
 			);
 		}
 
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
+		const now = new Date();
+		const candidateId = nanoId();
 		const operation = input.parentCommentId
 			? "create_reply"
 			: input.type === "emoji"
@@ -414,62 +498,84 @@ export const createAgentFeedback = Effect.fn("Agent.createFeedback")(
 			}),
 		);
 		const result = yield* database.use((db) =>
-			db.transaction(async (tx) => {
-				const idempotency = await acquireIdempotency(tx, {
-					userId: input.principal.id,
-					operation,
-					key: input.idempotencyKey,
-					requestHash,
-					expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-				});
+			atomic<
+				| { state: "conflict" }
+				| { state: "pending" }
+				| { state: "not_found" }
+				| {
+						state: "replay" | "created";
+						response: typeof Agent.AgentFeedbackResponse.Type;
+				  }
+			>(db, async (snapshot) => {
+				const statements: AtomicStatement[] = [];
+				const idempotency = await acquireIdempotency(
+					snapshot,
+					db,
+					{
+						userId: input.principal.id,
+						operation,
+						key: input.idempotencyKey,
+						requestHash,
+						expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+					},
+					candidateId,
+					now,
+				);
+				if (idempotency.state === "new")
+					statements.push(...idempotency.statements);
 				if (idempotency.state === "conflict") {
-					return { state: "conflict" as const };
+					return { statements, result: { state: "conflict" as const } };
 				}
-				if (idempotency.state === "unavailable") {
-					return { state: "unavailable" as const };
-				}
+
 				if (idempotency.state === "pending") {
-					return { state: "pending" as const };
+					return { statements, result: { state: "pending" as const } };
 				}
 				if (idempotency.state === "replay") {
 					return {
-						state: "replay" as const,
-						response: Schema.decodeUnknownSync(Agent.AgentFeedbackResponse)(
-							idempotency.record.response,
-						),
+						statements,
+						result: {
+							state: "replay" as const,
+							response: Schema.decodeUnknownSync(Agent.AgentFeedbackResponse)(
+								idempotency.record.response,
+							),
+						},
 					};
 				}
-				if (input.parentCommentId) {
-					const [parent] = await tx
-						.select({ id: Db.comments.id })
-						.from(Db.comments)
-						.where(
-							and(
-								eq(Db.comments.id, input.parentCommentId),
-								eq(Db.comments.videoId, input.videoId),
-								eq(Db.comments.type, "text"),
-							),
-						)
-						.limit(1);
+				const parentCommentId = input.parentCommentId;
+				if (parentCommentId) {
+					const [parent] = await snapshot.read((reader) =>
+						reader
+							.select({ id: Db.comments.id })
+							.from(Db.comments)
+							.where(
+								and(
+									eq(Db.comments.id, parentCommentId),
+									eq(Db.comments.videoId, input.videoId),
+									eq(Db.comments.type, "text"),
+								),
+							)
+							.limit(1),
+					);
 					if (!parent) {
-						await releaseIdempotency(tx, idempotency.record.id);
-						return { state: "not_found" as const };
+						statements.push(releaseIdempotency(db, idempotency.record.id));
+						return { statements, result: { state: "not_found" as const } };
 					}
 				}
-				const now = new Date();
-				const id = Comment.CommentId.make(nanoId());
-				await tx.insert(Db.comments).values({
-					id,
-					authorId: input.principal.id,
-					type: input.type,
-					content,
-					videoId: input.videoId,
-					timestamp:
-						input.timestampMs === null ? null : input.timestampMs / 1_000,
-					parentCommentId: input.parentCommentId,
-					createdAt: now,
-					updatedAt: now,
-				});
+				const id = Comment.CommentId.make(candidateId);
+				statements.push(
+					db.insert(Db.comments).values({
+						id,
+						authorId: input.principal.id,
+						type: input.type,
+						content,
+						videoId: input.videoId,
+						timestamp:
+							input.timestampMs === null ? null : input.timestampMs / 1_000,
+						parentCommentId: input.parentCommentId,
+						createdAt: now,
+						updatedAt: now,
+					}),
+				);
 				const response = {
 					id,
 					videoId: input.videoId,
@@ -482,15 +588,17 @@ export const createAgentFeedback = Effect.fn("Agent.createFeedback")(
 					author: { id: input.principal.id, name: null },
 					requestId: input.requestId,
 				};
-				await completeIdempotency(tx, idempotency.record.id, response);
-				return { state: "created" as const, response };
+				statements.push(
+					completeIdempotency(db, idempotency.record.id, response),
+				);
+				return { statements, result: { state: "created" as const, response } };
 			}),
 		);
 
 		if (result.state === "conflict") {
 			return yield* idempotencyConflict(input.requestId);
 		}
-		if (result.state === "unavailable" || result.state === "pending") {
+		if (result.state === "pending") {
 			return yield* temporarilyUnavailable(input.requestId);
 		}
 		if (result.state === "not_found") {
@@ -541,71 +649,93 @@ export const updateAgentCap = Effect.fn("Agent.updateCap")(function* (input: {
 	const requestHash = hash(
 		JSON.stringify({ videoId: input.videoId, title, public: input.public }),
 	);
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
+	const now = new Date();
+	const candidateId = nanoId();
 	const result = yield* database.use((db) =>
-		db.transaction(async (tx) => {
-			const idempotency = await acquireIdempotency(tx, {
-				userId: input.principal.id,
-				operation: "update_cap",
-				key: input.idempotencyKey,
-				requestHash,
-				expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
-			});
+		atomic<
+			| { state: "conflict" }
+			| { state: "pending" }
+			| { state: "not_found" }
+			| {
+					state: "replay" | "updated";
+					response: typeof Agent.AgentCapUpdateResponse.Type;
+			  }
+		>(db, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const idempotency = await acquireIdempotency(
+				snapshot,
+				db,
+				{
+					userId: input.principal.id,
+					operation: "update_cap",
+					key: input.idempotencyKey,
+					requestHash,
+					expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+				},
+				candidateId,
+				now,
+			);
+			if (idempotency.state === "new")
+				statements.push(...idempotency.statements);
 			if (idempotency.state === "conflict") {
-				return { state: "conflict" as const };
+				return { statements, result: { state: "conflict" as const } };
 			}
-			if (idempotency.state === "unavailable") {
-				return { state: "unavailable" as const };
-			}
+
 			if (idempotency.state === "pending") {
-				return { state: "pending" as const };
+				return { statements, result: { state: "pending" as const } };
 			}
 			if (idempotency.state === "replay") {
 				return {
-					state: "replay" as const,
-					response: Schema.decodeUnknownSync(Agent.AgentCapUpdateResponse)(
-						idempotency.record.response,
-					),
+					statements,
+					result: {
+						state: "replay" as const,
+						response: Schema.decodeUnknownSync(Agent.AgentCapUpdateResponse)(
+							idempotency.record.response,
+						),
+					},
 				};
 			}
-			const [video] = await tx
-				.select({
-					name: Db.videos.name,
-					public: Db.videos.public,
-					metadata: Db.videos.metadata,
-				})
-				.from(Db.videos)
-				.where(
-					and(
-						eq(Db.videos.id, input.videoId),
-						eq(Db.videos.ownerId, input.principal.id),
-					),
-				)
-				.limit(1)
-				.for("update");
+			const [video] = await snapshot.read((reader) =>
+				reader
+					.select({
+						name: Db.videos.name,
+						public: Db.videos.public,
+						metadata: Db.videos.metadata,
+					})
+					.from(Db.videos)
+					.where(
+						and(
+							eq(Db.videos.id, input.videoId),
+							eq(Db.videos.ownerId, input.principal.id),
+						),
+					)
+					.limit(1),
+			);
 			if (!video) {
-				await releaseIdempotency(tx, idempotency.record.id);
-				return { state: "not_found" as const };
+				statements.push(releaseIdempotency(db, idempotency.record.id));
+				return { statements, result: { state: "not_found" as const } };
 			}
-			const now = new Date();
 			const metadata =
 				video.metadata &&
 				typeof video.metadata === "object" &&
 				!Array.isArray(video.metadata)
 					? video.metadata
 					: {};
-			await tx
-				.update(Db.videos)
-				.set({
-					name: title ?? video.name,
-					public: input.public ?? video.public,
-					updatedAt: now,
-					metadata:
-						title === undefined
-							? metadata
-							: { ...metadata, titleManuallyEdited: true },
-				})
-				.where(eq(Db.videos.id, input.videoId));
+			statements.push(
+				db
+					.update(Db.videos)
+					.set({
+						name: title ?? video.name,
+						public: input.public ?? video.public,
+						updatedAt: now,
+						metadata:
+							title === undefined
+								? metadata
+								: { ...metadata, titleManuallyEdited: true },
+					})
+					.where(eq(Db.videos.id, input.videoId)),
+			);
 			const response = {
 				id: input.videoId,
 				title: title ?? video.name,
@@ -613,14 +743,14 @@ export const updateAgentCap = Effect.fn("Agent.updateCap")(function* (input: {
 				updatedAt: now.toISOString(),
 				requestId: input.requestId,
 			};
-			await completeIdempotency(tx, idempotency.record.id, response);
-			return { state: "updated" as const, response };
+			statements.push(completeIdempotency(db, idempotency.record.id, response));
+			return { statements, result: { state: "updated" as const, response } };
 		}),
 	);
 	if (result.state === "conflict") {
 		return yield* idempotencyConflict(input.requestId);
 	}
-	if (result.state === "unavailable" || result.state === "pending") {
+	if (result.state === "pending") {
 		return yield* temporarilyUnavailable(input.requestId);
 	}
 	if (result.state === "not_found") return yield* notFound(input.requestId);

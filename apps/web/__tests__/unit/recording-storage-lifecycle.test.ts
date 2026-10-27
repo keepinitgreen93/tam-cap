@@ -1,5 +1,10 @@
 import * as S3 from "@aws-sdk/client-s3";
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
+import { getTranscriptObjectKey } from "@cap/database/cloudflare/transcript-publication";
+import {
+	decryptEditTranscriptObject,
+	encryptEditTranscriptObject,
+} from "@cap/database/transcript-encryption";
 import {
 	CurrentUser,
 	DatabaseError,
@@ -10,9 +15,13 @@ import {
 	Video,
 } from "@cap/web-domain";
 import type { SQL } from "drizzle-orm";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { Cause, Effect, Exit, Logger, Option, Schema } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	databaseRevision,
+	snapshotGuard,
+} from "../../../../packages/database/cloudflare/concurrency-schema";
 
 const mocks = vi.hoisted(() => ({
 	database: vi.fn(),
@@ -25,7 +34,16 @@ const mocks = vi.hoisted(() => ({
 	nextId: "duplicate-video",
 }));
 
+vi.mock("@cap/env", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@cap/env")>()),
+	serverEnv: () => ({
+		NEXTAUTH_SECRET: "synthetic-duplicate-transcript-secret",
+		WEB_URL: "https://cap.test",
+		CAP_VIDEOS_DEFAULT_PUBLIC: true,
+	}),
+}));
 vi.mock("@cap/database", () => ({ db: mocks.database }));
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.database }));
 vi.mock("@cap/database/helpers", async (importOriginal) => ({
 	...(await importOriginal<typeof import("@cap/database/helpers")>()),
 	nanoId: () => mocks.nextId,
@@ -144,6 +162,7 @@ function databaseFixture(video = recording(), password?: string | null) {
 		password: password ?? null,
 	};
 	const rows = new Map<string, Record<string, unknown>>([[videoId, original]]);
+	const edits = new Map<string, Record<string, unknown>>();
 	const jobs = new Map<string, Record<string, unknown>>([
 		[
 			videoId,
@@ -173,11 +192,34 @@ function databaseFixture(video = recording(), password?: string | null) {
 	let beforePrepareDelete: (() => Promise<void>) | undefined;
 	let loseNextCreateResponse = false;
 	const idFrom = (condition: SQL) => {
-		const id = new MySqlDialect().sqlToQuery(condition).params[0];
+		const id = new SQLiteSyncDialect().sqlToQuery(condition).params[0];
 		if (typeof id !== "string") throw new Error("Missing database video id");
 		return id;
 	};
+	let revision = 0;
+	let signature = "";
+	const currentRevision = () => {
+		const next = JSON.stringify([
+			[...rows],
+			[...jobs],
+			[...uploads],
+			[...edits],
+		]);
+		if (next !== signature) {
+			signature = next;
+			revision++;
+		}
+		return revision;
+	};
 	const read = (table: unknown, condition: SQL) => {
+		if (table === databaseRevision) return [{ revision: currentRevision() }];
+		if (table === Db.organizations)
+			return [{ id: orgId, ownerId, tombstoneAt: null }];
+		if (table === Db.organizationMembers) return [];
+		if (table === Db.videoEdits) {
+			const edit = edits.get(idFrom(condition));
+			return edit ? [structuredClone(edit)] : [];
+		}
 		const source =
 			table === Db.videos
 				? rows
@@ -188,111 +230,96 @@ function databaseFixture(video = recording(), password?: string | null) {
 		const row = source.get(idFrom(condition));
 		return row ? [structuredClone(row)] : [];
 	};
-	function transactionHandle(pending: DatabaseMutation[]) {
-		return {
-			select: () => ({
-				from: (table: unknown) => ({
-					where: (condition: SQL) => ({
-						for: async () => read(table, condition),
-					}),
-				}),
-			}),
-			delete: (table: unknown) => ({
-				where: async (condition: SQL) => {
-					const id = idFrom(condition);
-					if (table === Db.videoProcessingJobs) {
-						events.push("job-delete-request");
-						await beforeJobDelete?.();
-						events.push("job-delete-complete");
-					} else {
-						events.push("dependent-delete");
-					}
-					pending.push({ operation: "delete", table, id });
-					return [{ affectedRows: 1 }];
-				},
-			}),
-			insert: (table: unknown) => ({
-				values: (
-					values: Record<string, unknown>[] | Record<string, unknown>,
-				) => {
-					if (Array.isArray(values)) {
-						for (const value of values) {
-							pending.push({ operation: "insert", table, values: value });
-						}
-						return Promise.resolve([{ affectedRows: 1 }]);
-					}
-					return {
-						onDuplicateKeyUpdate: async ({
-							set,
-						}: {
-							set: Record<string, unknown>;
-						}) => {
-							events.push("job-fence-request");
-							await beforePrepareDelete?.();
-							const id = values.videoId;
-							if (typeof id !== "string")
-								throw new Error("Missing retired job id");
-							pending.push({
-								operation: "insert",
-								table,
-								values: jobs.has(id) ? { ...jobs.get(id), ...set } : values,
-							});
-							return [{ affectedRows: 1 }];
-						},
-					};
-				},
-			}),
+	type Mutation = DatabaseMutation &
+		Promise<{ meta: { changes: number } }> & {
+			onConflictDoUpdate: (input: { set: Record<string, unknown> }) => Mutation;
 		};
-	}
-	const transaction = vi.fn(
-		async (
-			operation: (tx: ReturnType<typeof transactionHandle>) => Promise<unknown>,
-		) => {
-			const pending: DatabaseMutation[] = [];
-			const result = await operation(transactionHandle(pending));
-			for (const mutation of pending) {
-				mutations.push(mutation);
-				const table =
-					mutation.table === Db.videos
-						? rows
-						: mutation.table === Db.videoProcessingJobs
-							? jobs
-							: null;
-				const shareRows = shares.get(mutation.table);
-				if (shareRows && mutation.operation === "delete") {
-					for (const [id, row] of shareRows) {
-						if (row.videoId === mutation.id) shareRows.delete(id);
-					}
-				}
-				if (!table) continue;
-				if (mutation.operation === "delete" && mutation.id)
-					table.delete(mutation.id);
-				if (mutation.operation === "insert" && mutation.values) {
-					const id =
-						mutation.table === Db.videos
-							? mutation.values.id
-							: mutation.values.videoId;
-					if (typeof id !== "string") throw new Error("Missing inserted id");
-					table.set(id, mutation.values);
-				}
-			}
+	const mutation = (value: DatabaseMutation): Mutation =>
+		Object.assign(Promise.resolve({ meta: { changes: 1 } }), value, {
+			onConflictDoUpdate: ({ set }: { set: Record<string, unknown> }) =>
+				mutation({ ...value, values: { ...value.values, ...set } }),
+		});
+	const batch = vi.fn(async (statements: Mutation[]) => {
+		if (
+			statements.some(
+				(statement) =>
+					statement.operation === "insert" &&
+					statement.table === Db.videoProcessingJobs,
+			)
+		) {
+			events.push("job-fence-request");
+			await beforePrepareDelete?.();
+		}
+		const guard = statements.find(
+			(statement) =>
+				statement.table === snapshotGuard && statement.operation === "insert",
+		);
+		const valid = guard?.values?.valid;
+		if (valid) {
+			const expected = new SQLiteSyncDialect().sqlToQuery(valid as SQL)
+				.params[0];
+			if (expected !== currentRevision())
+				throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+		}
+		const pending = statements.filter(
+			(statement) => statement.table !== snapshotGuard,
+		);
+		for (const statement of pending) {
 			if (
-				loseNextCreateResponse &&
-				pending.some(
-					({ operation, table }) =>
-						operation === "insert" && table === Db.videos,
-				)
+				statement.operation === "delete" &&
+				statement.table === Db.videoProcessingJobs
 			) {
-				loseNextCreateResponse = false;
-				throw new Error("Committed video creation response was lost");
+				events.push("job-delete-request");
+				await beforeJobDelete?.();
+				events.push("job-delete-complete");
+			} else if (statement.operation === "delete")
+				events.push("dependent-delete");
+		}
+		for (const statement of pending) {
+			mutations.push(statement);
+			const table =
+				statement.table === Db.videos
+					? rows
+					: statement.table === Db.videoProcessingJobs
+						? jobs
+						: statement.table === Db.videoEdits
+							? edits
+							: null;
+			const shareRows = shares.get(statement.table);
+			if (shareRows && statement.operation === "delete")
+				for (const [id, row] of shareRows)
+					if (row.videoId === statement.id) shareRows.delete(id);
+			if (!table) continue;
+			if (statement.operation === "delete" && statement.id)
+				table.delete(statement.id);
+			if (statement.operation === "insert" && statement.values) {
+				const id =
+					statement.table === Db.videos
+						? statement.values.id
+						: statement.values.videoId;
+				if (typeof id !== "string") throw new Error("Missing inserted id");
+				table.set(id, statement.values);
 			}
-			return result;
-		},
-	);
+		}
+		if (
+			loseNextCreateResponse &&
+			pending.some(
+				({ operation, table }) => operation === "insert" && table === Db.videos,
+			)
+		) {
+			loseNextCreateResponse = false;
+			throw new Error("Committed video creation response was lost");
+		}
+		return [];
+	});
+	const selection = (table: unknown, condition: SQL) =>
+		Object.assign(Promise.resolve(read(table, condition)), {
+			limit: async () => read(table, condition),
+		});
 	mocks.database.mockReturnValue({
 		select: () => ({
 			from: (table: unknown) => ({
-				where: async (condition: SQL) => read(table, condition),
+				where: (condition: SQL) => selection(table, condition),
 				leftJoin: (joined: unknown) => ({
 					where: async (condition: SQL) => {
 						if (table !== Db.videoUploads || joined !== Db.videoProcessingJobs)
@@ -306,25 +333,35 @@ function databaseFixture(video = recording(), password?: string | null) {
 				}),
 			}),
 		}),
+		selectDistinct: () => {
+			throw new Error("Unexpected distinct selection");
+		},
+		query: {},
+		insert: (table: unknown) => ({
+			values: (values: Record<string, unknown>) =>
+				mutation({ operation: "insert", table, values }),
+		}),
 		delete: (table: unknown) => ({
-			where: async (condition: SQL) => {
-				if (table !== Db.storageObjects)
-					throw new Error("Unexpected direct delete");
-				objectDeleteConditions.push(condition);
-				return [{ affectedRows: 1 }];
+			where: (condition: SQL) => {
+				if (table === Db.storageObjects) objectDeleteConditions.push(condition);
+				return mutation({
+					operation: "delete",
+					table,
+					id: table === snapshotGuard ? undefined : idFrom(condition),
+				});
 			},
 		}),
-		transaction,
+		batch,
 	});
 	return {
 		rows,
+		edits,
 		jobs,
 		uploads,
 		shares,
 		mutations,
 		events,
 		objectDeleteConditions,
-		transaction,
 		beforeJobDelete: (callback: () => Promise<void>) => {
 			beforeJobDelete = callback;
 		},
@@ -410,6 +447,27 @@ async function storageFixture(seed: Iterable<readonly [string, string]>) {
 		afterCopy?.();
 	};
 	vi.spyOn(client, "send").mockImplementation(async (command) => {
+		if (command instanceof S3.GetObjectCommand) {
+			const key = command.input.Key;
+			if (!key || !objects.has(key))
+				throw new S3.NoSuchKey({
+					message: "Object missing",
+					$metadata: { httpStatusCode: 404 },
+				});
+			return {
+				Body: { transformToString: async () => objects.get(key) },
+				$metadata: {},
+			};
+		}
+		if (command instanceof S3.PutObjectCommand) {
+			const key = command.input.Key;
+			if (!key || typeof command.input.Body !== "string")
+				throw new Error("Unexpected transcript put");
+			objects.set(key, command.input.Body);
+			sizes.set(key, new TextEncoder().encode(command.input.Body).byteLength);
+			identities.set(key, `"transcript-${key}"`);
+			return { ETag: identities.get(key), $metadata: {} };
+		}
 		if (command instanceof S3.HeadObjectCommand) {
 			const key = command.input.Key;
 			if (!key || !objects.has(key)) throw new Error("Object not found");
@@ -668,6 +726,12 @@ async function driveFixture() {
 	const repo = await Effect.runPromise(
 		StorageRepo.pipe(Effect.provide(StorageRepo.Default)),
 	);
+	vi.spyOn(repo, "assertVideoAccess").mockReturnValue(
+		Effect.succeed(undefined),
+	);
+	vi.spyOn(repo, "assertOrganizationAccess").mockReturnValue(
+		Effect.succeed(undefined),
+	);
 	vi.spyOn(repo, "getIntegrationById").mockReturnValue(
 		Effect.succeed(Option.some(integration)),
 	);
@@ -920,11 +984,11 @@ describe("recording storage lifecycle", () => {
 		expect(database.rows.get("duplicate-video")?.metadata).not.toHaveProperty(
 			"desktopRecordingUpload",
 		);
-		expect(database.rows.get("duplicate-video")).not.toHaveProperty(
-			"createdAt",
+		expect(database.rows.get("duplicate-video")?.createdAt).toBeInstanceOf(
+			Date,
 		);
-		expect(database.rows.get("duplicate-video")).not.toHaveProperty(
-			"updatedAt",
+		expect(database.rows.get("duplicate-video")?.updatedAt).toEqual(
+			database.rows.get("duplicate-video")?.createdAt,
 		);
 		expect(database.rows.get("owned-video")?.metadata).toHaveProperty(
 			"desktopRecordingUpload",
@@ -970,6 +1034,8 @@ describe("recording storage lifecycle", () => {
 	it("preserves password and strips customCreatedAt without copying original createdAt or updatedAt", async () => {
 		const videoWithCustomDate = Video.Video.make({
 			...recording(),
+			createdAt: new Date("2020-01-01T00:00:00Z"),
+			updatedAt: new Date("2020-01-02T00:00:00Z"),
 			metadata: Option.some({
 				sourceName: "Dated recording",
 				customCreatedAt: "2020-01-01T00:00:00.000Z",
@@ -985,8 +1051,10 @@ describe("recording storage lifecycle", () => {
 		expect(Exit.isSuccess(result)).toBe(true);
 		const duplicated = database.rows.get("duplicate-video");
 		expect(duplicated).toBeDefined();
-		expect(duplicated).not.toHaveProperty("createdAt");
-		expect(duplicated).not.toHaveProperty("updatedAt");
+		expect(duplicated?.createdAt).toBeInstanceOf(Date);
+		expect(duplicated?.createdAt).not.toEqual(videoWithCustomDate.createdAt);
+		expect(duplicated?.updatedAt).toBeInstanceOf(Date);
+		expect(duplicated?.updatedAt).not.toEqual(videoWithCustomDate.updatedAt);
 		expect(duplicated?.metadata).not.toHaveProperty("customCreatedAt");
 		expect(duplicated).toMatchObject({
 			password: "secret-pass-123",
@@ -1026,16 +1094,28 @@ describe("recording storage lifecycle", () => {
 		expect(
 			storage.requests.filter(({ operation }) => operation === "list"),
 		).toHaveLength(2);
+		const transcriptKey = getTranscriptObjectKey(
+			{
+				id: Video.VideoId.make("duplicate-video"),
+				ownerId,
+				metadata: database.rows.get("duplicate-video")
+					?.metadata as typeof Db.videos.$inferSelect.metadata,
+			},
+			"vtt",
+		);
+		if (!transcriptKey)
+			throw new Error("Missing duplicated transcript pointer");
+		expect(storage.objects.get(transcriptKey)).toBe("published-transcription");
 		expect(
 			[...storage.objects.keys()]
 				.filter((key) => key.startsWith(newPrefix))
 				.sort(),
 		).toEqual([
+			transcriptKey,
 			`${newPrefix}chapter-data.json`,
 			`${newPrefix}preview/animated-preview.gif`,
 			`${newPrefix}result.mp4`,
 			`${newPrefix}screenshot/screen-capture.jpg`,
-			`${newPrefix}transcription.vtt`,
 		]);
 		expect(database.rows.get("duplicate-video")?.source).toEqual({
 			type: "desktopMP4",
@@ -1043,6 +1123,67 @@ describe("recording storage lifecycle", () => {
 		expect(storage.objects.get(retained.at(-1)?.[0] ?? "")).toBe(
 			"source-fragment",
 		);
+	});
+
+	it("duplicates original-timeline words with target encryption and the preserved edit source", async () => {
+		const database = databaseFixture();
+		const originalWords = JSON.stringify({
+			version: 3,
+			durationMs: 10000,
+			words: [{ id: "one", text: "hello", startMs: 1000, endMs: 1500 }],
+		});
+		const originalSource = `${prefix}source/original.mp4`;
+		const editSpec = {
+			version: 1,
+			sourceDuration: 10,
+			keepRanges: [{ start: 0, end: 5 }],
+		};
+		database.edits.set(videoId, {
+			videoId,
+			sourceKey: originalSource,
+			editSpec,
+			createdAt: new Date(),
+			updatedAt: new Date(),
+		});
+		const storage = await storageFixture([
+			[outputKey, "edited-video"],
+			[thumbnailKey, "thumbnail"],
+			[previewKey, "preview"],
+			[originalSource, "original-video"],
+			[`${prefix}transcription.vtt`, "WEBVTT\n\n"],
+			[
+				`${prefix}transcription.edit.v3.json`,
+				encryptEditTranscriptObject(originalWords, ownerId, videoId),
+			],
+			[`${prefix}.transcripts/old-version/transcription.vtt`, "old-captions"],
+		]);
+		expect(Exit.isSuccess(await runVideoOperation("duplicate"))).toBe(true);
+		const targetId = Video.VideoId.make("duplicate-video");
+		const metadata = database.rows.get(targetId)
+			?.metadata as typeof Db.videos.$inferSelect.metadata;
+		const editKey = getTranscriptObjectKey(
+			{ id: targetId, ownerId, metadata },
+			"edit",
+		);
+		if (!editKey) throw new Error("Missing duplicated word transcript");
+		const encrypted = storage.objects.get(editKey);
+		if (!encrypted) throw new Error("Missing encrypted duplicate");
+		expect(decryptEditTranscriptObject(encrypted, ownerId, targetId)).toBe(
+			originalWords,
+		);
+		expect(decryptEditTranscriptObject(encrypted, ownerId, videoId)).toBeNull();
+		expect(database.edits.get(targetId)).toMatchObject({
+			sourceKey: `${newPrefix}source/original.mp4`,
+			editSpec,
+		});
+		expect(storage.objects.get(`${newPrefix}source/original.mp4`)).toBe(
+			"original-video",
+		);
+		expect(
+			storage.objects.has(
+				`${newPrefix}.transcripts/old-version/transcription.vtt`,
+			),
+		).toBe(false);
 	});
 
 	it("copies a published MP4 snapshot without retaining its original output pointer", async () => {
@@ -1080,6 +1221,13 @@ describe("recording storage lifecycle", () => {
 		);
 		expect(database.rows.get("duplicate-video")?.metadata).toEqual({
 			sourceName: "Test display",
+			transcriptPublication: {
+				version: 1,
+				id: expect.any(String),
+				vtt: false,
+				edit: false,
+				revision: null,
+			},
 		});
 	});
 
@@ -1399,7 +1547,7 @@ describe("recording storage lifecycle", () => {
 		},
 	);
 
-	it("rolls back the deletion fence if the owner changes before the locked read", async () => {
+	it("rolls back the deletion fence if the owner changes before the fenced commit", async () => {
 		const database = databaseFixture();
 		const storage = await storageFixture([[outputKey, "verified-video"]]);
 		database.beforePrepareDelete(async () => {
@@ -1790,9 +1938,10 @@ describe("recording storage lifecycle", () => {
 			expect(drive.deleteConditions).toHaveLength(1);
 			const [condition] = drive.deleteConditions;
 			if (!condition) throw new Error("Missing Drive index delete condition");
-			expect(new MySqlDialect().sqlToQuery(condition).params).toEqual([
+			expect(new SQLiteSyncDialect().sqlToQuery(condition).params).toEqual([
 				drive.integrationId,
 				expect.stringMatching(/^[a-f0-9]{64}$/),
+				outputKey,
 				"original-file",
 			]);
 		},

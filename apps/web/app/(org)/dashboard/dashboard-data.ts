@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
 import type { userSelectProps } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	notifications,
 	organizationInvites,
@@ -9,11 +9,11 @@ import {
 	spaces,
 	users,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
-import { Database, ImageUploads } from "@cap/web-backend";
+import { CloudflareDatabase as Database, ImageUploads } from "@cap/web-backend";
 import type { ImageUpload } from "@cap/web-domain";
-import { and, count, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, count, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { Effect } from "effect";
 import {
 	canManageOrganizationMembers,
@@ -376,7 +376,16 @@ export async function getDashboardData(user: typeof userSelectProps) {
 				? db()
 						.select()
 						.from(organizationInvites)
-						.where(inArray(organizationInvites.organizationId, organizationIds))
+						.where(
+							and(
+								inArray(organizationInvites.organizationId, organizationIds),
+								eq(organizationInvites.status, "pending"),
+								or(
+									isNull(organizationInvites.expiresAt),
+									gt(organizationInvites.expiresAt, new Date()),
+								),
+							),
+						)
 				: Promise.resolve<(typeof organizationInvites.$inferSelect)[]>([]),
 			active ? loadActiveOrganizationData(user, active) : Promise.resolve(null),
 		]);
@@ -483,7 +492,14 @@ export async function getDashboardData(user: typeof userSelectProps) {
 											.select({ value: count() })
 											.from(organizationInvites)
 											.where(
-												inArray(organizationInvites.organizationId, ownedIds),
+												and(
+													inArray(organizationInvites.organizationId, ownedIds),
+													eq(organizationInvites.status, "pending"),
+													or(
+														isNull(organizationInvites.expiresAt),
+														gt(organizationInvites.expiresAt, new Date()),
+													),
+												),
 											)
 									: Promise.resolve([{ value: 0 }]),
 							),
@@ -529,10 +545,15 @@ export async function getDashboardData(user: typeof userSelectProps) {
 						invites: organizationInvitesData.filter(
 							(invite) => invite.organizationId === organization.id,
 						),
-						inviteQuota: proSeatProvider?.inviteQuota ?? 0,
+						inviteQuota:
+							process.env.CAP_RUNTIME === "cloudflare"
+								? Number.MAX_SAFE_INTEGER
+								: (proSeatProvider?.inviteQuota ?? 0),
 						totalInvites,
 						ownerIsPro: userIsPro(owner ?? null),
-						hasActiveProSeatProvider: proSeatProvider !== null,
+						hasActiveProSeatProvider:
+							process.env.CAP_RUNTIME === "cloudflare" ||
+							proSeatProvider !== null,
 					};
 				}),
 			),

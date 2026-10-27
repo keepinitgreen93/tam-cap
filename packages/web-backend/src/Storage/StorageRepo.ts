@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
+import {
+	requireActiveOrganization,
+	requireOrganizationMember,
+} from "@cap/database/cloudflare/access";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { decrypt, encrypt } from "@cap/database/crypto";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
 import {
 	type Organisation,
 	Storage,
@@ -10,14 +15,22 @@ import {
 } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect, Option } from "effect";
-
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
+import {
+	activeVideo,
+	requireLiveVideo,
+	requireWritableVideo,
+} from "../Videos/persistence.ts";
+import {
+	activeIntegration,
+	activeStorageObject,
+	requireStorageObjectWrite,
+	writableStorageObject,
+	writeStorageObject,
+} from "./persistence.ts";
 
 export const getObjectKeyHash = (key: string) =>
 	createHash("sha256").update(key).digest("hex");
-
-const escapeLikePattern = (value: string) =>
-	value.replace(/[\\%_]/g, (match) => `\\${match}`);
 
 export type GoogleDriveIntegrationConfig = {
 	refreshToken: string;
@@ -64,16 +77,6 @@ export type StorageObjectUpdate = Omit<
 	StorageObjectInput,
 	"integrationId" | "ownerId" | "videoId" | "objectKey"
 >;
-
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
 
 export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 	effect: Effect.gen(function* () {
@@ -139,6 +142,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 						.where(
 							Dz.and(
 								Dz.eq(Db.storageIntegrations.organizationId, organizationId),
+								activeIntegration,
 								Dz.eq(Db.storageIntegrations.active, true),
 								Dz.eq(Db.storageIntegrations.status, "active"),
 							),
@@ -156,7 +160,9 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 						db
 							.select()
 							.from(Db.storageIntegrations)
-							.where(Dz.eq(Db.storageIntegrations.id, id)),
+							.where(
+								Dz.and(Dz.eq(Db.storageIntegrations.id, id), activeIntegration),
+							),
 					);
 
 					return Option.fromNullable(integration);
@@ -197,7 +203,9 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 								Db.storageIntegrations.googleDriveAccessTokenExpiresAt,
 						})
 						.from(Db.storageIntegrations)
-						.where(Dz.eq(Db.storageIntegrations.id, id))
+						.where(
+							Dz.and(Dz.eq(Db.storageIntegrations.id, id), activeIntegration),
+						)
 						.limit(1),
 				);
 
@@ -225,7 +233,10 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							})
 							.where(
 								Dz.and(
-									Dz.eq(Db.storageIntegrations.id, id),
+									Dz.and(
+										Dz.eq(Db.storageIntegrations.id, id),
+										activeIntegration,
+									),
 									Dz.or(
 										Dz.isNull(
 											Db.storageIntegrations
@@ -241,7 +252,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							),
 					);
 
-					return getAffectedRows(result) > 0;
+					return result.meta.changes > 0;
 				}),
 		);
 
@@ -271,7 +282,10 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							})
 							.where(
 								Dz.and(
-									Dz.eq(Db.storageIntegrations.id, id),
+									Dz.and(
+										Dz.eq(Db.storageIntegrations.id, id),
+										activeIntegration,
+									),
 									Dz.eq(
 										Db.storageIntegrations.googleDriveTokenRefreshLeaseId,
 										leaseId,
@@ -280,7 +294,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							),
 					);
 
-					return getAffectedRows(result) > 0;
+					return result.meta.changes > 0;
 				}),
 		);
 
@@ -297,7 +311,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 					})
 					.where(
 						Dz.and(
-							Dz.eq(Db.storageIntegrations.id, id),
+							Dz.and(Dz.eq(Db.storageIntegrations.id, id), activeIntegration),
 							Dz.eq(
 								Db.storageIntegrations.googleDriveTokenRefreshLeaseId,
 								leaseId,
@@ -333,23 +347,12 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 						metadata: input.metadata ?? null,
 					};
 
-					yield* db.use((db) =>
-						db
-							.insert(Db.storageObjects)
-							.values(value)
-							.onDuplicateKeyUpdate({
-								set: {
-									providerObjectId: value.providerObjectId,
-									uploadSessionUrl: value.uploadSessionUrl,
-									uploadStatus: value.uploadStatus,
-									contentType: value.contentType,
-									contentLength: value.contentLength,
-									metadata: input.preserveMetadata
-										? Dz.sql`${Db.storageObjects.metadata}`
-										: value.metadata,
-									updatedAt: new Date(),
-								},
-							}),
+					yield* db.use((database) =>
+						writeStorageObject(
+							database,
+							{ ...value, updatedAt: new Date() },
+							{ preserveMetadata: input.preserveMetadata },
+						),
 					);
 				}),
 		);
@@ -369,39 +372,70 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							})
 						: null;
 
-					const result = yield* db.use((db) =>
-						db
-							.update(Db.storageObjects)
-							.set({
-								providerObjectId: input.providerObjectId,
-								uploadSessionUrl,
-								uploadStatus: input.uploadStatus ?? "pending",
-								contentType: input.contentType ?? null,
-								contentLength: input.contentLength ?? null,
-								metadata: input.preserveMetadata
-									? Dz.sql`${Db.storageObjects.metadata}`
-									: (input.metadata ?? null),
-								updatedAt: new Date(),
-							})
-							.where(
-								Dz.and(
-									Dz.eq(Db.storageObjects.id, object.id),
-									Dz.eq(Db.storageObjects.integrationId, object.integrationId),
-									Dz.eq(
-										Db.storageObjects.objectKeyHash,
-										getObjectKeyHash(object.objectKey),
-									),
-									Dz.eq(Db.storageObjects.objectKey, object.objectKey),
-									Dz.eq(
-										Db.storageObjects.providerObjectId,
-										object.providerObjectId,
-									),
-									Dz.eq(Db.storageObjects.uploadStatus, object.uploadStatus),
-								),
-							),
+					const updatedAt = new Date();
+					return yield* db.use((database) =>
+						atomic(database, async (snapshot) => {
+							const [current] = await snapshot.read((reader) =>
+								reader
+									.select()
+									.from(Db.storageObjects)
+									.where(Dz.eq(Db.storageObjects.id, object.id))
+									.limit(1),
+							);
+							if (
+								!current ||
+								current.integrationId !== object.integrationId ||
+								current.ownerId !== object.ownerId ||
+								current.videoId !== object.videoId ||
+								current.objectKey !== object.objectKey ||
+								current.providerObjectId !== object.providerObjectId ||
+								current.uploadStatus !== object.uploadStatus
+							)
+								return { statements: [], result: false };
+							await requireStorageObjectWrite(snapshot, current);
+							return {
+								statements: [
+									database
+										.update(Db.storageObjects)
+										.set({
+											providerObjectId: input.providerObjectId,
+											uploadSessionUrl,
+											uploadStatus: input.uploadStatus ?? "pending",
+											contentType: input.contentType ?? null,
+											contentLength: input.contentLength ?? null,
+											metadata: input.preserveMetadata
+												? Dz.sql`${Db.storageObjects.metadata}`
+												: (input.metadata ?? null),
+											updatedAt,
+										})
+										.where(
+											Dz.and(
+												Dz.eq(Db.storageObjects.id, object.id),
+												activeStorageObject,
+												Dz.eq(
+													Db.storageObjects.integrationId,
+													object.integrationId,
+												),
+												Dz.eq(
+													Db.storageObjects.objectKeyHash,
+													getObjectKeyHash(object.objectKey),
+												),
+												Dz.eq(Db.storageObjects.objectKey, object.objectKey),
+												Dz.eq(
+													Db.storageObjects.providerObjectId,
+													object.providerObjectId,
+												),
+												Dz.eq(
+													Db.storageObjects.uploadStatus,
+													object.uploadStatus,
+												),
+											),
+										),
+								],
+								result: true,
+							};
+						}),
 					);
-
-					return getAffectedRows(result) > 0;
 				}),
 		);
 
@@ -416,28 +450,25 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							})
 						: null;
 
-					yield* db.use((db) =>
-						db
-							.insert(Db.storageObjects)
-							.values({
-								id: Storage.StorageObjectId.make(nanoId()),
-								integrationId: input.integrationId,
-								ownerId: input.ownerId,
-								videoId: input.videoId,
-								objectKey: input.objectKey,
-								objectKeyHash,
-								providerObjectId: input.providerObjectId,
-								uploadSessionUrl,
-								uploadStatus: input.uploadStatus ?? "pending",
-								contentType: input.contentType ?? null,
-								contentLength: input.contentLength ?? null,
-								metadata: input.metadata ?? null,
-							})
-							.onDuplicateKeyUpdate({
-								set: {
-									id: Dz.sql`${Db.storageObjects.id}`,
-								},
-							}),
+					const now = new Date();
+					const value = {
+						id: Storage.StorageObjectId.make(nanoId()),
+						integrationId: input.integrationId,
+						ownerId: input.ownerId,
+						videoId: input.videoId,
+						objectKey: input.objectKey,
+						objectKeyHash,
+						providerObjectId: input.providerObjectId,
+						uploadSessionUrl,
+						uploadStatus: input.uploadStatus ?? "pending",
+						contentType: input.contentType ?? null,
+						contentLength: input.contentLength ?? null,
+						metadata: input.metadata ?? null,
+						createdAt: now,
+						updatedAt: now,
+					} satisfies typeof Db.storageObjects.$inferInsert;
+					yield* db.use((database) =>
+						writeStorageObject(database, value, { reserve: true }),
 					);
 
 					const object = yield* getObjectByKey(
@@ -466,7 +497,9 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							.where(
 								Dz.and(
 									Dz.eq(Db.storageObjects.integrationId, integrationId),
+									activeStorageObject,
 									Dz.eq(Db.storageObjects.objectKeyHash, getObjectKeyHash(key)),
+									Dz.eq(Db.storageObjects.objectKey, key),
 								),
 							),
 					);
@@ -489,7 +522,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 								storageIntegrationId: Db.videos.storageIntegrationId,
 							})
 							.from(Db.videos)
-							.where(Dz.eq(Db.videos.id, videoId))
+							.where(Dz.and(Dz.eq(Db.videos.id, videoId), activeVideo))
 							.limit(1),
 					)
 					.pipe(Effect.map((rows) => Option.fromNullable(rows[0]))),
@@ -508,6 +541,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 							.where(
 								Dz.and(
 									Dz.eq(Db.storageObjects.id, object.id),
+									writableStorageObject,
 									Dz.eq(Db.storageObjects.integrationId, object.integrationId),
 									Dz.eq(
 										Db.storageObjects.objectKeyHash,
@@ -521,7 +555,7 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 								),
 							),
 					)
-					.pipe(Effect.map((result) => getAffectedRows(result) > 0)),
+					.pipe(Effect.map((result) => result.meta.changes > 0)),
 		);
 
 		const listObjectsByPrefix = Effect.fn("StorageRepo.listObjectsByPrefix")(
@@ -533,30 +567,26 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 			) =>
 				db.use(async (db) => {
 					const pageSize = Math.min(Math.max(maxKeys ?? 1_000, 1), 1_000);
-					const prefixPattern = prefix
-						? `${escapeLikePattern(prefix)}%`
-						: undefined;
+
 					const objects = await db
 						.select()
 						.from(Db.storageObjects)
 						.where(
 							Dz.and(
 								Dz.eq(Db.storageObjects.integrationId, integrationId),
-								// The collation-aware LIKE is a superset of the BINARY match and is
-								// what lets MySQL range-scan integration_object_key_prefix_idx;
-								// the BINARY LIKE keeps the result case-sensitive.
-								prefixPattern
-									? Dz.like(Db.storageObjects.objectKey, prefixPattern)
+								activeStorageObject,
+								prefix
+									? Dz.gte(Db.storageObjects.objectKey, prefix)
 									: undefined,
-								prefixPattern
-									? Dz.sql`BINARY ${Db.storageObjects.objectKey} LIKE ${prefixPattern}`
+								prefix
+									? Dz.sql`substr(${Db.storageObjects.objectKey}, 1, length(${prefix})) = ${prefix} collate binary`
 									: undefined,
 								continuationToken
-									? Dz.sql`BINARY ${Db.storageObjects.objectKey} > BINARY ${continuationToken}`
+									? Dz.gt(Db.storageObjects.objectKey, continuationToken)
 									: undefined,
 							),
 						)
-						.orderBy(Dz.sql`BINARY ${Db.storageObjects.objectKey}`)
+						.orderBy(Db.storageObjects.objectKey)
 						.limit(pageSize + 1);
 					const page = objects.slice(0, pageSize);
 					return {
@@ -584,7 +614,9 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 						.where(
 							Dz.and(
 								Dz.eq(Db.storageObjects.integrationId, integrationId),
+								writableStorageObject,
 								Dz.eq(Db.storageObjects.objectKeyHash, getObjectKeyHash(key)),
+								Dz.eq(Db.storageObjects.objectKey, key),
 							),
 						),
 				),
@@ -602,7 +634,9 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 						.where(
 							Dz.and(
 								Dz.eq(Db.storageObjects.integrationId, integrationId),
+								activeStorageObject,
 								Dz.eq(Db.storageObjects.objectKeyHash, getObjectKeyHash(key)),
+								Dz.eq(Db.storageObjects.objectKey, key),
 								providerObjectId
 									? Dz.eq(Db.storageObjects.providerObjectId, providerObjectId)
 									: undefined,
@@ -611,7 +645,41 @@ export class StorageRepo extends Effect.Service<StorageRepo>()("StorageRepo", {
 				),
 		);
 
+		const assertOrganizationAccess = (
+			organizationId: Organisation.OrganisationId,
+			userId?: User.UserId,
+		) =>
+			db.use((database) =>
+				atomic(database, async (snapshot) => {
+					if (userId)
+						await requireOrganizationMember(snapshot, organizationId, userId);
+					else await requireActiveOrganization(snapshot, organizationId);
+					return { statements: [], result: undefined };
+				}),
+			);
+		const assertVideoAccess = (videoId: Video.VideoId, ownerId: User.UserId) =>
+			db.use((database) =>
+				atomic(database, async (snapshot) => {
+					await requireLiveVideo(snapshot, videoId, ownerId);
+					return { statements: [], result: undefined };
+				}),
+			);
+
+		const assertWritableVideo = (
+			videoId: Video.VideoId,
+			ownerId: User.UserId,
+		) =>
+			db.use((database) =>
+				atomic(database, async (snapshot) => {
+					await requireWritableVideo(snapshot, videoId, ownerId);
+					return { statements: [], result: undefined };
+				}),
+			);
+
 		return {
+			assertOrganizationAccess,
+			assertVideoAccess,
+			assertWritableVideo,
 			getActiveIntegrationForUser,
 			getActiveIntegrationForOrganization,
 			getIntegrationById,

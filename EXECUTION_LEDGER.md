@@ -1,0 +1,66 @@
+# Full Cloudflare Cap replacement execution ledger
+
+Source: docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md and docs/superpowers/plans/2026-10-27-cloudflare-cap.md. User explicitly authorized continuing through an end-to-end live replacement on 2026-10-27. Foundation commit: 4bbd7b2. No further architecture approval loop is required within Cloudflare plus Resend and the stated budget target.
+
+## Acceptance criteria
+
+| ID | Criterion | Status | Owner/evidence |
+| --- | --- | --- | --- |
+| AC01 | Source fork preserves upstream features, licenses and desktop/API contracts | VERIFIED foundation; ongoing | keepinitgreen93/tam-cap |
+| AC02 | Cloudflare metadata persistence replaces MySQL with equivalent ownership/concurrency behavior | IN PROGRESS | Database implementation wave |
+| AC03 | Private R2 originals and derived assets, scoped uploads and intentional sharing | OPEN integration | Bucket created/private; app integration pending |
+| AC04 | Cap web application runs on Cloudflare; controlled migrations outside request startup | IN PROGRESS | Runtime implementation wave |
+| AC05 | Durable media/edit/import jobs recover after interruption without duplicate results | OPEN | Runtime/job wave |
+| AC06 | Cloudflare transcription preserves words, fillers, timestamps and audio/video alignment | VERIFIED adapter; OPEN E2E | 182 scoped tests; live synthetic probe |
+| AC07 | Cloudflare titles, summaries and chapters work without external AI fallbacks | OPEN | AI integration wave |
+| AC08 | Resend owner/member login and invitations work; registration is invite-controlled | IN PROGRESS | Owner delivered-email/browser login verified; D1 invitation/guest boundaries tested; member E2E remains |
+| AC09 | Filler and silence cleanup preserve originals and support preview/undo/export | IN PROGRESS | PCM/server/UI code tested; immutable transcript publication integration and live Save/export remain |
+| AC10 | Owner/member browser recording/upload, browser playback, external sharing and unauthorized denial pass; desktop API contracts preserved | OPEN | E2E wave; native desktop installation is not required for the site's built-in recorder |
+| AC11 | Backup/restore, rollback and measured usage/bounded concurrency verified | OPEN | Operations/E2E wave |
+| AC12 | Live application works at videos.trulyauthenticmarketing.com | OPEN | Production cutover after acceptance |
+| AC13 | Loom inventory, sample import and batch reconciliation with exceptions | DEFERRED BY USER | User explicitly chose to handle existing-library migration after the replacement is live; not a launch blocker |
+| AC14 | Security review then QA, no material findings, relevant tests green | OPEN | Final independent reviews |
+| AC15 | View and engagement analytics operate on Cloudflare without Tinybird | OPEN | API agent implementing separate analytics store/provider; zero-value fallback is not acceptance |
+
+## Waves and dependencies
+
+1. Persistence contract and caller partition; in parallel build the Cloudflare web/media runtime integration and inventory durable-workflow support. Models inherit this chat's model; no override needed.
+2. Port persistence groups against the verified common contract; integrate runtime and Resend; verify each group with actual D1 concurrency tests. Database/runtime are prerequisites for application E2E.
+3. Finish AI generation and silence editing; connect desktop/client workflows. These preserve existing Cap UI and contracts.
+4. Staging E2E, interrupted-job recovery, privacy, restore and costs; provision final runtime secrets through protected channels. External blockers get exact evidence and independent work continues.
+5. Security then QA, fix findings, production hostname, Loom migration and final verification.
+
+## Rules
+
+No placeholder portal or health endpoint counts as the app. No dropping transactions or replacing row locks with no-ops. No production MySQL on ephemeral disks. No silent loss of source media. No Railway/AWS hosting. Resend approved. Full replacement is complete only when every applicable criterion is VERIFIED; foundation checks cannot be substituted for user-visible E2E.
+
+## Progress
+
+- Initial state re-read from commit and current repository; working tree clean before this ledger.
+- Optional local scratch-cache deletion was previously rejected by automatic approval review; do not retry it. Use new isolated test state.
+- Wave 1 running: persistence_architecture owns an explicit revision-fenced atomic-plan/batch API and private D1 bridge; cloudflare_runtime owns the Node/FFmpeg container wrapper and durable workflow qualification; silence_editing owns PCM-based reviewed timeline cuts. All inherit the current model.
+- Persistence contract: capture a stable revision around pure planning reads, then atomically check that revision and apply the planned SQL batch. Every application mutation must update the revision. Port read-after-write assumptions explicitly. Do not emulate arbitrary interactive callbacks.
+- Runtime will use private Container outbound handlers (cap.database and cap.workflow) rather than expose a database API publicly. Container default local Workflow SDK storage is unacceptable; durable world implementation must pass concurrency/recovery tests.
+- Resend connection is active and domain verified. No dedicated application key yet; prepare scoped sending key and store directly in Cloudflare secrets when runtime Worker exists.
+- Loom migration access: Atlassian/Loom connection initiated; awaiting user authentication. This blocks private-library inventory only, not application implementation.
+- User subsequently deferred the existing Loom-library migration because connection setup was unclear. Do not request that connection again during this build or block launch on AC13. Preserve import functionality and source data; migrate the old library in a later user-directed step.
+- D1 atomic/bridge primitive independently verified: 18 tests pass including concurrent reservation, read/commit races, whole-batch rollback, bounded conflicts and ambiguous transport response handling. The 0001 concurrency migration was applied to the dedicated remote D1. Full caller migration is still IN PROGRESS.
+- Cloudflare account already has Workers Paid and R2 Paid subscriptions; no subscription upgrade was made. Created dedicated queues tam-cap-workflows and tam-cap-workflows-failed.
+- Both full Node web and FFmpeg media images built. Guarded staging runtime deployment started with CAP_RUNTIME_READY=false and no production domain; this is not application acceptance or launch.
+- First container registration was rejected because this account requires scheduling_policy=durable_object. Worker and registry images uploaded, but no application was started. Runtime agent is adapting native startup to named images. Keep readiness false.
+- Protected staging secrets created directly in Cloudflare: CAP_WEB_ENV and MEDIA_SERVER_WEBHOOK_SECRET. Dedicated Resend key is sending-only for updates.trulyauthenticmarketing.com; R2 token restricted to tam-cap-videos; AI token permits inference only. No values were printed or written to Git. Production URL switch remains pending.
+- Root independently ran 96 silence/transcript/timeline/action/workflow/UI tests successfully. Implementer additionally verified 16 FFmpeg/media tests including 129MiB input, multi-track audio and real disk reservations. Live application roundtrip is still required.
+- Root implemented the small AI deployment boundary: CAP_RUNTIME=cloudflare permits only the configured account's Cloudflare API endpoint and Cloudflare model IDs, never external fallback keys. Three failing regression cases now pass; existing provider tests preserved. Cloudflare AI failure logging omits raw prompts/provider bodies.
+- R2 application credential verified with private synthetic write/read/delete. Workers AI inference credential returned HTTP 200; synthetic summary uses a fenced JSON object that Cap's existing JSON extraction must handle in full pipeline acceptance.
+- CAP_PREVIEW_KEY is installed as a protected Worker secret; local test value is in ignored tmp/cap-preview-key.txt and must never be printed. Runtime preview header is stripped before forwarding to Node. Public staging remains gated, production hostname unchanged.
+- User explicitly approved sending the real owner sign-in test email and verifying delivery/login. Resend message 01a17e8b-60b9-7084-ba91-fa9008717d9e was delivered to the owner; the real browser OTP flow produced an authenticated owner session. The code was transferred privately and its temporary plaintext file cleared. Dashboard currently errors in the partially integrated staging image, so AC10/AC12 remain OPEN.
+- Runtime configuration recovery backup is encrypted with AES-GCM/RSA-OAEP to a locally DPAPI-protected user key in ignored .secrets; Verify succeeded without exposing values. scripts/cloudflare/runtime-secrets.ps1 can publish an approved staging/production origin from that protected backup.
+- Root independently verified all 30 D1 core/auth/validation tests. Remote validation preflight checked all 49 application tables, including the newly created owner records, and found no invalid rows. Applied generated0002 validation triggers remotely; no table rebuild or data deletion.
+- UI500 root cause traced: dashboard layout's pending-invite query and dashboard data still used canonical MySQL db(). Dashboard agent is porting these reads and JSON aggregation to D1; staging image will be rebuilt after that bounded group passes.
+- Ruling: use Cap's existing browser recorder as the primary live-site recording acceptance path. Source confirms `/dashboard/caps/record` is a first-class recorder. The user requested a live site, not a custom native installer; desktop API compatibility is still retained/tested. This avoids making an unrelated Windows native build a prerequisite for the requested site. Hardware inputs in automated recording tests may be synthetic and will be labeled as such.
+- Shared transcript publication now uses immutable paired artifacts and a strict D1 pointer/media CAS. API/editor/transcription readers and writers are being wired to the shared contract. Ambiguous commits retain artifacts; cleanup is limited to proven unpublished preparation.
+- Unproven provisional-live transcript promotion is disabled in the Cloudflare path until generation/segment provenance exists; canonical transcription runs a verified full pass. Provisional UI can remain. This is an accuracy-first optimization decision and may add ASR usage; actual browser-flow usage must be measured before cost reporting.
+- Recording and generic processing paths now have generation/run tokens, immutable outputs and idempotent dispatch receipts under test. Final web/mobile/operator routes and recovery callers are still being integrated.
+- Viewer-only sign-in for explicit video grants is being preserved without granting team/recording/onboarding privileges. Shared workspace capability checks protect organization, developer and agent provisioning.
+- Security follow-up: Zod4 copies are patched to4.6.6; Zod3 exposure to GHSA-mrhx-c7xc-m3w5 requires final assessment/mitigation. Container UID1000 is not a deployed privilege boundary under the platform's durable_object policy; VM isolation and scoped capabilities remain the security boundaries.
+- Checkpoints on this branch remain work in progress. No final completion, public readiness, production cutover, or full security/QA sign-off is implied.

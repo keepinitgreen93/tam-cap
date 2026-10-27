@@ -2,6 +2,7 @@ import "server-only";
 
 import {
 	AwsCredentials,
+	CloudflareDatabase,
 	Database,
 	Extensions,
 	Folders,
@@ -58,7 +59,13 @@ export const Dependencies = Layer.mergeAll(
 	ImageUploads.Default,
 	layerTracer,
 ).pipe(
-	Layer.provideMerge(Layer.mergeAll(Database.Default, FetchHttpClient.layer)),
+	Layer.provideMerge(
+		Layer.mergeAll(
+			Database.Default,
+			CloudflareDatabase.Default,
+			FetchHttpClient.layer,
+		),
+	),
 );
 
 // purposefully not exposed

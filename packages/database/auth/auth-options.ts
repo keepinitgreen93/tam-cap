@@ -12,15 +12,17 @@ import EmailProvider from "next-auth/providers/email";
 import GoogleProvider from "next-auth/providers/google";
 import type { Provider } from "next-auth/providers/index";
 import WorkOSProvider from "next-auth/providers/workos";
+import { db } from "../cloudflare/application.ts";
+import { users } from "../cloudflare/schema.ts";
+import { canSignInCloudflare } from "../cloudflare/team.ts";
 import { getEmailDeliveryStatus, sendEmail } from "../emails/config.ts";
-import { db } from "../index.ts";
-import { users } from "../schema.ts";
 import {
 	isBlockedAccountEmail,
 	isEmailAllowedForSignup,
 	isEmailBlockedFromSignup,
 } from "./domain-utils.ts";
 import { DrizzleAdapter } from "./drizzle-adapter.ts";
+import { cloudflareAccessPolicy, normalizeEmail } from "./identity.ts";
 import {
 	provisionSsoMembership,
 	type SsoAuthContext,
@@ -137,7 +139,9 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 								// because a generic issuer is not known to verify addresses.
 								allowDangerousEmailAccountLinking: true,
 								profile(profile: OidcClaims) {
-									const email = profile.email?.trim().toLowerCase();
+									const email = profile.email
+										? normalizeEmail(profile.email)
+										: undefined;
 									return {
 										id: profile.sub,
 										name:
@@ -189,7 +193,9 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 												.join(" ") ||
 											profile.email?.split("@")[0] ||
 											profile.id,
-										email: profile.email?.trim().toLowerCase(),
+										email: profile.email
+											? normalizeEmail(profile.email)
+											: undefined,
 										image: null,
 									};
 								},
@@ -210,7 +216,9 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 								async authorize(_credentials, req) {
 									const env = serverEnv();
 									const header = env.TRUSTED_PROXY_AUTH_HEADER?.toLowerCase();
-									const email = env.TRUSTED_PROXY_AUTH_EMAIL?.toLowerCase();
+									const email = env.TRUSTED_PROXY_AUTH_EMAIL
+										? normalizeEmail(env.TRUSTED_PROXY_AUTH_EMAIL)
+										: undefined;
 									const secret = env.TRUSTED_PROXY_AUTH_SECRET;
 									if (!header || !email || !secret?.trim()) return null;
 									// The router is the sole authority for this header (it strips
@@ -250,6 +258,7 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 						]
 					: []),
 				EmailProvider({
+					normalizeIdentifier: normalizeEmail,
 					// next-auth defaults to 24h, but the code is 6 digits and the
 					// verify path has no attempt limiting, so a day-long window is a
 					// practical brute-force target. The OTP email and the dev console
@@ -365,8 +374,21 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 						: typeof credentials?.email === "string"
 							? credentials.email
 							: null);
-				if (!rawEmail || typeof rawEmail !== "string") return true;
-				const userEmail = rawEmail.toLowerCase();
+				if (!rawEmail || typeof rawEmail !== "string") return false;
+				let userEmail: string;
+				try {
+					userEmail = normalizeEmail(rawEmail);
+				} catch {
+					return false;
+				}
+				if (
+					!(await canSignInCloudflare(
+						db(),
+						userEmail,
+						cloudflareAccessPolicy(),
+					))
+				)
+					return "/login?error=InviteRequired";
 
 				if (
 					isEmailBlockedFromSignup(
@@ -434,7 +456,10 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 						.where(
 							user
 								? eq(users.id, User.UserId.make(user.id))
-								: eq(users.email, (token.email || "").toLowerCase()),
+								: eq(
+										users.email,
+										token.email ? normalizeEmail(token.email) : "",
+									),
 						)
 						.limit(1);
 

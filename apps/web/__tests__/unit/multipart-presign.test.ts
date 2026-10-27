@@ -1,8 +1,9 @@
-import { S3Bucket, User, Video } from "@cap/web-domain";
-import type { SQL } from "drizzle-orm";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import * as Db from "@cap/database/cloudflare/schema";
+import { Organisation, S3Bucket, User, Video } from "@cap/web-domain";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { Effect, Option } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
 	getOwnedById: vi.fn(),
@@ -20,7 +21,7 @@ const mocks = vi.hoisted(() => ({
 }));
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({ NEXTAUTH_SECRET: "test-reupload-secret" }),
-	buildEnv: { NEXT_PUBLIC_IS_CAP: true },
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" },
 }));
 vi.mock("@/lib/desktop-reupload", () => ({
 	prepareDesktopReupload: mocks.prepareReplacement,
@@ -30,6 +31,7 @@ vi.mock("@cap/web-backend", async () => {
 	const { Context, Layer } = await import("effect");
 	return {
 		Database: Context.GenericTag("test/Database"),
+		CloudflareDatabase: Context.GenericTag("test/Database"),
 		VideosPolicy: Context.GenericTag("test/VideosPolicy"),
 		Storage: { getAccessForVideo: mocks.storage },
 		makeCurrentUserLayer: () => Layer.empty,
@@ -147,6 +149,7 @@ describe("desktop reupload completion", () => {
 	let video: {
 		id: Video.VideoId;
 		ownerId: User.UserId;
+		orgId: import("@cap/web-domain").Organisation.OrganisationId;
 		source: { type: "desktopMP4"; outputKey: string };
 		bucketId: Video.Video["bucketId"];
 		storageIntegrationId: Video.Video["storageIntegrationId"];
@@ -157,7 +160,7 @@ describe("desktop reupload completion", () => {
 	let rejectCommit: boolean;
 	let provider: "s3" | "googleDrive";
 	let uploadState: Record<string, unknown>;
-	const dialect = new MySqlDialect();
+	const dialect = new SQLiteSyncDialect();
 	const mintToken = () => {
 		outputKey = createDesktopReuploadKey(video);
 		token = createDesktopReuploadToken(video, {
@@ -183,73 +186,86 @@ describe("desktop reupload completion", () => {
 		video = {
 			id: Video.VideoId.make("video"),
 			ownerId: User.UserId.make("owner"),
+			orgId: Organisation.OrganisationId.make("org"),
 			source: { type: "desktopMP4", outputKey: oldKey },
 			bucketId: Option.none(),
 			storageIntegrationId: Option.none(),
 		};
 		mintToken();
-		const client = {
-			select: () => ({
-				from: () => ({
-					innerJoin: () => ({
-						where: () => ({
-							limit: async () => [
+		const client = createRecordingD1Model({
+			read: ({ table }) =>
+				table === Db.videos
+					? [
+							{
+								...video,
+								bucket: Option.getOrNull(video.bucketId),
+								storageIntegrationId: Option.getOrNull(
+									video.storageIntegrationId,
+								),
+							},
+						]
+					: table === Db.organizations
+						? [
 								{
+									id: "org",
+									ownerId: "owner",
+									tombstoneAt: null,
 									stripeSubscriptionStatus: null,
 									thirdPartyStripeSubscriptionId: null,
 								},
-							],
-						}),
-					}),
-				}),
-			}),
-			transaction: async (run: (tx: unknown) => Promise<void>) => {
-				const pending: Record<string, unknown>[] = [];
-				let removeUpload = false;
-				await run({
-					update: () => ({
-						set: (values: Record<string, unknown>) => ({
-							where: async () => {
-								pending.push(values);
-								events.push("publish");
-							},
-						}),
-					}),
-					delete: () => ({
-						where: async (filter: SQL) => {
-							events.push("delete-upload");
-							const params = dialect.sqlToQuery(filter).params;
-							removeUpload = params.length === 1 || params.includes(uploadKey);
-						},
-					}),
-				});
-				if (rejectCommit) throw new Error("Database commit failed");
-				for (const values of pending) {
-					updates.push(values);
-					if (values.source)
-						video.source = values.source as typeof video.source;
+							]
+						: table === Db.videoUploads && uploadKey
+							? [{ ...uploadState, videoId: video.id, rawFileKey: uploadKey }]
+							: [],
+			signature: () => JSON.stringify([video, uploadKey, uploadState]),
+			apply: async (statements) => {
+				if (
+					rejectCommit &&
+					statements.some(
+						(statement) =>
+							statement.table === Db.videos && statement.operation === "update",
+					)
+				)
+					throw new Error("Database commit failed");
+				for (const statement of statements) {
+					const values = Array.isArray(statement.values)
+						? (statement.values[0] ?? {})
+						: statement.values;
+					if (statement.table === Db.videoProcessingJobs) {
+						events.push("retire");
+						continue;
+					}
+					if (
+						statement.table === Db.videos &&
+						statement.operation === "update"
+					) {
+						events.push("publish");
+						updates.push(values);
+						if (values.source)
+							video.source = values.source as typeof video.source;
+					}
+					if (
+						statement.table === Db.videoUploads &&
+						statement.operation === "delete"
+					) {
+						events.push("delete-upload");
+						const params = statement.condition
+							? dialect.sqlToQuery(statement.condition).params
+							: [];
+						if (params.length === 1 || params.includes(uploadKey))
+							uploadKey = null;
+					}
+					if (
+						statement.table === Db.videoUploads &&
+						statement.operation === "insert"
+					) {
+						Object.assign(uploadState, values, statement.conflict);
+						uploadKey =
+							typeof values.rawFileKey === "string" ? values.rawFileKey : null;
+					}
 				}
-				if (removeUpload) uploadKey = null;
 			},
-			insert: () => ({
-				values: (values: { rawFileKey?: string | null }) => ({
-					onDuplicateKeyUpdate: async ({
-						set,
-					}: {
-						set: Record<string, unknown>;
-					}) => {
-						Object.assign(uploadState, set);
-						uploadKey = values.rawFileKey ?? null;
-					},
-				}),
-			}),
-			delete: () => ({
-				where: async (filter: SQL) => {
-					if (dialect.sqlToQuery(filter).params.includes(uploadKey))
-						uploadKey = null;
-				},
-			}),
-		};
+		});
 		mocks.database.mockReturnValue(client);
 		mocks.getOwnedById.mockImplementation(() =>
 			Effect.sync(() =>
@@ -306,7 +322,6 @@ describe("desktop reupload completion", () => {
 				if (video.source.outputKey === replacement.outputKey) return null;
 				if (uploadKey !== replacement.outputKey)
 					throw new Error("Replacement upload was canceled or superseded");
-				events.push("retire");
 				return {
 					source: { type: "desktopMP4", outputKey: replacement.outputKey },
 					transcriptionStatus: null,
@@ -654,6 +669,7 @@ describe("raw recording completion integrity", () => {
 					{
 						id: Video.VideoId.make("video"),
 						ownerId: User.UserId.make("owner"),
+						orgId: Organisation.OrganisationId.make("org"),
 						source: { type: "webMP4" },
 						bucketId: Option.none(),
 						storageIntegrationId: Option.none(),
@@ -661,9 +677,26 @@ describe("raw recording completion integrity", () => {
 				]),
 			),
 		);
-		mocks.database.mockReturnValue({
-			update: () => ({ set: () => ({ where: async () => {} }) }),
-		});
+		mocks.database.mockReturnValue(
+			createRecordingD1Model({
+				read: ({ table }) =>
+					table === Db.videos
+						? [
+								{
+									id: "video",
+									ownerId: "owner",
+									orgId: "org",
+									bucket: null,
+									storageIntegrationId: null,
+									source: { type: "webMP4" },
+								},
+							]
+						: table === Db.organizations
+							? [{ id: "org", ownerId: "owner", tombstoneAt: null }]
+							: [],
+				apply: () => undefined,
+			}),
+		);
 		mocks.complete.mockReturnValue(Effect.succeed({ ETag: etag }));
 		mocks.head.mockReturnValue(
 			Effect.succeed({ ETag: etag, ContentLength: 2 }),

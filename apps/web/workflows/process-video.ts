@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { users, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users, videos } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend/src/Storage/index";
 import { Video } from "@cap/web-domain";
@@ -11,6 +11,12 @@ import {
 	isMediaServerCapacityError,
 } from "@/lib/media-server-backpressure";
 import { transcribeVideo } from "@/lib/transcribe";
+import {
+	applyVideoProcessingProgress,
+	claimProcessingAttempt,
+	matchesProcessingRun,
+	ProcessingRunSupersededError,
+} from "@/lib/video-processing-state";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 import {
@@ -24,6 +30,7 @@ interface ProcessVideoWorkflowPayload {
 	userId: string;
 	rawFileKey: string;
 	bucketId: string | null;
+	processingToken: string;
 }
 
 interface VideoProcessingResult {
@@ -37,22 +44,30 @@ interface VideoProcessingResult {
 	};
 }
 
-function getValidDuration(duration: number) {
-	return Number.isFinite(duration) && duration > 0 ? duration : undefined;
-}
-
 export async function processVideoWorkflow(
 	payload: ProcessVideoWorkflowPayload,
 ): Promise<VideoProcessingResult> {
 	"use workflow";
 
-	const { videoId, userId, rawFileKey, bucketId } = payload;
+	const { videoId, userId, rawFileKey, bucketId, processingToken } = payload;
+	let attemptId: string | undefined;
 
 	try {
-		await validateProcessingRequest(videoId, rawFileKey);
+		await validateProcessingRequest(
+			videoId,
+			rawFileKey,
+			processingToken,
+			userId,
+		);
 
 		let metadata: ProcessedVideoMetadata;
 		for (let processingAttempt = 0; ; processingAttempt++) {
+			const attempt = await beginProcessingAttempt(
+				videoId,
+				processingToken,
+				processingAttempt,
+			);
+			attemptId = attempt.attemptId;
 			let capacityRetryCount = 0;
 			while (true) {
 				try {
@@ -61,17 +76,27 @@ export async function processVideoWorkflow(
 						userId,
 						rawFileKey,
 						bucketId,
+						processingToken,
+						attemptId,
 					);
 					break;
 				} catch (error) {
 					if (!isMediaServerCapacityError(error)) throw error;
-					await markVideoWaitingForCapacity(videoId);
+					await markVideoWaitingForCapacity(
+						videoId,
+						processingToken,
+						attemptId,
+					);
 					await sleep(`${Math.min(120, 15 + capacityRetryCount * 15)}s`);
 					capacityRetryCount++;
 				}
 			}
 			try {
-				metadata = await waitForVideoProcessing(videoId);
+				metadata = await waitForVideoProcessing(
+					videoId,
+					processingToken,
+					attemptId,
+				);
 				break;
 			} catch (error) {
 				if (
@@ -80,19 +105,13 @@ export async function processVideoWorkflow(
 				) {
 					throw error;
 				}
-				await markVideoWaitingForCapacity(videoId);
+				await markVideoWaitingForCapacity(videoId, processingToken, attemptId);
 				await sleep(15_000 * (processingAttempt + 1));
 			}
 		}
 
-		await saveMetadataAndComplete(videoId, metadata);
-
-		const outputKey = `${userId}/${videoId}/result.mp4`;
-		if (rawFileKey !== outputKey) {
-			await cleanupRawUpload(videoId, rawFileKey);
-		}
-
-		await queueProcessedVideoTranscription(videoId);
+		await confirmProcessingComplete(videoId, processingToken, attemptId);
+		await queueProcessedVideoTranscription(videoId, processingToken);
 
 		return {
 			success: true,
@@ -101,47 +120,51 @@ export async function processVideoWorkflow(
 		};
 	} catch (error) {
 		const errorMessage = error instanceof Error ? error.message : String(error);
-		await setProcessingError(videoId, errorMessage);
+		if (attemptId && !(error instanceof Error && error.name === "ProcessingRunSupersededError"))
+			await setProcessingError(
+				videoId,
+				processingToken,
+				attemptId,
+				errorMessage,
+			);
 		throw new FatalError(errorMessage);
 	}
+}
+
+async function beginProcessingAttempt(
+	videoId: string,
+	token: string,
+	attempt: number,
+) {
+	"use step";
+	return claimProcessingAttempt(
+		db(),
+		Video.VideoId.make(videoId),
+		token,
+		attempt,
+	);
 }
 
 async function validateProcessingRequest(
 	videoId: string,
 	rawFileKey: string,
+	token: string,
+	userId: string,
 ): Promise<void> {
 	"use step";
-
-	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
-	if (!mediaServerUrl) {
+	if (!serverEnv().MEDIA_SERVER_URL)
 		throw new FatalError("MEDIA_SERVER_URL is not configured");
-	}
-
 	const [video] = await db()
 		.select()
 		.from(videos)
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	if (!video) {
-		throw new FatalError("Video does not exist");
-	}
-
-	const [upload] = await db()
-		.select()
-		.from(videoUploads)
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
-
-	if (!upload) {
-		throw new FatalError("Upload does not exist");
-	}
-
-	if (upload.rawFileKey !== rawFileKey) {
-		throw new FatalError("Upload raw file key does not match");
-	}
-
-	if (upload.phase !== "processing") {
-		throw new FatalError("Upload is not ready for processing");
-	}
+		.where(eq(videos.id, Video.VideoId.make(videoId)));
+	if (
+		!video ||
+		video.ownerId !== userId ||
+		!matchesProcessingRun(video, token) ||
+		video.metadata?.processingRun?.rawFileKey !== rawFileKey
+	)
+		throw new FatalError("Processing source or ownership changed");
 }
 
 const MEDIA_SERVER_START_MAX_ATTEMPTS = 2;
@@ -177,6 +200,9 @@ async function startMediaServerProcessJob(
 		webhookSecret?: string;
 		inputExtension: string;
 		audioLevels?: boolean;
+		processingToken: string;
+		processingInputKey: string;
+		processingOutputKey: string;
 		importedOriginal?: boolean;
 	},
 ): Promise<string> {
@@ -261,6 +287,8 @@ async function processVideoOnMediaServer(
 	userId: string,
 	rawFileKey: string,
 	_bucketId: string | null,
+	processingToken: string,
+	attemptId: string,
 ): Promise<void> {
 	"use step";
 
@@ -276,9 +304,11 @@ async function processVideoOnMediaServer(
 		.from(videos)
 		.where(eq(videos.id, Video.VideoId.make(videoId)));
 
-	if (!video) {
-		throw new FatalError("Video does not exist");
-	}
+	if (!video || !matchesProcessingRun(video, processingToken, attemptId))
+		throw new ProcessingRunSupersededError();
+	const processingRun = video.metadata?.processingRun;
+	if (!processingRun) throw new ProcessingRunSupersededError();
+	if (processingRun.state === "complete") return;
 
 	const videoDomain = decodeStorageVideo(video);
 
@@ -291,9 +321,9 @@ async function processVideoOnMediaServer(
 		})
 		.pipe(runWorkflowPromise);
 
-	const outputKey = `${userId}/${videoId}/result.mp4`;
-	const thumbnailKey = `${userId}/${videoId}/screenshot/screen-capture.jpg`;
-	const previewGifKey = `${userId}/${videoId}/preview/animated-preview.gif`;
+	const outputKey = processingRun.outputKey;
+	const thumbnailKey = processingRun.thumbnailKey;
+	const previewGifKey = processingRun.previewKey;
 
 	const outputPresignedUrl = await bucket
 		.getInternalPresignedPutUrl(
@@ -326,21 +356,35 @@ async function processVideoOnMediaServer(
 		)
 		.pipe(runWorkflowPromise);
 
-	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress?retryable=true`;
+	const webhookUrl = `${webhookBaseUrl}/api/webhooks/media-server/progress?processingRun=${encodeURIComponent(processingToken)}&processingAttempt=${encodeURIComponent(attemptId)}`;
 	const webhookSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
 
-	await db()
-		.update(videoUploads)
-		.set({
-			phase: "processing",
-			processingProgress: 0,
-			processingMessage: "Starting video processing...",
-			processingError: null,
-			updatedAt: new Date(),
-		})
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+	const active = await applyVideoProcessingProgress(db(), {
+		videoId: Video.VideoId.make(videoId),
+		token: processingToken,
+		attemptId,
+		phase: "processing",
+		progress: 0,
+		message: "Starting video processing...",
+	});
+	if (!active) {
+		const [current] = await db()
+			.select()
+			.from(videos)
+			.where(eq(videos.id, Video.VideoId.make(videoId)));
+		if (
+			current &&
+			matchesProcessingRun(current, processingToken, attemptId) &&
+			current.metadata?.processingRun?.state === "complete"
+		)
+			return;
+		throw new ProcessingRunSupersededError();
+	}
 
 	await startMediaServerProcessJob(mediaServerUrl, {
+		processingToken: attemptId,
+		processingInputKey: rawFileKey,
+		processingOutputKey: outputKey,
 		audioLevels: video.source.type === "webMP4",
 		videoId,
 		userId,
@@ -357,60 +401,41 @@ async function processVideoOnMediaServer(
 	});
 }
 
-async function saveMetadataAndComplete(
+async function confirmProcessingComplete(
 	videoId: string,
-	metadata: { duration: number; width: number; height: number; fps: number },
-): Promise<void> {
+	token: string,
+	attemptId: string,
+) {
 	"use step";
-
-	const duration = getValidDuration(metadata.duration);
-
-	await db()
-		.update(videos)
-		.set({
-			width: metadata.width,
-			height: metadata.height,
-			fps: metadata.fps,
-			...(duration === undefined ? {} : { duration }),
-		})
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	await db()
-		.delete(videoUploads)
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
-}
-
-async function cleanupRawUpload(
-	videoId: string,
-	rawFileKey: string,
-): Promise<void> {
-	"use step";
-
-	try {
-		const [video] = await db()
-			.select()
-			.from(videos)
-			.where(eq(videos.id, Video.VideoId.make(videoId)));
-
-		if (!video) return;
-
-		const videoDomain = decodeStorageVideo(video);
-
-		const [bucket] =
-			await Storage.getAccessForVideo(videoDomain).pipe(runWorkflowPromise);
-
-		await bucket.deleteObject(rawFileKey).pipe(runWorkflowPromise);
-	} catch (error) {
-		console.error("[process-video] Failed to delete raw upload", error);
-	}
+	const [video] = await db()
+		.select()
+		.from(videos)
+		.where(eq(videos.id, Video.VideoId.make(videoId)));
+	if (
+		!video ||
+		!matchesProcessingRun(video, token, attemptId) ||
+		video.metadata?.processingRun?.state !== "complete"
+	)
+		throw new ProcessingRunSupersededError();
 }
 
 async function queueProcessedVideoTranscription(
 	videoId: string,
+	processingToken: string,
 ): Promise<void> {
 	"use step";
 
 	try {
+		const [current] = await db()
+			.select()
+			.from(videos)
+			.where(eq(videos.id, Video.VideoId.make(videoId)));
+		if (
+			!current ||
+			!matchesProcessingRun(current, processingToken) ||
+			current.metadata?.processingRun?.state !== "complete"
+		)
+			return;
 		const [owner] = await db()
 			.select({
 				id: videos.ownerId,
@@ -445,31 +470,34 @@ async function queueProcessedVideoTranscription(
 
 async function setProcessingError(
 	videoId: string,
+	token: string,
+	attemptId: string,
 	errorMessage: string,
 ): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videoUploads)
-		.set({
-			phase: "error",
-			processingProgress: 0,
-			processingMessage: "Video processing failed",
-			processingError: errorMessage,
-			updatedAt: new Date(),
-		})
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+	await applyVideoProcessingProgress(db(), {
+		videoId: Video.VideoId.make(videoId),
+		token,
+		attemptId,
+		phase: "error",
+		progress: 0,
+		message: "Video processing failed",
+		error: errorMessage,
+	});
 }
 
-async function markVideoWaitingForCapacity(videoId: string): Promise<void> {
+async function markVideoWaitingForCapacity(
+	videoId: string,
+	token: string,
+	attemptId: string,
+): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videoUploads)
-		.set({
-			processingMessage: "Queued for video processing...",
-			processingError: null,
-			updatedAt: new Date(),
-		})
-		.where(eq(videoUploads.videoId, videoId as Video.VideoId));
+	await applyVideoProcessingProgress(db(), {
+		videoId: Video.VideoId.make(videoId),
+		token,
+		attemptId,
+		phase: "processing",
+		progress: 0,
+		message: "Queued for video processing...",
+	});
 }

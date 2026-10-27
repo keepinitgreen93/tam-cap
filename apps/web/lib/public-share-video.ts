@@ -1,4 +1,4 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	organizations,
 	spaces,
@@ -6,9 +6,9 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { Video } from "@cap/web-domain";
-import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 
 export type PublicShareVideoCandidate = {
 	id: Video.VideoId;
@@ -72,6 +72,10 @@ export async function getPublicShareVideo(
 			hasPassword: sql<boolean>`${videos.password} IS NOT NULL`.mapWith(
 				Boolean,
 			),
+			hasInheritedPassword:
+				sql<boolean>`exists (select 1 from ${spaceVideos} inner join ${spaces} on ${spaceVideos.spaceId} = ${spaces.id} where ${spaceVideos.videoId} = ${videos.id} and ${spaces.password} is not null)`.mapWith(
+					Boolean,
+				),
 			allowedEmailDomain: organizations.allowedEmailDomain,
 			isScreenshot: videos.isScreenshot,
 			hasActiveUpload:
@@ -80,7 +84,7 @@ export async function getPublicShareVideo(
 				),
 			sourceType: sql<
 				PublicShareVideoCandidate["sourceType"]
-			>`JSON_UNQUOTE(JSON_EXTRACT(${videos.source}, '$.type'))`,
+			>`JSON_EXTRACT(${videos.source}, '$.type')`,
 			jobStatus: videos.jobStatus,
 			skipProcessing: videos.skipProcessing,
 			width: videos.width,
@@ -102,17 +106,7 @@ export async function getPublicShareVideo(
 
 	if (!video) return null;
 
-	const [inheritedPassword] = await db()
-		.select({ id: spaces.id })
-		.from(spaceVideos)
-		.innerJoin(spaces, eq(spaceVideos.spaceId, spaces.id))
-		.where(and(eq(spaceVideos.videoId, videoId), isNotNull(spaces.password)))
-		.limit(1);
-
-	const candidate: PublicShareVideoCandidate = {
-		...video,
-		hasInheritedPassword: Boolean(inheritedPassword),
-	};
+	const candidate: PublicShareVideoCandidate = video;
 
 	if (!isPublicShareVideoCandidateEligible(candidate)) return null;
 

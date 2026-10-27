@@ -1,166 +1,99 @@
-import { getCurrentUser } from "@cap/database/auth/session";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { organizationInvites } from "@cap/database/cloudflare/schema";
+import { eq } from "drizzle-orm";
+import type { NextRequest } from "next/server";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestTeam } from "../helpers/cloudflare-team";
 
-const mockDb = {
-	select: vi.fn(),
-	update: vi.fn(),
-	delete: vi.fn(),
-	from: vi.fn(),
-	where: vi.fn(),
-	for: vi.fn(),
-	limit: vi.fn(),
-	set: vi.fn(),
-	transaction: vi.fn(),
-};
-
-vi.mock("@cap/database", () => ({
-	db: () => mockDb,
+const state = vi.hoisted(() => ({
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
+	user: null as Awaited<ReturnType<typeof createTestTeam>>["user"] | null,
 }));
-
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!state.database) throw new Error("Test database unavailable");
+		return state.database;
+	},
+}));
 vi.mock("@cap/database/auth/session", () => ({
-	getCurrentUser: vi.fn(),
+	getCurrentUser: async () => state.user,
 }));
 
-vi.mock("@cap/database/schema", () => ({
-	organizationInvites: {
-		id: "id",
-		invitedEmail: "invitedEmail",
-		organizationId: "organizationId",
-	},
-	organizationMembers: {
-		id: "memberId",
-		userId: "memberUserId",
-		organizationId: "memberOrganizationId",
-		hasProSeat: "memberHasProSeat",
-	},
-	spaceMembers: {
-		userId: "spaceMemberUserId",
-		spaceId: "spaceMemberSpaceId",
-	},
-	spaces: {
-		id: "spaceId",
-		organizationId: "spaceOrganizationId",
-	},
-	users: {
-		id: "userId",
-		thirdPartyStripeSubscriptionId: "thirdPartyStripeSubscriptionId",
-	},
-}));
+import { POST } from "@/app/api/invite/decline/route";
 
-vi.mock("drizzle-orm", () => ({
-	and: vi.fn((...args: unknown[]) => args),
-	eq: vi.fn((field: unknown, value: unknown) => ({ field, value })),
-	inArray: vi.fn((field: unknown, values: unknown[]) => ({ field, values })),
-}));
-
-const mockGetCurrentUser = getCurrentUser as ReturnType<typeof vi.fn>;
-
-function resetMockDb() {
-	for (const key of Object.keys(mockDb)) {
-		const fn = mockDb[key as keyof typeof mockDb];
-		if (typeof fn?.mockClear === "function") {
-			fn.mockClear();
-		}
-	}
-	mockDb.select.mockReturnValue(mockDb);
-	mockDb.update.mockReturnValue(mockDb);
-	mockDb.delete.mockReturnValue(mockDb);
-	mockDb.from.mockReturnValue(mockDb);
-	mockDb.where.mockReturnValue(mockDb);
-	mockDb.set.mockReturnValue(mockDb);
-	mockDb.for.mockResolvedValue([]);
-	mockDb.limit.mockResolvedValue([]);
-	mockDb.transaction.mockImplementation((fn) => fn(mockDb));
-}
-
-function makeRequest(body: unknown) {
-	return new Request("https://cap.test/api/invite/decline", {
+let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let team: Awaited<ReturnType<typeof createTestTeam>>;
+const request = (body: unknown, crossSite = false) =>
+	new Request("https://cap.test/api/invite/decline", {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
+		headers: {
+			"Content-Type": "application/json",
+			...(crossSite ? { "Sec-Fetch-Site": "cross-site" } : {}),
+		},
 		body: JSON.stringify(body),
-	}) as unknown as import("next/server").NextRequest;
-}
+	}) as NextRequest;
 
-describe("POST /api/invite/decline", () => {
-	let POST: typeof import("@/app/api/invite/decline/route").POST;
-
+describe("POST /api/invite/decline on D1", () => {
+	beforeAll(async () => {
+		fixture = await createTestDatabase();
+		state.database = fixture.database;
+	});
+	afterAll(async () => fixture?.dispose());
 	beforeEach(async () => {
-		vi.clearAllMocks();
-		resetMockDb();
-		const mod = await import("@/app/api/invite/decline/route");
-		POST = mod.POST;
+		team = await createTestTeam(fixture.database);
+		state.user = team.user;
 	});
-
 	it("returns 401 when the requester is not authenticated", async () => {
-		mockGetCurrentUser.mockResolvedValue(null);
-
-		const response = await POST(makeRequest({ inviteId: "invite-1" }));
-
-		expect(response.status).toBe(401);
-		expect(mockDb.delete).not.toHaveBeenCalled();
+		state.user = null;
+		expect(
+			(await POST(request({ inviteId: team.invite.inviteId }))).status,
+		).toBe(401);
 	});
-
-	it("returns 400 when inviteId is missing", async () => {
-		mockGetCurrentUser.mockResolvedValue({
-			id: "user-1",
-			email: "invitee@example.com",
-		});
-
-		const response = await POST(makeRequest({}));
-
-		expect(response.status).toBe(400);
-		expect(mockDb.delete).not.toHaveBeenCalled();
+	it("rejects cross-site cookie writes", async () => {
+		expect(
+			(await POST(request({ inviteId: team.invite.inviteId }, true))).status,
+		).toBe(401);
 	});
-
+	it("returns 400 for missing or expired invitations", async () => {
+		expect((await POST(request({}))).status).toBe(400);
+		await fixture.database
+			.update(organizationInvites)
+			.set({ expiresAt: new Date(0) })
+			.where(eq(organizationInvites.id, team.invite.inviteId));
+		expect(
+			(await POST(request({ inviteId: team.invite.inviteId }))).status,
+		).toBe(400);
+	});
 	it("returns 404 when the invite does not exist", async () => {
-		mockGetCurrentUser.mockResolvedValue({
-			id: "user-1",
-			email: "invitee@example.com",
-		});
-		mockDb.for.mockResolvedValueOnce([]);
-
-		const response = await POST(makeRequest({ inviteId: "invite-1" }));
-
-		expect(response.status).toBe(404);
-		expect(mockDb.delete).not.toHaveBeenCalled();
+		expect((await POST(request({ inviteId: "missing-invite" }))).status).toBe(
+			404,
+		);
 	});
-
 	it("returns 403 when the authenticated user is not the invitee", async () => {
-		mockGetCurrentUser.mockResolvedValue({
-			id: "user-1",
-			email: "attacker@example.com",
-		});
-		mockDb.for.mockResolvedValueOnce([
-			{ id: "invite-1", invitedEmail: "invitee@example.com" },
-		]);
-
-		const response = await POST(makeRequest({ inviteId: "invite-1" }));
-
-		expect(response.status).toBe(403);
-		expect(mockDb.delete).not.toHaveBeenCalled();
+		state.user = team.owner;
+		expect(
+			(await POST(request({ inviteId: team.invite.inviteId }))).status,
+		).toBe(403);
 	});
-
-	it("deletes the invite when the authenticated user is the invitee", async () => {
-		mockGetCurrentUser.mockResolvedValue({
-			id: "user-1",
-			email: "Invitee@Example.com",
-			activeOrganizationId: null,
-			defaultOrgId: null,
-		});
-		mockDb.for.mockResolvedValueOnce([
-			{
-				id: "invite-1",
-				invitedEmail: "invitee@example.com",
-				organizationId: "org-1",
-			},
-		]);
-		mockDb.limit.mockReturnValueOnce(mockDb);
-
-		const response = await POST(makeRequest({ inviteId: "invite-1" }));
-
-		expect(response.status).toBe(200);
-		expect(await response.json()).toEqual({ success: true });
-		expect(mockDb.delete).toHaveBeenCalledTimes(1);
-		expect(mockDb.transaction).toHaveBeenCalledTimes(1);
+	it("deletes the invite when the authenticated user is its invitee", async () => {
+		expect(
+			(await POST(request({ inviteId: team.invite.inviteId }))).status,
+		).toBe(200);
+		expect(
+			await fixture.database
+				.select()
+				.from(organizationInvites)
+				.where(eq(organizationInvites.id, team.invite.inviteId)),
+		).toHaveLength(0);
 	});
 });

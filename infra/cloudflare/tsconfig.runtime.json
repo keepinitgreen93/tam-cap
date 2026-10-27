@@ -1,0 +1,9 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"allowJs": true,
+		"types": ["@cloudflare/workers-types"],
+		"lib": ["ES2023"]
+	},
+	"include": ["runtime-worker.ts", "runtime-env.ts", "workflow-store.mjs"]
+}

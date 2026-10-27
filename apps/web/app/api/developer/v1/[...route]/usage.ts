@@ -1,5 +1,8 @@
-import { db } from "@cap/database";
-import { developerCreditAccounts, developerVideos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	developerCreditAccounts,
+	developerVideos,
+} from "@cap/database/cloudflare/schema";
 import { and, count, eq, isNull, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { withDeveloperSecretAuth } from "../../../utils";
@@ -23,7 +26,7 @@ app.get("/", async (c) => {
 		db()
 			.select({
 				totalVideos: count(),
-				totalDurationMinutes: sql<number>`COALESCE(SUM(${developerVideos.duration}) / 60, 0)`,
+				totalDurationMinutes: sql<number>`COALESCE(SUM(${developerVideos.duration}) / 60.0, 0)`,
 			})
 			.from(developerVideos)
 			.where(

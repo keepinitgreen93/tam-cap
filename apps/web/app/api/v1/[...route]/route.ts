@@ -1,5 +1,10 @@
 import { createHash, createHmac } from "node:crypto";
 import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
+import { normalizeEmail } from "@cap/database/auth/identity";
+import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import { releaseProSeatStatement } from "@cap/database/cloudflare/pro-seat";
+import * as Db from "@cap/database/cloudflare/schema";
 import {
 	decrypt,
 	encrypt,
@@ -9,9 +14,6 @@ import {
 import { sendEmail } from "@cap/database/emails/config";
 import { OrganizationInvite } from "@cap/database/emails/organization-invite";
 import { nanoId, nanoIdLong } from "@cap/database/helpers";
-import { releaseProSeatSubscription } from "@cap/database/pro-seat-subscription";
-import * as Db from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
 import { buildEnv, serverEnv } from "@cap/env";
 import {
 	STRIPE_DEVELOPER_CREDITS_PRODUCT_ID,
@@ -21,8 +23,8 @@ import {
 } from "@cap/utils";
 import {
 	AgentManagement,
+	CloudflareDatabase,
 	collectPasswordHashes,
-	Database,
 	type GoogleDriveIntegrationConfig,
 	getGoogleDriveAccessToken,
 	getGoogleDriveAuthUrl,
@@ -62,7 +64,7 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { union } from "drizzle-orm/mysql-core";
+import { union } from "drizzle-orm/sqlite-core";
 import { Effect, Layer, Option, Schema } from "effect";
 import { revalidatePath } from "next/cache";
 import { start } from "workflow/api";
@@ -112,6 +114,7 @@ import {
 import {
 	createAgentFeedback,
 	isAgentIdempotencyKey,
+	readAgentMutationReplay,
 	runAgentExternalMutation,
 	runAgentMutation,
 	updateAgentCap,
@@ -132,7 +135,15 @@ import {
 	isDisallowedS3Endpoint,
 	publicOnlyS3Agents,
 } from "@/lib/s3-endpoint-policy";
+import { createTranscriptStore } from "@/lib/storage-transcript-store";
 import { transcribeVideo } from "@/lib/transcribe";
+import {
+	metadataWithTranscriptPublication,
+	prepareTranscriptPublication,
+	readTranscriptArtifacts,
+	readTranscriptVtt,
+	TranscriptPublicationConflictError,
+} from "@/lib/transcript-publication";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { isVideoStorageKey } from "@/lib/video-storage-key";
 import { isAiGenerationEnabled } from "@/utils/flags";
@@ -196,6 +207,28 @@ type StatusRow = Pick<
 	| "uploadError"
 >;
 
+const getNewVideoPublic = async (
+	snapshot: AtomicSnapshot,
+	organizationId: Organisation.OrganisationId,
+) => {
+	const [organization] = await snapshot.read((reader) =>
+		reader
+			.select({
+				visibility: Db.organizations.defaultVideoVisibility,
+				tombstoneAt: Db.organizations.tombstoneAt,
+			})
+			.from(Db.organizations)
+			.where(eq(Db.organizations.id, organizationId))
+			.limit(1),
+	);
+	if (!organization || organization.tombstoneAt)
+		throw new Error("Organization not found");
+	return (
+		organization.visibility !== "private" &&
+		serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC
+	);
+};
+
 const makeRequestId = () => crypto.randomUUID();
 
 const deterministicAgentId = (namespace: string, ...parts: string[]) =>
@@ -203,11 +236,6 @@ const deterministicAgentId = (namespace: string, ...parts: string[]) =>
 		.update([namespace, ...parts].join("\0"), "utf8")
 		.digest("base64url")
 		.slice(0, 15);
-
-const affectedRows = (result: unknown) =>
-	Array.isArray(result)
-		? ((result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0)
-		: ((result as { affectedRows?: number }).affectedRows ?? 0);
 
 const defaultProOrganizationSettings = {
 	disableSummary: false,
@@ -230,7 +258,7 @@ const readDeveloperCredentials = Effect.fn("Agent.readDeveloperCredentials")(
 		result: (typeof DeveloperKeyOperationResult)["Type"],
 		requestId: string,
 	) {
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const rows = yield* database.use((db) =>
 			db
 				.select({
@@ -486,7 +514,7 @@ const getStatus = (row: StatusRow) => {
 const getCapRows = Effect.fn("Agent.getCapRows")(function* (
 	videoId?: Video.VideoId,
 ) {
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	return yield* database.use((db) => {
 		const query = db
 			.select({
@@ -536,7 +564,7 @@ const getCapRows = Effect.fn("Agent.getCapRows")(function* (
 const getStatusRow = Effect.fn("Agent.getStatusRow")(function* (
 	videoId: Video.VideoId,
 ) {
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [row] = yield* database.use((db) =>
 		db
 			.select({
@@ -560,7 +588,7 @@ const getSpaceRules = Effect.fn("Agent.getSpaceRules")(function* (
 	videoIds: ReadonlyArray<Video.VideoId>,
 ) {
 	if (videoIds.length === 0) return [] as SpaceRuleRow[];
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	return yield* database.use((db) =>
 		db
 			.select({
@@ -574,7 +602,9 @@ const getSpaceRules = Effect.fn("Agent.getSpaceRules")(function* (
 			})
 			.from(Db.spaceVideos)
 			.innerJoin(Db.spaces, eq(Db.spaceVideos.spaceId, Db.spaces.id))
-			.where(inArray(Db.spaceVideos.videoId, videoIds)),
+			.where(
+				sql`${Db.spaceVideos.videoId} in (select value from json_each(${JSON.stringify(videoIds)}))`,
+			),
 	);
 });
 
@@ -692,7 +722,7 @@ const listCaps = Effect.fn("Agent.listCaps")(function* (
 	requestId: string,
 ) {
 	const principal = yield* Agent.AgentPrincipal;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const limit = parseAgentLimit(params.limit);
 	if (limit === null)
 		return yield* badRequest(requestId, "limit must be positive");
@@ -866,15 +896,26 @@ const readTranscript = Effect.fn("Agent.readTranscript")(function* (
 ) {
 	const storage = yield* Storage;
 	const [bucket] = yield* storage.getAccessForVideo(video);
-	const object = yield* bucket.getObject(
-		`${video.ownerId}/${video.id}/transcription.vtt`,
-	);
-	if (Option.isNone(object)) {
+	const vtt = yield* Effect.tryPromise({
+		try: () =>
+			readTranscriptVtt(
+				{
+					id: video.id,
+					ownerId: video.ownerId,
+					metadata: Option.getOrNull(video.metadata),
+				},
+				createTranscriptStore(bucket),
+			),
+		catch: () =>
+			temporarilyUnavailable(requestId, "Transcript content could not be read"),
+	});
+	if (vtt === null)
 		return yield* notReady(
 			requestId,
 			"Transcript content is not available yet",
 		);
-	}
+	const object = { value: vtt };
+
 	const cues = parseAgentVtt(object.value);
 	return {
 		vtt: object.value,
@@ -887,7 +928,7 @@ const readTranscript = Effect.fn("Agent.readTranscript")(function* (
 const getFeedback = Effect.fn("Agent.getFeedback")(function* (
 	videoId: Video.VideoId,
 ) {
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	return yield* database.use((db) =>
 		db
 			.select({
@@ -1096,7 +1137,7 @@ const unlockCap = Effect.fn("Agent.unlockCap")(function* (
 		return yield* badRequest(requestId, "This Cap does not require a password");
 	}
 
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [videoRows, spacePasswords] = yield* database.use((db) =>
 		Promise.all([
 			db
@@ -1217,7 +1258,7 @@ const ensureAgentStripeCustomer = Effect.fn("Agent.ensureStripeCustomer")(
 		providerIdempotencyKey: string,
 		requestId: string,
 	) {
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [account] = yield* database.use((db) =>
 			db
 				.select({
@@ -1285,7 +1326,7 @@ const createAgentGoogleDriveState = (
 
 const getAgentOrganizationDrive = Effect.fn("Agent.getOrganizationDrive")(
 	function* (organizationId: Organisation.OrganisationId) {
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [drive] = yield* database.use((db) =>
 			db
 				.select()
@@ -1355,7 +1396,7 @@ const resolveAgentS3Config = Effect.fn("Agent.resolveS3Config")(function* (
 				"Provide both S3 access key ID and secret access key",
 			);
 		}
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [existing] = yield* database.use((db) =>
 			db
 				.select({
@@ -1535,7 +1576,7 @@ const getAgentOperation = Effect.fn("Agent.getOperation")(function* (
 		return yield* badRequest(requestId, "Operation ID is invalid");
 	}
 	const principal = yield* Agent.AgentPrincipal;
-	const database = yield* Database;
+	const database = yield* CloudflareDatabase;
 	const [operation] = yield* database.use((db) =>
 		db
 			.select()
@@ -1584,7 +1625,7 @@ const requireAgentStorageManager = Effect.fn("Agent.requireStorageManager")(
 		yield* requireScope(principal, scope, requestId);
 		const management = yield* AgentManagement;
 		yield* management.requireOrganizationManager(principal.id, organizationId);
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [account] = yield* database.use((db) =>
 			db
 				.select({
@@ -1702,7 +1743,7 @@ const updateAgentImage = Effect.fn("Agent.updateImage")(function* (input: {
 		decodeReplay: decodeMutationResponse,
 		execute: () =>
 			Effect.gen(function* () {
-				const database = yield* Database;
+				const database = yield* CloudflareDatabase;
 				const imageUploads = yield* ImageUploads;
 				const target = input.target;
 				if (target.type === "profile") {
@@ -1826,13 +1867,13 @@ const updateAgentImage = Effect.fn("Agent.updateImage")(function* (input: {
 								? db
 										.update(Db.folders)
 										.set({
-											settings: sql`JSON_MERGE_PATCH(COALESCE(${Db.folders.settings}, '{}'), CAST(${patch} AS JSON))`,
+											settings: sql`json_patch(COALESCE(${Db.folders.settings}, '{}'), ${patch})`,
 										})
 										.where(eq(Db.folders.id, target.folderId))
 								: db
 										.update(Db.spaces)
 										.set({
-											settings: sql`JSON_MERGE_PATCH(COALESCE(${Db.spaces.settings}, '{}'), CAST(${patch} AS JSON))`,
+											settings: sql`json_patch(COALESCE(${Db.spaces.settings}, '{}'), ${patch})`,
 										})
 										.where(eq(Db.spaces.id, target.spaceId));
 						},
@@ -1918,6 +1959,7 @@ const updateAgentCollectionPublicPage = Effect.fn(
 		input.target.type === "folder"
 			? input.target.folderId
 			: input.target.spaceId;
+	const mutationTime1 = new Date();
 	return yield* runAgentMutation({
 		principal,
 		operation: `update_${input.target.type}_public_page`,
@@ -1925,44 +1967,69 @@ const updateAgentCollectionPublicPage = Effect.fn(
 		request: { target: input.target, payload: input.payload },
 		requestId: input.requestId,
 		decodeReplay: decodeMutationResponse,
-		execute: async (tx) => {
-			const now = new Date();
+		execute: async (snapshot, db) => {
+			const statements: AtomicStatement[] = [];
+			const now = mutationTime1;
 			const settingsPatch =
 				Object.keys(publicPage).length > 0
 					? JSON.stringify({ publicPage })
 					: null;
-			const result =
-				input.target.type === "folder"
-					? await tx
+			const collectionTarget = input.target;
+			const [existingCollection] =
+				collectionTarget.type === "folder"
+					? await snapshot.read((reader) =>
+							reader
+								.select({ id: Db.folders.id })
+								.from(Db.folders)
+								.where(eq(Db.folders.id, collectionTarget.folderId))
+								.limit(1),
+						)
+					: await snapshot.read((reader) =>
+							reader
+								.select({ id: Db.spaces.id })
+								.from(Db.spaces)
+								.where(eq(Db.spaces.id, collectionTarget.spaceId))
+								.limit(1),
+						);
+			if (!existingCollection)
+				return { statements: [], result: { state: "not_found" } };
+			input.target.type === "folder"
+				? statements.push(
+						db
 							.update(Db.folders)
 							.set({
 								public: publicValue,
 								settings: settingsPatch
-									? sql`JSON_MERGE_PATCH(COALESCE(${Db.folders.settings}, '{}'), CAST(${settingsPatch} AS JSON))`
+									? sql`json_patch(COALESCE(${Db.folders.settings}, '{}'), ${settingsPatch})`
 									: undefined,
 								updatedAt: now,
 							})
-							.where(eq(Db.folders.id, input.target.folderId))
-					: await tx
+							.where(eq(Db.folders.id, input.target.folderId)),
+					)
+				: statements.push(
+						db
 							.update(Db.spaces)
 							.set({
 								public: publicValue,
 								settings: settingsPatch
-									? sql`JSON_MERGE_PATCH(COALESCE(${Db.spaces.settings}, '{}'), CAST(${settingsPatch} AS JSON))`
+									? sql`json_patch(COALESCE(${Db.spaces.settings}, '{}'), ${settingsPatch})`
 									: undefined,
 								updatedAt: now,
 							})
-							.where(eq(Db.spaces.id, input.target.spaceId));
-			if (affectedRows(result) === 0) return { state: "not_found" };
+							.where(eq(Db.spaces.id, input.target.spaceId)),
+					);
 			return {
-				state: "success",
-				response: mutationResponse(
-					`${input.target.type}_public_page`,
-					targetId,
-					"updated",
-					input.requestId,
-					now,
-				),
+				statements,
+				result: {
+					state: "success",
+					response: mutationResponse(
+						`${input.target.type}_public_page`,
+						targetId,
+						"updated",
+						input.requestId,
+						now,
+					),
+				},
 			};
 		},
 	});
@@ -1989,52 +2056,59 @@ const queueAgentCapOperation = Effect.fn("Agent.queueCapOperation")(
 			request: { videoId: input.videoId },
 			requestId: input.requestId,
 			decodeReplay: Schema.decodeUnknownSync(AgentOperationMutationState),
-			execute: async (tx) => {
-				const [video] = await tx
-					.select()
-					.from(Db.videos)
-					.where(
-						and(
-							eq(Db.videos.id, input.videoId),
-							eq(Db.videos.ownerId, principal.id),
-						),
-					)
-					.limit(1)
-					.for("update");
-				if (!video) return { state: "not_found" };
-				await tx.insert(Db.agentApiOperations).values({
-					id: operationId,
-					userId: principal.id,
-					kind: input.kind,
-					resourceId: input.videoId,
-					resultResourceId: destinationId,
-					payload: {
-						snapshot: {
-							id: video.id,
-							ownerId: video.ownerId,
-							orgId: video.orgId,
-							name: video.name,
-							bucket: video.bucket,
-							storageIntegrationId: video.storageIntegrationId,
-							duration: video.duration,
-							width: video.width,
-							height: video.height,
-							fps: video.fps,
-							metadata: video.metadata,
-							public: video.public,
-							settings: video.settings,
-							transcriptionStatus: video.transcriptionStatus,
-							source: video.source,
-							folderId: video.folderId,
-							isScreenshot: video.isScreenshot,
-							skipProcessing: video.skipProcessing,
+			execute: async (snapshot, db) => {
+				const statements: AtomicStatement[] = [];
+				const [video] = await snapshot.read((reader) =>
+					reader
+						.select()
+						.from(Db.videos)
+						.where(
+							and(
+								eq(Db.videos.id, input.videoId),
+								eq(Db.videos.ownerId, principal.id),
+							),
+						)
+						.limit(1),
+				);
+				if (!video) return { statements, result: { state: "not_found" } };
+				statements.push(
+					db.insert(Db.agentApiOperations).values({
+						id: operationId,
+						userId: principal.id,
+						kind: input.kind,
+						resourceId: input.videoId,
+						resultResourceId: destinationId,
+						payload: {
+							snapshot: {
+								id: video.id,
+								ownerId: video.ownerId,
+								orgId: video.orgId,
+								name: video.name,
+								bucket: video.bucket,
+								storageIntegrationId: video.storageIntegrationId,
+								duration: video.duration,
+								width: video.width,
+								height: video.height,
+								fps: video.fps,
+								metadata: video.metadata,
+								public: video.public,
+								settings: video.settings,
+								transcriptionStatus: video.transcriptionStatus,
+								source: video.source,
+								folderId: video.folderId,
+								isScreenshot: video.isScreenshot,
+								skipProcessing: video.skipProcessing,
+							},
+							destinationId,
 						},
-						destinationId,
-					},
-				});
+					}),
+				);
 				return {
-					state: "success",
-					response: { operationId, requestId: input.requestId },
+					statements,
+					result: {
+						state: "success",
+						response: { operationId, requestId: input.requestId },
+					},
 				};
 			},
 		});
@@ -2059,31 +2133,39 @@ const queueAgentOrganizationDelete = Effect.fn("Agent.queueOrganizationDelete")(
 			request: { organizationId },
 			requestId,
 			decodeReplay: Schema.decodeUnknownSync(AgentOperationMutationState),
-			execute: async (tx) => {
-				const [organization] = await tx
-					.select({ id: Db.organizations.id })
-					.from(Db.organizations)
-					.where(
-						and(
-							eq(Db.organizations.id, organizationId),
-							eq(Db.organizations.ownerId, principal.id),
-							isNull(Db.organizations.tombstoneAt),
-						),
-					)
-					.limit(1)
-					.for("update");
-				if (!organization) return { state: "not_found" };
-				await tx.insert(Db.agentApiOperations).values({
-					id: operationId,
-					userId: principal.id,
-					kind: "delete_organization",
-					resourceId: organizationId,
-					resultResourceId: null,
-					payload: { organizationId },
-				});
+			execute: async (snapshot, db) => {
+				const statements: AtomicStatement[] = [];
+				const [organization] = await snapshot.read((reader) =>
+					reader
+						.select({ id: Db.organizations.id })
+						.from(Db.organizations)
+						.where(
+							and(
+								eq(Db.organizations.id, organizationId),
+								eq(Db.organizations.ownerId, principal.id),
+								isNull(Db.organizations.tombstoneAt),
+							),
+						)
+						.limit(1),
+				);
+				if (!organization)
+					return { statements, result: { state: "not_found" } };
+				statements.push(
+					db.insert(Db.agentApiOperations).values({
+						id: operationId,
+						userId: principal.id,
+						kind: "delete_organization",
+						resourceId: organizationId,
+						resultResourceId: null,
+						payload: { organizationId },
+					}),
+				);
 				return {
-					state: "success",
-					response: { operationId, requestId },
+					statements,
+					result: {
+						state: "success",
+						response: { operationId, requestId },
+					},
 				};
 			},
 		});
@@ -2105,6 +2187,23 @@ const queueAgentOrganizationDomain = Effect.fn("Agent.queueOrganizationDomain")(
 		requestId: string;
 	}) {
 		yield* requireAgentWrites(input.requestId);
+		if (
+			process.env.CAP_RUNTIME === "cloudflare" &&
+			input.kind !== "verify_organization_domain"
+		) {
+			const configuredDomain = new URL(
+				serverEnv().WEB_URL,
+			).hostname.toLowerCase();
+			if (
+				input.kind === "remove_organization_domain" ||
+				input.domain !== configuredDomain
+			)
+				return yield* forbidden(
+					input.requestId,
+					"Domains on this self-hosted server are managed by the deployment operator",
+				);
+		}
+
 		yield* requireUserConfirmedRequest(input.requestId);
 		const principal = yield* Agent.AgentPrincipal;
 		yield* requireScope(principal, "organizations:manage", input.requestId);
@@ -2124,77 +2223,94 @@ const queueAgentOrganizationDomain = Effect.fn("Agent.queueOrganizationDomain")(
 			},
 			requestId: input.requestId,
 			decodeReplay: Schema.decodeUnknownSync(AgentOperationMutationState),
-			execute: async (tx) => {
+			execute: async (snapshot, db) => {
+				const statements: AtomicStatement[] = [];
 				const [[organization], [membership], [account]] = await Promise.all([
-					tx
-						.select({ ownerId: Db.organizations.ownerId })
-						.from(Db.organizations)
-						.where(
-							and(
-								eq(Db.organizations.id, input.organizationId),
-								isNull(Db.organizations.tombstoneAt),
-							),
-						)
-						.limit(1)
-						.for("update"),
-					tx
-						.select({ role: Db.organizationMembers.role })
-						.from(Db.organizationMembers)
-						.where(
-							and(
-								eq(Db.organizationMembers.organizationId, input.organizationId),
-								eq(Db.organizationMembers.userId, principal.id),
-							),
-						)
-						.limit(1),
-					tx
-						.select({
-							stripeSubscriptionStatus: Db.users.stripeSubscriptionStatus,
-							thirdPartyStripeSubscriptionId:
-								Db.users.thirdPartyStripeSubscriptionId,
-						})
-						.from(Db.users)
-						.where(eq(Db.users.id, principal.id))
-						.limit(1),
+					snapshot.read((reader) =>
+						reader
+							.select({ ownerId: Db.organizations.ownerId })
+							.from(Db.organizations)
+							.where(
+								and(
+									eq(Db.organizations.id, input.organizationId),
+									isNull(Db.organizations.tombstoneAt),
+								),
+							)
+							.limit(1),
+					),
+					snapshot.read((reader) =>
+						reader
+							.select({ role: Db.organizationMembers.role })
+							.from(Db.organizationMembers)
+							.where(
+								and(
+									eq(
+										Db.organizationMembers.organizationId,
+										input.organizationId,
+									),
+									eq(Db.organizationMembers.userId, principal.id),
+								),
+							)
+							.limit(1),
+					),
+					snapshot.read((reader) =>
+						reader
+							.select({
+								stripeSubscriptionStatus: Db.users.stripeSubscriptionStatus,
+								thirdPartyStripeSubscriptionId:
+									Db.users.thirdPartyStripeSubscriptionId,
+							})
+							.from(Db.users)
+							.where(eq(Db.users.id, principal.id))
+							.limit(1),
+					),
 				]);
-				if (!organization || !account) return { state: "not_found" };
+				if (!organization || !account)
+					return { statements, result: { state: "not_found" } };
 				if (
 					organization.ownerId !== principal.id &&
-					membership?.role !== "owner" &&
 					membership?.role !== "admin"
 				) {
-					return { state: "forbidden" };
+					return { statements, result: { state: "forbidden" } };
 				}
 				if (input.kind === "set_organization_domain" && !userIsPro(account)) {
-					return { state: "forbidden" };
+					return { statements, result: { state: "forbidden" } };
 				}
-				if (input.domain) {
-					const [conflict] = await tx
-						.select({ id: Db.organizations.id })
-						.from(Db.organizations)
-						.where(
-							and(
-								eq(Db.organizations.customDomain, input.domain),
-								ne(Db.organizations.id, input.organizationId),
-							),
-						)
-						.limit(1);
-					if (conflict) return { state: "conflict" };
+				const targetDomain = input.domain;
+				if (targetDomain) {
+					const [conflict] = await snapshot.read((reader) =>
+						reader
+							.select({ id: Db.organizations.id })
+							.from(Db.organizations)
+							.where(
+								and(
+									eq(Db.organizations.customDomain, targetDomain),
+									ne(Db.organizations.id, input.organizationId),
+								),
+							)
+							.limit(1),
+					);
+					if (conflict) return { statements, result: { state: "conflict" } };
 				}
-				await tx.insert(Db.agentApiOperations).values({
-					id: operationId,
-					userId: principal.id,
-					kind: input.kind,
-					resourceId: input.organizationId,
-					resultResourceId: null,
-					payload: {
-						organizationId: input.organizationId,
-						domain: input.domain,
-					},
-				});
+				statements.push(
+					db.insert(Db.agentApiOperations).values({
+						id: operationId,
+						userId: principal.id,
+						kind: input.kind,
+						resourceId: input.organizationId,
+						resultResourceId: null,
+						payload: {
+							organizationId: input.organizationId,
+							domain: input.domain,
+						},
+					}),
+				);
 				return {
-					state: "success",
-					response: { operationId, requestId: input.requestId },
+					statements,
+					result: {
+						state: "success",
+						response: { operationId, requestId: input.requestId },
+					},
 				};
 			},
 		});
@@ -2229,7 +2345,12 @@ const queueAgentLoomImport = Effect.fn("Agent.queueLoomImport")(
 		) {
 			return yield* badRequest(input.requestId, "Loom URL is invalid");
 		}
-		const ownerEmail = input.payload.ownerEmail?.trim().toLowerCase();
+		const ownerEmail = input.payload.ownerEmail
+			? yield* Effect.try({
+					try: () => normalizeEmail(input.payload.ownerEmail ?? ""),
+					catch: () => badRequest(input.requestId, "Email is invalid"),
+				})
+			: undefined;
 		if (
 			ownerEmail &&
 			(ownerEmail.length > 255 ||
@@ -2261,7 +2382,7 @@ const queueAgentLoomImport = Effect.fn("Agent.queueLoomImport")(
 		if (spaceName) {
 			yield* requireScope(principal, "library:write", input.requestId);
 		}
-		const database = yield* Database;
+		const database = yield* CloudflareDatabase;
 		const [account] = yield* database.use((db) =>
 			db
 				.select({
@@ -2362,71 +2483,86 @@ const queueAgentLoomImport = Effect.fn("Agent.queueLoomImport")(
 					const rawFileKey = `${ownerId}/${videoId}/raw-upload.mp4`;
 					const now = new Date();
 					const importState = yield* database.use((db) =>
-						db.transaction(async (tx) => {
-							const [existingImport] = await tx
-								.select({ id: Db.importedVideos.id })
-								.from(Db.importedVideos)
-								.where(
-									and(
-										eq(Db.importedVideos.orgId, input.organizationId),
-										eq(Db.importedVideos.source, "loom"),
-										eq(Db.importedVideos.sourceId, loomVideoId),
-									),
-								)
-								.limit(1)
-								.for("update");
+						atomic(db, async (snapshot) => {
+							const statements: AtomicStatement[] = [];
+							const [existingImport] = await snapshot.read((reader) =>
+								reader
+									.select({ id: Db.importedVideos.id })
+									.from(Db.importedVideos)
+									.where(
+										and(
+											eq(Db.importedVideos.orgId, input.organizationId),
+											eq(Db.importedVideos.source, "loom"),
+											eq(Db.importedVideos.sourceId, loomVideoId),
+										),
+									)
+									.limit(1),
+							);
 							if (existingImport && existingImport.id !== videoId) {
-								return "conflict" as const;
+								return { statements, result: "conflict" as const };
 							}
-							const [existingOperation] = await tx
-								.select({ id: Db.agentApiOperations.id })
-								.from(Db.agentApiOperations)
-								.where(eq(Db.agentApiOperations.id, operationId))
-								.limit(1);
+							const [existingOperation] = await snapshot.read((reader) =>
+								reader
+									.select({ id: Db.agentApiOperations.id })
+									.from(Db.agentApiOperations)
+									.where(eq(Db.agentApiOperations.id, operationId))
+									.limit(1),
+							);
 							if (!existingOperation) {
 								if (!existingImport) {
-									await tx.insert(Db.videos).values({
-										id: videoId,
-										name:
-											download.videoName?.slice(0, 255) ??
-											`Loom Import - ${now.toISOString().slice(0, 10)}`,
-										ownerId,
-										orgId: input.organizationId,
-										source: { type: "webMP4" },
-										bucket: Option.getOrNull(writable.bucketId),
-										storageIntegrationId: Option.getOrNull(
-											writable.storageIntegrationId,
-										),
-										public: await getNewVideoPublic(input.organizationId),
-										duration: download.durationSeconds,
-										width: download.width,
-										height: download.height,
-									});
-									await tx.insert(Db.videoUploads).values({
-										videoId,
-										phase: "uploading",
-										processingProgress: 0,
-										processingMessage: "Importing from Loom...",
-									});
-									await tx.insert(Db.importedVideos).values({
-										id: videoId,
-										orgId: input.organizationId,
-										source: "loom",
-										sourceId: loomVideoId,
-									});
+									statements.push(
+										db.insert(Db.videos).values({
+											id: videoId,
+											name:
+												download.videoName?.slice(0, 255) ??
+												`Loom Import - ${now.toISOString().slice(0, 10)}`,
+											ownerId,
+											orgId: input.organizationId,
+											source: { type: "webMP4" },
+											bucket: Option.getOrNull(writable.bucketId),
+											storageIntegrationId: Option.getOrNull(
+												writable.storageIntegrationId,
+											),
+											public: await getNewVideoPublic(
+												snapshot,
+												input.organizationId,
+											),
+											duration: download.durationSeconds,
+											width: download.width,
+											height: download.height,
+										}),
+									);
+									statements.push(
+										db.insert(Db.videoUploads).values({
+											videoId,
+											phase: "uploading",
+											processingProgress: 0,
+											processingMessage: "Importing from Loom...",
+										}),
+									);
+									statements.push(
+										db.insert(Db.importedVideos).values({
+											id: videoId,
+											orgId: input.organizationId,
+											source: "loom",
+											sourceId: loomVideoId,
+										}),
+									);
 								}
 								let spaceId: Space.SpaceIdOrOrganisationId | null = null;
 								if (spaceName) {
-									const [existingSpace] = await tx
-										.select({ id: Db.spaces.id })
-										.from(Db.spaces)
-										.where(
-											and(
-												eq(Db.spaces.organizationId, input.organizationId),
-												sql`LOWER(${Db.spaces.name}) = ${spaceName.toLowerCase()}`,
-											),
-										)
-										.limit(1);
+									const [existingSpace] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.spaces.id })
+											.from(Db.spaces)
+											.where(
+												and(
+													eq(Db.spaces.organizationId, input.organizationId),
+													sql`LOWER(${Db.spaces.name}) = ${spaceName.toLowerCase()}`,
+												),
+											)
+											.limit(1),
+									);
 									spaceId =
 										existingSpace?.id ??
 										Space.SpaceId.make(
@@ -2437,60 +2573,66 @@ const queueAgentLoomImport = Effect.fn("Agent.queueLoomImport")(
 											),
 										);
 									if (!existingSpace) {
-										await tx.insert(Db.spaces).values({
-											id: spaceId,
-											name: spaceName,
-											organizationId: input.organizationId,
-											createdById: principal.id,
-										});
+										statements.push(
+											db.insert(Db.spaces).values({
+												id: spaceId,
+												name: spaceName,
+												organizationId: input.organizationId,
+												createdById: principal.id,
+											}),
+										);
 									}
 									for (const [userId, role] of [
 										[principal.id, "admin"],
 										[ownerId, ownerId === principal.id ? "admin" : "member"],
 									] as const) {
-										await tx
-											.insert(Db.spaceMembers)
-											.values({
-												id: deterministicAgentId(
-													"loom_space_member",
+										statements.push(
+											db
+												.insert(Db.spaceMembers)
+												.values({
+													id: deterministicAgentId(
+														"loom_space_member",
+														spaceId,
+														userId,
+													),
 													spaceId,
 													userId,
-												),
-												spaceId,
-												userId,
-												role,
-											})
-											.onDuplicateKeyUpdate({
-												set: { role: sql`${Db.spaceMembers.role}` },
-											});
+													role,
+												})
+												.onConflictDoNothing(),
+										);
 									}
-									await tx.insert(Db.spaceVideos).values({
-										id: deterministicAgentId(
-											"loom_space_video",
+									statements.push(
+										db.insert(Db.spaceVideos).values({
+											id: deterministicAgentId(
+												"loom_space_video",
+												spaceId,
+												videoId,
+											),
 											spaceId,
 											videoId,
-										),
-										spaceId,
-										videoId,
-										addedById: principal.id,
-									});
+											addedById: principal.id,
+										}),
+									);
 								}
-								await tx.insert(Db.agentApiOperations).values({
-									id: operationId,
-									userId: principal.id,
-									kind: "import_loom",
-									resourceId: input.organizationId,
-									resultResourceId: videoId,
-									payload: {
-										organizationId: input.organizationId,
-										videoId,
-										ownerId,
-										loomVideoId,
-										spaceId,
-									},
-								});
+								statements.push(
+									db.insert(Db.agentApiOperations).values({
+										id: operationId,
+										userId: principal.id,
+										kind: "import_loom",
+										resourceId: input.organizationId,
+										resultResourceId: videoId,
+										payload: {
+											organizationId: input.organizationId,
+											videoId,
+											ownerId,
+											loomVideoId,
+											spaceId,
+										},
+									}),
+								);
 							}
-							return "ready" as const;
+							return { statements, result: "ready" as const };
 						}),
 					);
 					if (importState === "conflict") {
@@ -3247,7 +3389,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Only the Cap owner can inspect sharing targets",
 							);
 						}
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [organizations, spaces] = yield* database.use((db) =>
 							Promise.all([
 								db
@@ -3320,7 +3462,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const rows = yield* management.listStorageIntegrations(
 							principal.id,
 							path.organizationId,
@@ -3379,7 +3521,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [account] = yield* database.use((db) =>
 							db
 								.select({
@@ -3678,6 +3820,12 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Developer app name is invalid",
 							);
 						}
+						const mutationId2 = nanoId();
+						const mutationId3 = nanoId();
+						const mutationId4 = nanoId();
+						const mutationToken5 = nanoIdLong();
+						const mutationToken6 = nanoIdLong();
+						const mutationId7 = nanoId();
 						const result = yield* runAgentMutation({
 							principal,
 							operation: "create_developer_app",
@@ -3687,12 +3835,13 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								DeveloperKeyOperationResult,
 							),
-							execute: async (tx) => {
-								const appId = nanoId();
-								const publicKeyId = nanoId();
-								const secretKeyId = nanoId();
-								const publicKeyRaw = `cpk_${nanoIdLong()}`;
-								const secretKeyRaw = `csk_${nanoIdLong()}`;
+							execute: async (_snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const appId = mutationId2;
+								const publicKeyId = mutationId3;
+								const secretKeyId = mutationId4;
+								const publicKeyRaw = `cpk_${mutationToken5}`;
+								const secretKeyRaw = `csk_${mutationToken6}`;
 								const [
 									publicKeyHash,
 									secretKeyHash,
@@ -3704,38 +3853,47 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									encrypt(publicKeyRaw),
 									encrypt(secretKeyRaw),
 								]);
-								await tx.insert(Db.developerApps).values({
-									id: appId,
-									ownerId: principal.id,
-									name,
-									environment: payload.environment,
-								});
-								await tx.insert(Db.developerApiKeys).values([
-									{
-										id: publicKeyId,
+								statements.push(
+									db.insert(Db.developerApps).values({
+										id: appId,
+										ownerId: principal.id,
+										name,
+										environment: payload.environment,
+									}),
+								);
+								statements.push(
+									db.insert(Db.developerApiKeys).values([
+										{
+											id: publicKeyId,
+											appId,
+											keyType: "public",
+											keyPrefix: publicKeyRaw.slice(0, 12),
+											keyHash: publicKeyHash,
+											encryptedKey: encryptedPublicKey,
+										},
+										{
+											id: secretKeyId,
+											appId,
+											keyType: "secret",
+											keyPrefix: secretKeyRaw.slice(0, 12),
+											keyHash: secretKeyHash,
+											encryptedKey: encryptedSecretKey,
+										},
+									]),
+								);
+								statements.push(
+									db.insert(Db.developerCreditAccounts).values({
+										id: mutationId7,
 										appId,
-										keyType: "public",
-										keyPrefix: publicKeyRaw.slice(0, 12),
-										keyHash: publicKeyHash,
-										encryptedKey: encryptedPublicKey,
-									},
-									{
-										id: secretKeyId,
-										appId,
-										keyType: "secret",
-										keyPrefix: secretKeyRaw.slice(0, 12),
-										keyHash: secretKeyHash,
-										encryptedKey: encryptedSecretKey,
-									},
-								]);
-								await tx.insert(Db.developerCreditAccounts).values({
-									id: nanoId(),
-									appId,
-									ownerId: principal.id,
-								});
+										ownerId: principal.id,
+									}),
+								);
 								return {
-									state: "success",
-									response: { appId, publicKeyId, secretKeyId },
+									statements,
+									result: {
+										state: "success",
+										response: { appId, publicKeyId, secretKeyId },
+									},
 								};
 							},
 						});
@@ -3776,6 +3934,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Developer app fields are invalid",
 							);
 						}
+						const mutationTime8 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_developer_app",
@@ -3783,39 +3942,46 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, ...payload, name, logoUrl },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [app] = await tx
-									.select({ id: Db.developerApps.id })
-									.from(Db.developerApps)
-									.where(
-										and(
-											eq(Db.developerApps.id, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!app) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.developerApps)
-									.set({
-										name,
-										environment: payload.environment,
-										logoUrl,
-										updatedAt: now,
-									})
-									.where(eq(Db.developerApps.id, path.appId));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [app] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerApps.id })
+										.from(Db.developerApps)
+										.where(
+											and(
+												eq(Db.developerApps.id, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!app) return { statements, result: { state: "not_found" } };
+								const now = mutationTime8;
+								statements.push(
+									db
+										.update(Db.developerApps)
+										.set({
+											name,
+											environment: payload.environment,
+											logoUrl,
+											updatedAt: now,
+										})
+										.where(eq(Db.developerApps.id, path.appId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"developer_app",
-										path.appId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"developer_app",
+											path.appId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -3831,6 +3997,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
 						yield* requireScope(principal, "developer:write", requestId);
+						const mutationTime9 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "delete_developer_app",
@@ -3838,43 +4005,52 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [app] = await tx
-									.select({ id: Db.developerApps.id })
-									.from(Db.developerApps)
-									.where(
-										and(
-											eq(Db.developerApps.id, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [app] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerApps.id })
+										.from(Db.developerApps)
+										.where(
+											and(
+												eq(Db.developerApps.id, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!app) return { statements, result: { state: "not_found" } };
+								const now = mutationTime9;
+								statements.push(
+									db
+										.update(Db.developerApiKeys)
+										.set({ revokedAt: now })
+										.where(
+											and(
+												eq(Db.developerApiKeys.appId, path.appId),
+												isNull(Db.developerApiKeys.revokedAt),
+											),
 										),
-									)
-									.limit(1)
-									.for("update");
-								if (!app) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.developerApiKeys)
-									.set({ revokedAt: now })
-									.where(
-										and(
-											eq(Db.developerApiKeys.appId, path.appId),
-											isNull(Db.developerApiKeys.revokedAt),
-										),
-									);
-								await tx
-									.update(Db.developerApps)
-									.set({ deletedAt: now, updatedAt: now })
-									.where(eq(Db.developerApps.id, path.appId));
+								);
+								statements.push(
+									db
+										.update(Db.developerApps)
+										.set({ deletedAt: now, updatedAt: now })
+										.where(eq(Db.developerApps.id, path.appId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"developer_app",
-										path.appId,
-										"deleted",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"developer_app",
+											path.appId,
+											"deleted",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -3903,39 +4079,44 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, domain },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [app] = await tx
-									.select({ id: Db.developerApps.id })
-									.from(Db.developerApps)
-									.where(
-										and(
-											eq(Db.developerApps.id, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!app) return { state: "not_found" };
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [app] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerApps.id })
+										.from(Db.developerApps)
+										.where(
+											and(
+												eq(Db.developerApps.id, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!app) return { statements, result: { state: "not_found" } };
 								const id = deterministicAgentId(
 									"developer_domain",
 									path.appId,
 									domain,
 								);
-								await tx
-									.insert(Db.developerAppDomains)
-									.values({ id, appId: path.appId, domain })
-									.onDuplicateKeyUpdate({
-										set: { domain: sql`${Db.developerAppDomains.domain}` },
-									});
+								statements.push(
+									db
+										.insert(Db.developerAppDomains)
+										.values({ id, appId: path.appId, domain })
+										.onConflictDoNothing(),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"developer_domain",
-										id,
-										"created",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"developer_domain",
+											id,
+											"created",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -3957,36 +4138,58 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [app] = await tx
-									.select({ id: Db.developerApps.id })
-									.from(Db.developerApps)
-									.where(
-										and(
-											eq(Db.developerApps.id, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [app] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerApps.id })
+										.from(Db.developerApps)
+										.where(
+											and(
+												eq(Db.developerApps.id, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!app) return { statements, result: { state: "not_found" } };
+								const [existingTarget] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerAppDomains.id })
+										.from(Db.developerAppDomains)
+										.where(
+											and(
+												eq(Db.developerAppDomains.id, path.domainId),
+												eq(Db.developerAppDomains.appId, path.appId),
+											),
+										)
+										.limit(1),
+								);
+								if (!existingTarget)
+									return { statements: [], result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.developerAppDomains)
+										.where(
+											and(
+												eq(Db.developerAppDomains.id, path.domainId),
+												eq(Db.developerAppDomains.appId, path.appId),
+											),
 										),
-									)
-									.limit(1);
-								if (!app) return { state: "not_found" };
-								const result = await tx
-									.delete(Db.developerAppDomains)
-									.where(
-										and(
-											eq(Db.developerAppDomains.id, path.domainId),
-											eq(Db.developerAppDomains.appId, path.appId),
-										),
-									);
-								if (affectedRows(result) === 0) return { state: "not_found" };
+								);
+
 								return {
-									state: "success",
-									response: mutationResponse(
-										"developer_domain",
-										path.domainId,
-										"deleted",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"developer_domain",
+											path.domainId,
+											"deleted",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -4002,6 +4205,11 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
 						yield* requireScope(principal, "developer:secrets", requestId);
+						const mutationId10 = nanoId();
+						const mutationId11 = nanoId();
+						const mutationToken12 = nanoIdLong();
+						const mutationToken13 = nanoIdLong();
+						const mutationTime14 = new Date();
 						const result = yield* runAgentMutation({
 							principal,
 							operation: "rotate_developer_keys",
@@ -4011,24 +4219,26 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								DeveloperKeyOperationResult,
 							),
-							execute: async (tx) => {
-								const [app] = await tx
-									.select({ id: Db.developerApps.id })
-									.from(Db.developerApps)
-									.where(
-										and(
-											eq(Db.developerApps.id, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!app) return { state: "not_found" };
-								const publicKeyId = nanoId();
-								const secretKeyId = nanoId();
-								const publicKeyRaw = `cpk_${nanoIdLong()}`;
-								const secretKeyRaw = `csk_${nanoIdLong()}`;
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [app] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerApps.id })
+										.from(Db.developerApps)
+										.where(
+											and(
+												eq(Db.developerApps.id, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!app) return { statements, result: { state: "not_found" } };
+								const publicKeyId = mutationId10;
+								const secretKeyId = mutationId11;
+								const publicKeyRaw = `cpk_${mutationToken12}`;
+								const secretKeyRaw = `csk_${mutationToken13}`;
 								const [
 									publicKeyHash,
 									secretKeyHash,
@@ -4040,40 +4250,47 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									encrypt(publicKeyRaw),
 									encrypt(secretKeyRaw),
 								]);
-								const now = new Date();
-								await tx
-									.update(Db.developerApiKeys)
-									.set({ revokedAt: now })
-									.where(
-										and(
-											eq(Db.developerApiKeys.appId, path.appId),
-											isNull(Db.developerApiKeys.revokedAt),
+								const now = mutationTime14;
+								statements.push(
+									db
+										.update(Db.developerApiKeys)
+										.set({ revokedAt: now })
+										.where(
+											and(
+												eq(Db.developerApiKeys.appId, path.appId),
+												isNull(Db.developerApiKeys.revokedAt),
+											),
 										),
-									);
-								await tx.insert(Db.developerApiKeys).values([
-									{
-										id: publicKeyId,
-										appId: path.appId,
-										keyType: "public",
-										keyPrefix: publicKeyRaw.slice(0, 12),
-										keyHash: publicKeyHash,
-										encryptedKey: encryptedPublicKey,
-									},
-									{
-										id: secretKeyId,
-										appId: path.appId,
-										keyType: "secret",
-										keyPrefix: secretKeyRaw.slice(0, 12),
-										keyHash: secretKeyHash,
-										encryptedKey: encryptedSecretKey,
-									},
-								]);
+								);
+								statements.push(
+									db.insert(Db.developerApiKeys).values([
+										{
+											id: publicKeyId,
+											appId: path.appId,
+											keyType: "public",
+											keyPrefix: publicKeyRaw.slice(0, 12),
+											keyHash: publicKeyHash,
+											encryptedKey: encryptedPublicKey,
+										},
+										{
+											id: secretKeyId,
+											appId: path.appId,
+											keyType: "secret",
+											keyPrefix: secretKeyRaw.slice(0, 12),
+											keyHash: secretKeyHash,
+											encryptedKey: encryptedSecretKey,
+										},
+									]),
+								);
 								return {
-									state: "success",
-									response: {
-										appId: path.appId,
-										publicKeyId,
-										secretKeyId,
+									statements,
+									result: {
+										state: "success",
+										response: {
+											appId: path.appId,
+											publicKeyId,
+											secretKeyId,
+										},
 									},
 								};
 							},
@@ -4091,6 +4308,11 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 				const requestId = makeRequestId();
 				return withMappedErrors(
 					Effect.gen(function* () {
+						if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true" && payload.enabled)
+							return yield* forbidden(
+								requestId,
+								"Credit auto top-up is unavailable on this self-hosted server",
+							);
 						yield* requireAgentWrites(requestId);
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
@@ -4110,6 +4332,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Auto top-up values are invalid",
 							);
 						}
+						const mutationTime15 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_developer_auto_top_up",
@@ -4117,40 +4340,57 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [app] = await tx
-									.select({ id: Db.developerApps.id })
-									.from(Db.developerApps)
-									.where(
-										and(
-											eq(Db.developerApps.id, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
-										),
-									)
-									.limit(1);
-								if (!app) return { state: "not_found" };
-								const now = new Date();
-								const result = await tx
-									.update(Db.developerCreditAccounts)
-									.set({
-										autoTopUpEnabled: payload.enabled,
-										autoTopUpThresholdMicroCredits:
-											payload.thresholdMicroCredits,
-										autoTopUpAmountCents: payload.amountCents,
-										updatedAt: now,
-									})
-									.where(eq(Db.developerCreditAccounts.appId, path.appId));
-								if (affectedRows(result) === 0) return { state: "not_found" };
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [app] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerApps.id })
+										.from(Db.developerApps)
+										.where(
+											and(
+												eq(Db.developerApps.id, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!app) return { statements, result: { state: "not_found" } };
+								const now = mutationTime15;
+								const [existingTarget] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerCreditAccounts.id })
+										.from(Db.developerCreditAccounts)
+										.where(eq(Db.developerCreditAccounts.appId, path.appId))
+										.limit(1),
+								);
+								if (!existingTarget)
+									return { statements: [], result: { state: "not_found" } };
+								statements.push(
+									db
+										.update(Db.developerCreditAccounts)
+										.set({
+											autoTopUpEnabled: payload.enabled,
+											autoTopUpThresholdMicroCredits:
+												payload.thresholdMicroCredits,
+											autoTopUpAmountCents: payload.amountCents,
+											updatedAt: now,
+										})
+										.where(eq(Db.developerCreditAccounts.appId, path.appId)),
+								);
+
 								return {
-									state: "success",
-									response: mutationResponse(
-										"developer_auto_top_up",
-										path.appId,
-										payload.enabled ? "enabled" : "disabled",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"developer_auto_top_up",
+											path.appId,
+											payload.enabled ? "enabled" : "disabled",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -4162,6 +4402,11 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 				const requestId = makeRequestId();
 				return withMappedErrors(
 					Effect.gen(function* () {
+						if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true")
+							return yield* forbidden(
+								requestId,
+								"Cap Cloud billing and referral services are not available on this self-hosted server",
+							);
 						yield* requireAgentWrites(requestId);
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
@@ -4186,7 +4431,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: decodeBrowserActionResponse,
 							execute: (providerIdempotencyKey) =>
 								Effect.gen(function* () {
-									const database = yield* Database;
+									const database = yield* CloudflareDatabase;
 									const [account] = yield* database.use((db) =>
 										db
 											.select({
@@ -4281,6 +4526,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
 						yield* requireScope(principal, "developer:write", requestId);
+						const mutationTime16 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "delete_developer_video",
@@ -4288,40 +4534,48 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.developerVideos.id })
-									.from(Db.developerVideos)
-									.innerJoin(
-										Db.developerApps,
-										eq(Db.developerVideos.appId, Db.developerApps.id),
-									)
-									.where(
-										and(
-											eq(Db.developerVideos.id, path.videoId),
-											eq(Db.developerVideos.appId, path.appId),
-											eq(Db.developerApps.ownerId, principal.id),
-											isNull(Db.developerApps.deletedAt),
-											isNull(Db.developerVideos.deletedAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.developerVideos)
-									.set({ deletedAt: now, updatedAt: now })
-									.where(eq(Db.developerVideos.id, path.videoId));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.developerVideos.id })
+										.from(Db.developerVideos)
+										.innerJoin(
+											Db.developerApps,
+											eq(Db.developerVideos.appId, Db.developerApps.id),
+										)
+										.where(
+											and(
+												eq(Db.developerVideos.id, path.videoId),
+												eq(Db.developerVideos.appId, path.appId),
+												eq(Db.developerApps.ownerId, principal.id),
+												isNull(Db.developerApps.deletedAt),
+												isNull(Db.developerVideos.deletedAt),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime16;
+								statements.push(
+									db
+										.update(Db.developerVideos)
+										.set({ deletedAt: now, updatedAt: now })
+										.where(eq(Db.developerVideos.id, path.videoId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"developer_video",
-										path.videoId,
-										"deleted",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"developer_video",
+											path.videoId,
+											"deleted",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -4333,6 +4587,11 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 				const requestId = makeRequestId();
 				return withMappedErrors(
 					Effect.gen(function* () {
+						if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true")
+							return yield* forbidden(
+								requestId,
+								"Cap Cloud billing and referral services are not available on this self-hosted server",
+							);
 						yield* requireAgentWrites(requestId);
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
@@ -4348,7 +4607,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Only the organization owner can manage billing",
 							);
 						}
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [account] = yield* database.use((db) =>
 							db
 								.select({
@@ -4457,6 +4716,11 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 				const requestId = makeRequestId();
 				return withMappedErrors(
 					Effect.gen(function* () {
+						if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true")
+							return yield* forbidden(
+								requestId,
+								"Cap Cloud billing and referral services are not available on this self-hosted server",
+							);
 						yield* requireAgentWrites(requestId);
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
@@ -4472,7 +4736,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Only the organization owner can manage billing",
 							);
 						}
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [account] = yield* database.use((db) =>
 							db
 								.select({
@@ -4621,6 +4885,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Organization fields are invalid",
 							);
 						}
+						const mutationTime17 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_organization",
@@ -4628,35 +4893,43 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, name, allowedEmailDomain },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [organization] = await tx
-									.select({ id: Db.organizations.id })
-									.from(Db.organizations)
-									.where(eq(Db.organizations.id, path.organizationId))
-									.limit(1)
-									.for("update");
-								if (!organization) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.organizations)
-									.set({
-										name,
-										allowedEmailDomain:
-											payload.allowedEmailDomain === undefined
-												? undefined
-												: allowedEmailDomain,
-										updatedAt: now,
-									})
-									.where(eq(Db.organizations.id, path.organizationId));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [organization] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.organizations.id })
+										.from(Db.organizations)
+										.where(eq(Db.organizations.id, path.organizationId))
+										.limit(1),
+								);
+								if (!organization)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime17;
+								statements.push(
+									db
+										.update(Db.organizations)
+										.set({
+											name,
+											allowedEmailDomain:
+												payload.allowedEmailDomain === undefined
+													? undefined
+													: allowedEmailDomain,
+											updatedAt: now,
+										})
+										.where(eq(Db.organizations.id, path.organizationId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization",
-										path.organizationId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization",
+											path.organizationId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -4691,6 +4964,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 											payload.defaultPlaybackSpeed,
 										),
 									};
+						const mutationTime18 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_organization_settings",
@@ -4698,31 +4972,36 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload: sanitizedPayload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
 								const [[organization], [account]] = await Promise.all([
-									tx
-										.select({ settings: Db.organizations.settings })
-										.from(Db.organizations)
-										.where(
-											and(
-												eq(Db.organizations.id, path.organizationId),
-												isNull(Db.organizations.tombstoneAt),
-											),
-										)
-										.limit(1)
-										.for("update"),
-									tx
-										.select({
-											stripeSubscriptionStatus:
-												Db.users.stripeSubscriptionStatus,
-											thirdPartyStripeSubscriptionId:
-												Db.users.thirdPartyStripeSubscriptionId,
-										})
-										.from(Db.users)
-										.where(eq(Db.users.id, principal.id))
-										.limit(1),
+									snapshot.read((reader) =>
+										reader
+											.select({ settings: Db.organizations.settings })
+											.from(Db.organizations)
+											.where(
+												and(
+													eq(Db.organizations.id, path.organizationId),
+													isNull(Db.organizations.tombstoneAt),
+												),
+											)
+											.limit(1),
+									),
+									snapshot.read((reader) =>
+										reader
+											.select({
+												stripeSubscriptionStatus:
+													Db.users.stripeSubscriptionStatus,
+												thirdPartyStripeSubscriptionId:
+													Db.users.thirdPartyStripeSubscriptionId,
+											})
+											.from(Db.users)
+											.where(eq(Db.users.id, principal.id))
+											.limit(1),
+									),
 								]);
-								if (!organization || !account) return { state: "not_found" };
+								if (!organization || !account)
+									return { statements, result: { state: "not_found" } };
 								const current = organization.settings ?? {};
 								const submitted = { ...current, ...sanitizedPayload };
 								const next = userIsPro(account)
@@ -4748,20 +5027,25 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 												current.aiGenerationLanguage ??
 												defaultProOrganizationSettings.aiGenerationLanguage,
 										};
-								const now = new Date();
-								await tx
-									.update(Db.organizations)
-									.set({ settings: next, updatedAt: now })
-									.where(eq(Db.organizations.id, path.organizationId));
+								const now = mutationTime18;
+								statements.push(
+									db
+										.update(Db.organizations)
+										.set({ settings: next, updatedAt: now })
+										.where(eq(Db.organizations.id, path.organizationId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization_settings",
-										path.organizationId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization_settings",
+											path.organizationId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -4781,7 +5065,10 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
-						const email = payload.email.trim().toLowerCase();
+						const email = yield* Effect.try({
+							try: () => normalizeEmail(payload.email),
+							catch: () => badRequest(requestId, "Email is invalid"),
+						});
 						const role = payload.role ?? "member";
 						const shouldSendEmail = payload.sendEmail ?? true;
 						if (
@@ -4791,6 +5078,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							return yield* badRequest(requestId, "Invite email is invalid");
 						}
 						const idempotencyKey = yield* requestIdempotencyKey;
+						const mutationTime19 = new Date();
 						const invitation = yield* runAgentMutation({
 							principal,
 							operation: "create_organization_invite",
@@ -4800,41 +5088,46 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								Agent.AgentOrganizationInviteResponse,
 							),
-							execute: async (tx) => {
-								const [member] = await tx
-									.select({ id: Db.organizationMembers.id })
-									.from(Db.organizationMembers)
-									.innerJoin(
-										Db.users,
-										eq(Db.organizationMembers.userId, Db.users.id),
-									)
-									.where(
-										and(
-											eq(
-												Db.organizationMembers.organizationId,
-												path.organizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [member] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.organizationMembers.id })
+										.from(Db.organizationMembers)
+										.innerJoin(
+											Db.users,
+											eq(Db.organizationMembers.userId, Db.users.id),
+										)
+										.where(
+											and(
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
+												sql`LOWER(${Db.users.email}) = ${email}`,
 											),
-											sql`LOWER(${Db.users.email}) = ${email}`,
-										),
-									)
-									.limit(1);
-								if (member) return { state: "conflict" };
-								const [existing] = await tx
-									.select()
-									.from(Db.organizationInvites)
-									.where(
-										and(
-											eq(
-												Db.organizationInvites.organizationId,
-												path.organizationId,
+										)
+										.limit(1),
+								);
+								if (member)
+									return { statements, result: { state: "conflict" } };
+								const [existing] = await snapshot.read((reader) =>
+									reader
+										.select()
+										.from(Db.organizationInvites)
+										.where(
+											and(
+												eq(
+													Db.organizationInvites.organizationId,
+													path.organizationId,
+												),
+												sql`LOWER(TRIM(${Db.organizationInvites.invitedEmail})) = ${email}`,
 											),
-											sql`LOWER(TRIM(${Db.organizationInvites.invitedEmail})) = ${email}`,
-										),
-									)
-									.orderBy(Db.organizationInvites.createdAt)
-									.limit(1)
-									.for("update");
-								const now = new Date();
+										)
+										.orderBy(Db.organizationInvites.createdAt)
+										.limit(1),
+								);
+								const now = mutationTime19;
 								const id =
 									existing?.id ??
 									deterministicAgentId(
@@ -4843,47 +5136,55 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										email,
 									);
 								if (existing) {
-									await tx
-										.update(Db.organizationInvites)
-										.set({ role, status: "pending", updatedAt: now })
-										.where(eq(Db.organizationInvites.id, existing.id));
+									statements.push(
+										db
+											.update(Db.organizationInvites)
+											.set({ role, status: "pending", updatedAt: now })
+											.where(eq(Db.organizationInvites.id, existing.id)),
+									);
 								} else {
-									await tx.insert(Db.organizationInvites).values({
-										id,
-										organizationId: path.organizationId,
-										invitedEmail: email,
-										invitedByUserId: principal.id,
-										role,
-										createdAt: now,
-										updatedAt: now,
-									});
+									statements.push(
+										db.insert(Db.organizationInvites).values({
+											id,
+											organizationId: path.organizationId,
+											invitedEmail: email,
+											invitedByUserId: principal.id,
+											role,
+											createdAt: now,
+											updatedAt: now,
+										}),
+									);
 								}
 								return {
-									state: "success",
-									response: {
-										invite: {
-											id,
-											invitedEmail: email,
-											role,
-											status: "pending",
-											expiresAt: existing?.expiresAt?.toISOString() ?? null,
-											createdAt:
-												existing?.createdAt.toISOString() ?? now.toISOString(),
-											updatedAt: now.toISOString(),
-											capabilities: organizationCapabilities(
-												actor.role,
-												principal.scopes,
-											),
+									statements,
+									result: {
+										state: "success",
+										response: {
+											invite: {
+												id,
+												invitedEmail: email,
+												role,
+												status: "pending",
+												expiresAt: existing?.expiresAt?.toISOString() ?? null,
+												createdAt:
+													existing?.createdAt.toISOString() ??
+													now.toISOString(),
+												updatedAt: now.toISOString(),
+												capabilities: organizationCapabilities(
+													actor.role,
+													principal.scopes,
+												),
+											},
+											inviteUrl: `${serverEnv().WEB_URL}/invite/${id}`,
+											emailDelivery: "not_requested" as const,
+											requestId,
 										},
-										inviteUrl: `${serverEnv().WEB_URL}/invite/${id}`,
-										emailDelivery: "not_requested" as const,
-										requestId,
 									},
 								};
 							},
 						});
 						if (!shouldSendEmail) return invitation;
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [organization] = yield* database.use((db) =>
 							db
 								.select({ name: Db.organizations.name })
@@ -4960,6 +5261,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
+						const mutationTime20 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "delete_organization_invite",
@@ -4967,29 +5269,52 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const result = await tx
-									.delete(Db.organizationInvites)
-									.where(
-										and(
-											eq(Db.organizationInvites.id, path.inviteId),
-											eq(
-												Db.organizationInvites.organizationId,
-												path.organizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [existingTarget] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.organizationInvites.id })
+										.from(Db.organizationInvites)
+										.where(
+											and(
+												eq(Db.organizationInvites.id, path.inviteId),
+												eq(
+													Db.organizationInvites.organizationId,
+													path.organizationId,
+												),
+											),
+										)
+										.limit(1),
+								);
+								if (!existingTarget)
+									return { statements: [], result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.organizationInvites)
+										.where(
+											and(
+												eq(Db.organizationInvites.id, path.inviteId),
+												eq(
+													Db.organizationInvites.organizationId,
+													path.organizationId,
+												),
 											),
 										),
-									);
-								if (affectedRows(result) === 0) return { state: "not_found" };
-								const now = new Date();
+								);
+
+								const now = mutationTime20;
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization_invite",
-										path.inviteId,
-										"deleted",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization_invite",
+											path.inviteId,
+											"deleted",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -5009,6 +5334,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
+						const mutationTime21 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_organization_member",
@@ -5016,36 +5342,40 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, role: payload.role },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [organization] = await tx
-									.select({ ownerId: Db.organizations.ownerId })
-									.from(Db.organizations)
-									.where(
-										and(
-											eq(Db.organizations.id, path.organizationId),
-											isNull(Db.organizations.tombstoneAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								const [member] = await tx
-									.select({
-										userId: Db.organizationMembers.userId,
-										role: Db.organizationMembers.role,
-									})
-									.from(Db.organizationMembers)
-									.where(
-										and(
-											eq(Db.organizationMembers.id, path.memberId),
-											eq(
-												Db.organizationMembers.organizationId,
-												path.organizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [organization] = await snapshot.read((reader) =>
+									reader
+										.select({ ownerId: Db.organizations.ownerId })
+										.from(Db.organizations)
+										.where(
+											and(
+												eq(Db.organizations.id, path.organizationId),
+												isNull(Db.organizations.tombstoneAt),
 											),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!organization || !member) return { state: "not_found" };
+										)
+										.limit(1),
+								);
+								const [member] = await snapshot.read((reader) =>
+									reader
+										.select({
+											userId: Db.organizationMembers.userId,
+											role: Db.organizationMembers.role,
+										})
+										.from(Db.organizationMembers)
+										.where(
+											and(
+												eq(Db.organizationMembers.id, path.memberId),
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
+											),
+										)
+										.limit(1),
+								);
+								if (!organization || !member)
+									return { statements, result: { state: "not_found" } };
 								const targetRole = getEffectiveOrganizationRole({
 									userId: member.userId,
 									ownerId: organization.ownerId,
@@ -5061,22 +5391,27 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										nextRole: payload.role,
 									})
 								) {
-									return { state: "forbidden" };
+									return { statements, result: { state: "forbidden" } };
 								}
-								const now = new Date();
-								await tx
-									.update(Db.organizationMembers)
-									.set({ role: payload.role, updatedAt: now })
-									.where(eq(Db.organizationMembers.id, path.memberId));
+								const now = mutationTime21;
+								statements.push(
+									db
+										.update(Db.organizationMembers)
+										.set({ role: payload.role, updatedAt: now })
+										.where(eq(Db.organizationMembers.id, path.memberId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization_member",
-										path.memberId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization_member",
+											path.memberId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -5096,6 +5431,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
+						const mutationTime22 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_organization_member_seat",
@@ -5103,75 +5439,92 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, enabled: payload.enabled },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [organization] = await tx
-									.select({ ownerId: Db.organizations.ownerId })
-									.from(Db.organizations)
-									.where(
-										and(
-											eq(Db.organizations.id, path.organizationId),
-											isNull(Db.organizations.tombstoneAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								const [member] = await tx
-									.select()
-									.from(Db.organizationMembers)
-									.where(
-										and(
-											eq(Db.organizationMembers.id, path.memberId),
-											eq(
-												Db.organizationMembers.organizationId,
-												path.organizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [organization] = await snapshot.read((reader) =>
+									reader
+										.select({ ownerId: Db.organizations.ownerId })
+										.from(Db.organizations)
+										.where(
+											and(
+												eq(Db.organizations.id, path.organizationId),
+												isNull(Db.organizations.tombstoneAt),
 											),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!organization || !member) return { state: "not_found" };
+										)
+										.limit(1),
+								);
+								const [member] = await snapshot.read((reader) =>
+									reader
+										.select()
+										.from(Db.organizationMembers)
+										.where(
+											and(
+												eq(Db.organizationMembers.id, path.memberId),
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
+											),
+										)
+										.limit(1),
+								);
+								if (!organization || !member)
+									return { statements, result: { state: "not_found" } };
 								if (member.userId === organization.ownerId) {
-									return { state: "forbidden" };
+									return { statements, result: { state: "forbidden" } };
 								}
 								if (member.hasProSeat === payload.enabled) {
 									return {
-										state: "success",
-										response: mutationResponse(
-											"organization_member_seat",
-											path.memberId,
-											payload.enabled ? "enabled" : "disabled",
-											requestId,
-										),
+										statements,
+										result: {
+											state: "success",
+											response: mutationResponse(
+												"organization_member_seat",
+												path.memberId,
+												payload.enabled ? "enabled" : "disabled",
+												requestId,
+											),
+										},
 									};
 								}
-								if (payload.enabled) {
-									const allMembers = await tx
-										.select({
-											id: Db.organizationMembers.id,
-											userId: Db.organizationMembers.userId,
-											hasProSeat: Db.organizationMembers.hasProSeat,
-										})
-										.from(Db.organizationMembers)
-										.where(
-											eq(
-												Db.organizationMembers.organizationId,
-												path.organizationId,
+								if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true") {
+									statements.push(
+										db
+											.update(Db.organizationMembers)
+											.set({ hasProSeat: payload.enabled })
+											.where(eq(Db.organizationMembers.id, path.memberId)),
+									);
+								} else if (payload.enabled) {
+									const allMembers = await snapshot.read((reader) =>
+										reader
+											.select({
+												id: Db.organizationMembers.id,
+												userId: Db.organizationMembers.userId,
+												hasProSeat: Db.organizationMembers.hasProSeat,
+											})
+											.from(Db.organizationMembers)
+											.where(
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
 											),
-										)
-										.for("update");
+									);
 									const managerIds = Array.from(
 										new Set([organization.ownerId, principal.id]),
 									);
-									const managers = await tx
-										.select({
-											id: Db.users.id,
-											inviteQuota: Db.users.inviteQuota,
-											stripeSubscriptionId: Db.users.stripeSubscriptionId,
-											stripeSubscriptionStatus:
-												Db.users.stripeSubscriptionStatus,
-										})
-										.from(Db.users)
-										.where(inArray(Db.users.id, managerIds));
+									const managers = await snapshot.read((reader) =>
+										reader
+											.select({
+												id: Db.users.id,
+												inviteQuota: Db.users.inviteQuota,
+												stripeSubscriptionId: Db.users.stripeSubscriptionId,
+												stripeSubscriptionStatus:
+													Db.users.stripeSubscriptionStatus,
+											})
+											.from(Db.users)
+											.where(inArray(Db.users.id, managerIds)),
+									);
 									const owner = managers.find(
 										(manager) => manager.id === organization.ownerId,
 									);
@@ -5183,44 +5536,55 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										owner,
 										actorCanManageProSeats: true,
 									});
-									if (!seatProvider) return { state: "conflict" };
+									if (!seatProvider)
+										return { statements, result: { state: "conflict" } };
 									const { proSeatsRemaining } = calculateProSeats({
 										inviteQuota: seatProvider.inviteQuota ?? 1,
 										ownerId: organization.ownerId,
 										ownerIsPro: hasActiveDirectSubscription(owner),
 										members: allMembers,
 									});
-									if (proSeatsRemaining <= 0) return { state: "conflict" };
-									await tx
-										.update(Db.organizationMembers)
-										.set({ hasProSeat: true })
-										.where(eq(Db.organizationMembers.id, path.memberId));
+									if (proSeatsRemaining <= 0)
+										return { statements, result: { state: "conflict" } };
+									statements.push(
+										db
+											.update(Db.organizationMembers)
+											.set({ hasProSeat: true })
+											.where(eq(Db.organizationMembers.id, path.memberId)),
+									);
 									if (seatProvider.stripeSubscriptionId) {
-										await tx
-											.update(Db.users)
-											.set({
-												thirdPartyStripeSubscriptionId:
-													seatProvider.stripeSubscriptionId,
-											})
-											.where(eq(Db.users.id, member.userId));
+										statements.push(
+											db
+												.update(Db.users)
+												.set({
+													thirdPartyStripeSubscriptionId:
+														seatProvider.stripeSubscriptionId,
+												})
+												.where(eq(Db.users.id, member.userId)),
+										);
 									}
 								} else {
-									await tx
-										.update(Db.organizationMembers)
-										.set({ hasProSeat: false })
-										.where(eq(Db.organizationMembers.id, path.memberId));
-									await releaseProSeatSubscription(tx, member.userId);
+									statements.push(
+										db
+											.update(Db.organizationMembers)
+											.set({ hasProSeat: false })
+											.where(eq(Db.organizationMembers.id, path.memberId)),
+									);
+									statements.push(releaseProSeatStatement(db, member.userId));
 								}
-								const now = new Date();
+								const now = mutationTime22;
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization_member_seat",
-										path.memberId,
-										payload.enabled ? "enabled" : "disabled",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization_member_seat",
+											path.memberId,
+											payload.enabled ? "enabled" : "disabled",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -5240,6 +5604,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							principal.id,
 							path.organizationId,
 						);
+						const mutationTime23 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "remove_organization_member",
@@ -5247,42 +5612,46 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [organization] = await tx
-									.select({ ownerId: Db.organizations.ownerId })
-									.from(Db.organizations)
-									.where(
-										and(
-											eq(Db.organizations.id, path.organizationId),
-											isNull(Db.organizations.tombstoneAt),
-										),
-									)
-									.limit(1)
-									.for("update");
-								const [member] = await tx
-									.select({
-										userId: Db.organizationMembers.userId,
-										role: Db.organizationMembers.role,
-										hasProSeat: Db.organizationMembers.hasProSeat,
-										email: Db.users.email,
-									})
-									.from(Db.organizationMembers)
-									.innerJoin(
-										Db.users,
-										eq(Db.organizationMembers.userId, Db.users.id),
-									)
-									.where(
-										and(
-											eq(Db.organizationMembers.id, path.memberId),
-											eq(
-												Db.organizationMembers.organizationId,
-												path.organizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [organization] = await snapshot.read((reader) =>
+									reader
+										.select({ ownerId: Db.organizations.ownerId })
+										.from(Db.organizations)
+										.where(
+											and(
+												eq(Db.organizations.id, path.organizationId),
+												isNull(Db.organizations.tombstoneAt),
 											),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!organization || !member) return { state: "not_found" };
+										)
+										.limit(1),
+								);
+								const [member] = await snapshot.read((reader) =>
+									reader
+										.select({
+											userId: Db.organizationMembers.userId,
+											role: Db.organizationMembers.role,
+											hasProSeat: Db.organizationMembers.hasProSeat,
+											email: Db.users.email,
+										})
+										.from(Db.organizationMembers)
+										.innerJoin(
+											Db.users,
+											eq(Db.organizationMembers.userId, Db.users.id),
+										)
+										.where(
+											and(
+												eq(Db.organizationMembers.id, path.memberId),
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
+											),
+										)
+										.limit(1),
+								);
+								if (!organization || !member)
+									return { statements, result: { state: "not_found" } };
 								const targetRole = getEffectiveOrganizationRole({
 									userId: member.userId,
 									ownerId: organization.ownerId,
@@ -5297,59 +5666,87 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										targetRole,
 									})
 								) {
-									return { state: "forbidden" };
+									return { statements, result: { state: "forbidden" } };
 								}
-								const result = await tx
-									.delete(Db.organizationMembers)
-									.where(
-										and(
-											eq(Db.organizationMembers.id, path.memberId),
-											eq(
-												Db.organizationMembers.organizationId,
-												path.organizationId,
-											),
-										),
-									);
-								if (affectedRows(result) === 0) return { state: "not_found" };
-								if (member.hasProSeat) {
-									await releaseProSeatSubscription(tx, member.userId);
-								}
-								const organizationSpaces = await tx
-									.select({ id: Db.spaces.id })
-									.from(Db.spaces)
-									.where(eq(Db.spaces.organizationId, path.organizationId));
-								const spaceIds = organizationSpaces.map((space) => space.id);
-								if (spaceIds.length > 0) {
-									await tx
-										.delete(Db.spaceMembers)
+								const [existingTarget] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.organizationMembers.id })
+										.from(Db.organizationMembers)
 										.where(
 											and(
-												eq(Db.spaceMembers.userId, member.userId),
-												inArray(Db.spaceMembers.spaceId, spaceIds),
+												eq(Db.organizationMembers.id, path.memberId),
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
 											),
-										);
-								}
-								await tx
-									.delete(Db.organizationInvites)
-									.where(
-										and(
-											eq(
-												Db.organizationInvites.organizationId,
-												path.organizationId,
+										)
+										.limit(1),
+								);
+								if (!existingTarget)
+									return { statements: [], result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.organizationMembers)
+										.where(
+											and(
+												eq(Db.organizationMembers.id, path.memberId),
+												eq(
+													Db.organizationMembers.organizationId,
+													path.organizationId,
+												),
 											),
-											sql`LOWER(TRIM(${Db.organizationInvites.invitedEmail})) = ${member.email.toLowerCase()}`,
 										),
+								);
+
+								if (member.hasProSeat) {
+									statements.push(releaseProSeatStatement(db, member.userId));
+								}
+								const organizationSpaces = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.spaces.id })
+										.from(Db.spaces)
+										.where(eq(Db.spaces.organizationId, path.organizationId)),
+								);
+								const spaceIds = organizationSpaces.map((space) => space.id);
+								if (spaceIds.length > 0) {
+									statements.push(
+										db
+											.delete(Db.spaceMembers)
+											.where(
+												and(
+													eq(Db.spaceMembers.userId, member.userId),
+													sql`${Db.spaceMembers.spaceId} in (select value from json_each(${JSON.stringify(spaceIds)}))`,
+												),
+											),
 									);
-								const now = new Date();
+								}
+								statements.push(
+									db
+										.delete(Db.organizationInvites)
+										.where(
+											and(
+												eq(
+													Db.organizationInvites.organizationId,
+													path.organizationId,
+												),
+												sql`LOWER(TRIM(${Db.organizationInvites.invitedEmail})) = ${normalizeEmail(member.email)}`,
+											),
+										),
+								);
+								const now = mutationTime23;
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization_member",
-										path.memberId,
-										"deleted",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization_member",
+											path.memberId,
+											"deleted",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -5390,58 +5787,79 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							},
 							requestId,
 							decodeReplay: Schema.decodeUnknownSync(Agent.AgentMeResponse),
-							execute: async (tx) => {
-								if (payload.defaultOrganizationId) {
-									const [membership] = await tx
-										.select({ id: Db.organizationMembers.id })
-										.from(Db.organizationMembers)
-										.where(
-											and(
-												eq(Db.organizationMembers.userId, principal.id),
-												eq(
-													Db.organizationMembers.organizationId,
-													payload.defaultOrganizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const defaultOrganizationId = payload.defaultOrganizationId;
+								if (defaultOrganizationId) {
+									const [membership] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.organizationMembers.id })
+											.from(Db.organizationMembers)
+											.where(
+												and(
+													eq(Db.organizationMembers.userId, principal.id),
+													eq(
+														Db.organizationMembers.organizationId,
+														defaultOrganizationId,
+													),
 												),
-											),
-										)
-										.limit(1);
-									if (!membership) return { state: "forbidden" };
+											)
+											.limit(1),
+									);
+									if (!membership)
+										return { statements, result: { state: "forbidden" } };
 								}
-								await tx
-									.update(Db.users)
-									.set({
-										name: payload.name === undefined ? undefined : name,
-										lastName:
-											payload.lastName === undefined ? undefined : lastName,
-										defaultOrgId: payload.defaultOrganizationId,
-									})
-									.where(eq(Db.users.id, principal.id));
-								const [account] = await tx
-									.select({
-										id: Db.users.id,
-										email: Db.users.email,
-										name: Db.users.name,
-										lastName: Db.users.lastName,
-										image: Db.users.image,
-										activeOrganizationId: Db.users.activeOrganizationId,
-										defaultOrganizationId: Db.users.defaultOrgId,
-										createdAt: Db.users.created_at,
-									})
-									.from(Db.users)
-									.where(eq(Db.users.id, principal.id))
-									.limit(1);
-								if (!account) return { state: "not_found" };
+								statements.push(
+									db
+										.update(Db.users)
+										.set({
+											name: payload.name === undefined ? undefined : name,
+											lastName:
+												payload.lastName === undefined ? undefined : lastName,
+											defaultOrgId: payload.defaultOrganizationId,
+										})
+										.where(eq(Db.users.id, principal.id)),
+								);
+								const [account] = await snapshot.read((reader) =>
+									reader
+										.select({
+											id: Db.users.id,
+											email: Db.users.email,
+											name: Db.users.name,
+											lastName: Db.users.lastName,
+											image: Db.users.image,
+											activeOrganizationId: Db.users.activeOrganizationId,
+											defaultOrganizationId: Db.users.defaultOrgId,
+											createdAt: Db.users.created_at,
+										})
+										.from(Db.users)
+										.where(eq(Db.users.id, principal.id))
+										.limit(1),
+								);
+								if (!account)
+									return { statements, result: { state: "not_found" } };
 								return {
-									state: "success",
-									response: {
-										...account,
-										image: account.image ?? null,
-										activeOrganizationId: account.activeOrganizationId ?? null,
-										defaultOrganizationId:
-											account.defaultOrganizationId ?? null,
-										createdAt: account.createdAt.toISOString(),
-										capabilities: profileCapabilities(principal.scopes),
-										requestId,
+									statements,
+									result: {
+										state: "success",
+										response: {
+											...account,
+											name: payload.name === undefined ? account.name : name,
+											lastName:
+												payload.lastName === undefined
+													? account.lastName
+													: lastName,
+											image: account.image ?? null,
+											activeOrganizationId:
+												account.activeOrganizationId ?? null,
+											defaultOrganizationId:
+												payload.defaultOrganizationId === undefined
+													? (account.defaultOrganizationId ?? null)
+													: payload.defaultOrganizationId,
+											createdAt: account.createdAt.toISOString(),
+											capabilities: profileCapabilities(principal.scopes),
+											requestId,
+										},
 									},
 								};
 							},
@@ -5481,6 +5899,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
 						yield* requireScope(principal, "profile:write", requestId);
+						const mutationTime24 = new Date();
+						const mutationTime25 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "sign_out_all_devices",
@@ -5488,44 +5908,58 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { userId: principal.id },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [account] = await tx
-									.select({ id: Db.users.id })
-									.from(Db.users)
-									.where(eq(Db.users.id, principal.id))
-									.limit(1)
-									.for("update");
-								if (!account) return { state: "not_found" };
-								await tx
-									.update(Db.users)
-									.set({
-										authSessionVersion: sql`${Db.users.authSessionVersion} + 1`,
-									})
-									.where(eq(Db.users.id, principal.id));
-								await tx
-									.delete(Db.sessions)
-									.where(eq(Db.sessions.userId, principal.id));
-								await tx
-									.delete(Db.authApiKeys)
-									.where(eq(Db.authApiKeys.userId, principal.id));
-								await tx
-									.update(Db.agentApiKeys)
-									.set({ revokedAt: new Date() })
-									.where(
-										and(
-											eq(Db.agentApiKeys.userId, principal.id),
-											isNull(Db.agentApiKeys.revokedAt),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [account] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.users.id })
+										.from(Db.users)
+										.where(eq(Db.users.id, principal.id))
+										.limit(1),
+								);
+								if (!account)
+									return { statements, result: { state: "not_found" } };
+								statements.push(
+									db
+										.update(Db.users)
+										.set({
+											authSessionVersion: sql`${Db.users.authSessionVersion} + 1`,
+										})
+										.where(eq(Db.users.id, principal.id)),
+								);
+								statements.push(
+									db
+										.delete(Db.sessions)
+										.where(eq(Db.sessions.userId, principal.id)),
+								);
+								statements.push(
+									db
+										.delete(Db.authApiKeys)
+										.where(eq(Db.authApiKeys.userId, principal.id)),
+								);
+								statements.push(
+									db
+										.update(Db.agentApiKeys)
+										.set({ revokedAt: mutationTime24 })
+										.where(
+											and(
+												eq(Db.agentApiKeys.userId, principal.id),
+												isNull(Db.agentApiKeys.revokedAt),
+											),
 										),
-									);
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"account_sessions",
-										principal.id,
-										"revoked",
-										requestId,
-										new Date(),
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"account_sessions",
+											principal.id,
+											"revoked",
+											requestId,
+											mutationTime25,
+										),
+									},
 								};
 							},
 						});
@@ -5537,6 +5971,11 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 				const requestId = makeRequestId();
 				return withMappedErrors(
 					Effect.gen(function* () {
+						if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true")
+							return yield* forbidden(
+								requestId,
+								"Cap Cloud billing and referral services are not available on this self-hosted server",
+							);
 						yield* requireAgentWrites(requestId);
 						yield* requireUserConfirmedRequest(requestId);
 						const principal = yield* Agent.AgentPrincipal;
@@ -5548,7 +5987,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Cap referrals are not available on this server",
 							);
 						}
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [account] = yield* database.use((db) =>
 							db
 								.select({ name: Db.users.name, image: Db.users.image })
@@ -5641,6 +6080,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								idempotencyKey,
 							),
 						);
+						const mutationTime26 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "create_organization",
@@ -5648,76 +6088,85 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { name },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [existingName] = await tx
-									.select({ id: Db.organizations.id })
-									.from(Db.organizations)
-									.where(
-										and(
-											sql`LOWER(${Db.organizations.name}) = ${name.toLowerCase()}`,
-											isNull(Db.organizations.tombstoneAt),
-										),
-									)
-									.limit(1);
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [existingName] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.organizations.id })
+										.from(Db.organizations)
+										.where(
+											and(
+												sql`LOWER(${Db.organizations.name}) = ${name.toLowerCase()}`,
+												isNull(Db.organizations.tombstoneAt),
+											),
+										)
+										.limit(1),
+								);
 								if (existingName && existingName.id !== organizationId) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
-								await tx
-									.insert(Db.organizations)
-									.values({
-										id: organizationId,
-										ownerId: principal.id,
-										name,
-									})
-									.onDuplicateKeyUpdate({
-										set: { id: sql`${Db.organizations.id}` },
-									});
-								const [organization] = await tx
-									.select({
-										ownerId: Db.organizations.ownerId,
-										name: Db.organizations.name,
-										tombstoneAt: Db.organizations.tombstoneAt,
-									})
-									.from(Db.organizations)
-									.where(eq(Db.organizations.id, organizationId))
-									.limit(1)
-									.for("update");
+								statements.push(
+									db
+										.insert(Db.organizations)
+										.values({
+											id: organizationId,
+											ownerId: principal.id,
+											name,
+										})
+										.onConflictDoNothing(),
+								);
+								const [organization] = await snapshot.read((reader) =>
+									reader
+										.select({
+											ownerId: Db.organizations.ownerId,
+											name: Db.organizations.name,
+											tombstoneAt: Db.organizations.tombstoneAt,
+										})
+										.from(Db.organizations)
+										.where(eq(Db.organizations.id, organizationId))
+										.limit(1),
+								);
 								if (
-									!organization ||
-									organization.ownerId !== principal.id ||
-									organization.name !== name ||
-									organization.tombstoneAt !== null
+									organization &&
+									(organization.ownerId !== principal.id ||
+										organization.name !== name ||
+										organization.tombstoneAt !== null)
 								) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
-								await tx
-									.insert(Db.organizationMembers)
-									.values({
-										id: deterministicAgentId(
-											"organization_member",
+								statements.push(
+									db
+										.insert(Db.organizationMembers)
+										.values({
+											id: deterministicAgentId(
+												"organization_member",
+												organizationId,
+												principal.id,
+											),
+											userId: principal.id,
 											organizationId,
-											principal.id,
-										),
-										userId: principal.id,
-										organizationId,
-										role: "owner",
-									})
-									.onDuplicateKeyUpdate({
-										set: { id: sql`${Db.organizationMembers.id}` },
-									});
-								await tx
-									.update(Db.users)
-									.set({ activeOrganizationId: organizationId })
-									.where(eq(Db.users.id, principal.id));
+											role: "owner",
+										})
+										.onConflictDoNothing(),
+								);
+								statements.push(
+									db
+										.update(Db.users)
+										.set({ activeOrganizationId: organizationId })
+										.where(eq(Db.users.id, principal.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"organization",
-										organizationId,
-										"created",
-										requestId,
-										new Date(),
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"organization",
+											organizationId,
+											"created",
+											requestId,
+											mutationTime26,
+										),
+									},
 								};
 							},
 						});
@@ -5825,7 +6274,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							execute: () =>
 								Effect.gen(function* () {
 									yield* testAgentS3Config(config, requestId);
-									const database = yield* Database;
+									const database = yield* CloudflareDatabase;
 									const encrypted = yield* Effect.tryPromise(async () => {
 										const [
 											accessKeyId,
@@ -5850,21 +6299,31 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									});
 									const id = S3Bucket.S3BucketId.make(nanoId());
 									yield* database.use((db) =>
-										db.transaction(async (tx) => {
-											await tx
-												.update(Db.s3Buckets)
-												.set({ active: false })
-												.where(
-													eq(Db.s3Buckets.organizationId, path.organizationId),
-												);
-											await tx.insert(Db.s3Buckets).values({
-												id,
-												ownerId: principal.id,
-												organizationId: path.organizationId,
-												provider: config.provider,
-												...encrypted,
-												active: true,
-											});
+										atomic(db, async (_snapshot) => {
+											const statements: AtomicStatement[] = [];
+											statements.push(
+												db
+													.update(Db.s3Buckets)
+													.set({ active: false })
+													.where(
+														eq(
+															Db.s3Buckets.organizationId,
+															path.organizationId,
+														),
+													),
+											);
+											statements.push(
+												db.insert(Db.s3Buckets).values({
+													id,
+													ownerId: principal.id,
+													organizationId: path.organizationId,
+													provider: config.provider,
+													...encrypted,
+													active: true,
+												}),
+											);
+
+											return { statements, result: undefined };
 										}),
 									);
 									return mutationResponse(
@@ -5943,6 +6402,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							"integrations:write",
 							requestId,
 						);
+						const mutationTime27 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "remove_organization_s3",
@@ -5950,34 +6410,42 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [bucket] = await tx
-									.select({ id: Db.s3Buckets.id })
-									.from(Db.s3Buckets)
-									.where(
-										and(
-											eq(Db.s3Buckets.organizationId, path.organizationId),
-											eq(Db.s3Buckets.active, true),
-										),
-									)
-									.orderBy(desc(Db.s3Buckets.updatedAt))
-									.limit(1)
-									.for("update");
-								if (!bucket) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.s3Buckets)
-									.set({ active: false, updatedAt: now })
-									.where(eq(Db.s3Buckets.id, bucket.id));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [bucket] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.s3Buckets.id })
+										.from(Db.s3Buckets)
+										.where(
+											and(
+												eq(Db.s3Buckets.organizationId, path.organizationId),
+												eq(Db.s3Buckets.active, true),
+											),
+										)
+										.orderBy(desc(Db.s3Buckets.updatedAt))
+										.limit(1),
+								);
+								if (!bucket)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime27;
+								statements.push(
+									db
+										.update(Db.s3Buckets)
+										.set({ active: false, updatedAt: now })
+										.where(eq(Db.s3Buckets.id, bucket.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"storage_s3",
-										bucket.id,
-										"disconnected",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"storage_s3",
+											bucket.id,
+											"disconnected",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -6041,6 +6509,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							"integrations:write",
 							requestId,
 						);
+						const mutationTime28 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "disconnect_organization_google_drive",
@@ -6048,54 +6517,68 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [drive] = await tx
-									.select({ id: Db.storageIntegrations.id })
-									.from(Db.storageIntegrations)
-									.where(
-										and(
-											eq(
-												Db.storageIntegrations.organizationId,
-												path.organizationId,
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [drive] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.storageIntegrations.id })
+										.from(Db.storageIntegrations)
+										.where(
+											and(
+												eq(
+													Db.storageIntegrations.organizationId,
+													path.organizationId,
+												),
+												eq(
+													Db.storageIntegrations.provider,
+													googleDriveProvider,
+												),
 											),
-											eq(Db.storageIntegrations.provider, googleDriveProvider),
-										),
-									)
-									.orderBy(desc(Db.storageIntegrations.updatedAt))
-									.limit(1)
-									.for("update");
-								if (!drive) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.storageIntegrations)
-									.set({
-										active: false,
-										status: "disconnected",
-										googleDriveAccessToken: null,
-										googleDriveAccessTokenExpiresAt: null,
-										googleDriveTokenRefreshLeaseId: null,
-										googleDriveTokenRefreshLeaseExpiresAt: null,
-										googleDriveStorageQuotaCache: null,
-										updatedAt: now,
-									})
-									.where(
-										and(
-											eq(
-												Db.storageIntegrations.organizationId,
-												path.organizationId,
+										)
+										.orderBy(desc(Db.storageIntegrations.updatedAt))
+										.limit(1),
+								);
+								if (!drive)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime28;
+								statements.push(
+									db
+										.update(Db.storageIntegrations)
+										.set({
+											active: false,
+											status: "disconnected",
+											googleDriveAccessToken: null,
+											googleDriveAccessTokenExpiresAt: null,
+											googleDriveTokenRefreshLeaseId: null,
+											googleDriveTokenRefreshLeaseExpiresAt: null,
+											googleDriveStorageQuotaCache: null,
+											updatedAt: now,
+										})
+										.where(
+											and(
+												eq(
+													Db.storageIntegrations.organizationId,
+													path.organizationId,
+												),
+												eq(
+													Db.storageIntegrations.provider,
+													googleDriveProvider,
+												),
 											),
-											eq(Db.storageIntegrations.provider, googleDriveProvider),
 										),
-									);
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"storage_google_drive",
-										drive.id,
-										"disconnected",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"storage_google_drive",
+											drive.id,
+											"disconnected",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -6116,6 +6599,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							"integrations:write",
 							requestId,
 						);
+						const mutationTime29 = new Date();
+						const mutationTime30 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_organization_storage_provider",
@@ -6123,21 +6608,73 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, provider: payload.provider },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
 								if (payload.provider === "s3") {
-									const [bucket] = await tx
-										.select({ id: Db.s3Buckets.id })
-										.from(Db.s3Buckets)
+									const [bucket] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.s3Buckets.id })
+											.from(Db.s3Buckets)
+											.where(
+												and(
+													eq(Db.s3Buckets.organizationId, path.organizationId),
+													eq(Db.s3Buckets.active, true),
+												),
+											)
+											.orderBy(desc(Db.s3Buckets.updatedAt))
+											.limit(1),
+									);
+									if (!bucket)
+										return { statements, result: { state: "not_found" } };
+									statements.push(
+										db
+											.update(Db.storageIntegrations)
+											.set({ active: false })
+											.where(
+												eq(
+													Db.storageIntegrations.organizationId,
+													path.organizationId,
+												),
+											),
+									);
+									return {
+										statements,
+										result: {
+											state: "success",
+											response: mutationResponse(
+												"storage_provider",
+												bucket.id,
+												"activated",
+												requestId,
+												mutationTime29,
+											),
+										},
+									};
+								}
+								const [drive] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.storageIntegrations.id })
+										.from(Db.storageIntegrations)
 										.where(
 											and(
-												eq(Db.s3Buckets.organizationId, path.organizationId),
-												eq(Db.s3Buckets.active, true),
+												eq(
+													Db.storageIntegrations.organizationId,
+													path.organizationId,
+												),
+												eq(
+													Db.storageIntegrations.provider,
+													googleDriveProvider,
+												),
+												eq(Db.storageIntegrations.status, "active"),
 											),
 										)
-										.orderBy(desc(Db.s3Buckets.updatedAt))
-										.limit(1);
-									if (!bucket) return { state: "not_found" };
-									await tx
+										.orderBy(desc(Db.storageIntegrations.updatedAt))
+										.limit(1),
+								);
+								if (!drive)
+									return { statements, result: { state: "not_found" } };
+								statements.push(
+									db
 										.update(Db.storageIntegrations)
 										.set({ active: false })
 										.where(
@@ -6145,57 +6682,26 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 												Db.storageIntegrations.organizationId,
 												path.organizationId,
 											),
-										);
-									return {
+										),
+								);
+								statements.push(
+									db
+										.update(Db.storageIntegrations)
+										.set({ active: true })
+										.where(eq(Db.storageIntegrations.id, drive.id)),
+								);
+								return {
+									statements,
+									result: {
 										state: "success",
 										response: mutationResponse(
 											"storage_provider",
-											bucket.id,
+											drive.id,
 											"activated",
 											requestId,
-											new Date(),
+											mutationTime30,
 										),
-									};
-								}
-								const [drive] = await tx
-									.select({ id: Db.storageIntegrations.id })
-									.from(Db.storageIntegrations)
-									.where(
-										and(
-											eq(
-												Db.storageIntegrations.organizationId,
-												path.organizationId,
-											),
-											eq(Db.storageIntegrations.provider, googleDriveProvider),
-											eq(Db.storageIntegrations.status, "active"),
-										),
-									)
-									.orderBy(desc(Db.storageIntegrations.updatedAt))
-									.limit(1)
-									.for("update");
-								if (!drive) return { state: "not_found" };
-								await tx
-									.update(Db.storageIntegrations)
-									.set({ active: false })
-									.where(
-										eq(
-											Db.storageIntegrations.organizationId,
-											path.organizationId,
-										),
-									);
-								await tx
-									.update(Db.storageIntegrations)
-									.set({ active: true })
-									.where(eq(Db.storageIntegrations.id, drive.id));
-								return {
-									state: "success",
-									response: mutationResponse(
-										"storage_provider",
-										drive.id,
-										"activated",
-										requestId,
-										new Date(),
-									),
+									},
 								};
 							},
 						});
@@ -6273,7 +6779,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									const displayName = email
 										? `Google Drive (${email})`
 										: "Google Drive";
-									const database = yield* Database;
+									const database = yield* CloudflareDatabase;
 									const object = yield* database.use((db) =>
 										db
 											.select({ id: Db.storageObjects.id })
@@ -6299,50 +6805,60 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 											)
 										: drive.id;
 									yield* database.use((db) =>
-										db.transaction(async (tx) => {
+										atomic(db, async (_snapshot) => {
+											const statements: AtomicStatement[] = [];
 											if (hasStoredData) {
 												if (drive.active) {
-													await tx
-														.update(Db.storageIntegrations)
-														.set({ active: false })
-														.where(
-															eq(
-																Db.storageIntegrations.organizationId,
-																path.organizationId,
+													statements.push(
+														db
+															.update(Db.storageIntegrations)
+															.set({ active: false })
+															.where(
+																eq(
+																	Db.storageIntegrations.organizationId,
+																	path.organizationId,
+																),
 															),
-														);
+													);
 												}
-												await tx
-													.insert(Db.storageIntegrations)
-													.values({
-														id: nextId,
-														ownerId: principal.id,
-														organizationId: path.organizationId,
-														provider: googleDriveProvider,
-														displayName,
-														status: "active",
-														active: drive.active,
-														encryptedConfig,
-													})
-													.onDuplicateKeyUpdate({
-														set: {
+												statements.push(
+													db
+														.insert(Db.storageIntegrations)
+														.values({
+															id: nextId,
+															ownerId: principal.id,
+															organizationId: path.organizationId,
+															provider: googleDriveProvider,
 															displayName,
 															status: "active",
 															active: drive.active,
 															encryptedConfig,
-														},
-													});
-												return;
+														})
+														.onConflictDoUpdate({
+															target: Db.storageIntegrations.id,
+															set: {
+																displayName,
+																status: "active",
+																active: drive.active,
+																encryptedConfig,
+															},
+														}),
+												);
+												return { statements, result: undefined };
 											}
-											await tx
-												.update(Db.storageIntegrations)
-												.set({
-													displayName,
-													status: "active",
-													encryptedConfig,
-													googleDriveStorageQuotaCache: null,
-												})
-												.where(eq(Db.storageIntegrations.id, drive.id));
+											statements.push(
+												db
+													.update(Db.storageIntegrations)
+													.set({
+														displayName,
+														status: "active",
+														encryptedConfig,
+														googleDriveStorageQuotaCache: null,
+													})
+													.where(eq(Db.storageIntegrations.id, drive.id)),
+											);
+
+											return { statements, result: undefined };
 										}),
 									);
 									return mutationResponse(
@@ -6380,14 +6896,17 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								Agent.AgentNotificationPreferencesResponse,
 							),
-							execute: async (tx) => {
-								const [user] = await tx
-									.select({ preferences: Db.users.preferences })
-									.from(Db.users)
-									.where(eq(Db.users.id, principal.id))
-									.limit(1)
-									.for("update");
-								if (!user) return { state: "not_found" };
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [user] = await snapshot.read((reader) =>
+									reader
+										.select({ preferences: Db.users.preferences })
+										.from(Db.users)
+										.where(eq(Db.users.id, principal.id))
+										.limit(1),
+								);
+								if (!user)
+									return { statements, result: { state: "not_found" } };
 								const current = user.preferences?.notifications;
 								const notifications = {
 									pauseComments:
@@ -6403,24 +6922,29 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										current?.pauseAnonViews ??
 										false,
 								};
-								await tx
-									.update(Db.users)
-									.set({
-										preferences: {
-											...(user.preferences ?? {}),
-											notifications,
-										},
-									})
-									.where(eq(Db.users.id, principal.id));
+								statements.push(
+									db
+										.update(Db.users)
+										.set({
+											preferences: {
+												...(user.preferences ?? {}),
+												notifications,
+											},
+										})
+										.where(eq(Db.users.id, principal.id)),
+								);
 								return {
-									state: "success",
-									response: {
-										pauseComments: notifications.pauseComments,
-										pauseReplies: notifications.pauseReplies,
-										pauseViews: notifications.pauseViews,
-										pauseReactions: notifications.pauseReactions,
-										pauseAnonymousViews: notifications.pauseAnonViews,
-										requestId,
+									statements,
+									result: {
+										state: "success",
+										response: {
+											pauseComments: notifications.pauseComments,
+											pauseReplies: notifications.pauseReplies,
+											pauseViews: notifications.pauseViews,
+											pauseReactions: notifications.pauseReactions,
+											pauseAnonymousViews: notifications.pauseAnonViews,
+											requestId,
+										},
 									},
 								};
 							},
@@ -6446,6 +6970,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Choose all or between one and 100 notification IDs",
 							);
 						}
+						const mutationTime31 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "mark_notifications_read",
@@ -6453,26 +6978,32 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { all: payload.all === true, ids },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								await tx
-									.update(Db.notifications)
-									.set({ readAt: new Date() })
-									.where(
-										and(
-											eq(Db.notifications.recipientId, principal.id),
-											payload.all
-												? undefined
-												: inArray(Db.notifications.id, ids),
+							execute: async (_snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								statements.push(
+									db
+										.update(Db.notifications)
+										.set({ readAt: mutationTime31 })
+										.where(
+											and(
+												eq(Db.notifications.recipientId, principal.id),
+												payload.all
+													? undefined
+													: sql`${Db.notifications.id} in (select value from json_each(${JSON.stringify(ids)}))`,
+											),
 										),
-									);
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"notifications",
-										payload.all ? "all" : ids.join(","),
-										"marked_read",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"notifications",
+											payload.all ? "all" : ids.join(","),
+											"marked_read",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -6504,7 +7035,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							payload.organizationId ?? principal.activeOrganizationId;
 						const management = yield* AgentManagement;
 						yield* management.getMembership(principal.id, organizationId);
-						if (payload.folderId) {
+						const targetFolderId = payload.folderId;
+						if (targetFolderId) {
 							const access = yield* management.getFolderAccess(
 								principal.id,
 								payload.folderId,
@@ -6517,7 +7049,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								return yield* forbidden(requestId);
 							}
 						}
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [account] = yield* database.use((db) =>
 							db
 								.select({
@@ -6555,6 +7087,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						if (title.length > 255) {
 							return yield* badRequest(requestId, "Upload title is too long");
 						}
+						const mutationTime32 = new Date();
 						const state = yield* runAgentMutation({
 							principal,
 							operation: "create_upload",
@@ -6562,44 +7095,52 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: payload,
 							requestId,
 							decodeReplay: Schema.decodeUnknownSync(AgentUploadMutationState),
-							execute: async (tx) => {
-								const now = new Date();
-								await tx.insert(Db.videos).values({
-									id: videoId,
-									name: title,
-									ownerId: principal.id,
-									orgId: organizationId,
-									source: { type: "webMP4" },
-									bucket: Option.getOrNull(writable.bucketId),
-									storageIntegrationId: Option.getOrNull(
-										writable.storageIntegrationId,
-									),
-									folderId: payload.folderId ?? null,
-									public: await getNewVideoPublic(organizationId),
-									duration: payload.durationSeconds,
-									width: payload.width,
-									height: payload.height,
-									fps: payload.fps,
-									metadata: {
-										sourceName: payload.fileName,
-										agentUpload: { state: "pending" },
-									},
-									createdAt: now,
-									updatedAt: now,
-								});
-								await tx.insert(Db.videoUploads).values({
-									videoId,
-									total: contentLength,
-									mode: "singlepart",
-								});
-								return {
-									state: "success",
-									response: {
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const now = mutationTime32;
+								statements.push(
+									db.insert(Db.videos).values({
 										id: videoId,
-										organizationId,
-										rawFileKey,
-										shareUrl: `${serverEnv().WEB_URL}/s/${videoId}`,
-										requestId,
+										name: title,
+										ownerId: principal.id,
+										orgId: organizationId,
+										source: { type: "webMP4" },
+										bucket: Option.getOrNull(writable.bucketId),
+										storageIntegrationId: Option.getOrNull(
+											writable.storageIntegrationId,
+										),
+										folderId: payload.folderId ?? null,
+										public: await getNewVideoPublic(snapshot, organizationId),
+										duration: payload.durationSeconds,
+										width: payload.width,
+										height: payload.height,
+										fps: payload.fps,
+										metadata: {
+											sourceName: payload.fileName,
+											agentUpload: { state: "pending" },
+										},
+										createdAt: now,
+										updatedAt: now,
+									}),
+								);
+								statements.push(
+									db.insert(Db.videoUploads).values({
+										videoId,
+										total: contentLength,
+										mode: "singlepart",
+									}),
+								);
+								return {
+									statements,
+									result: {
+										state: "success",
+										response: {
+											id: videoId,
+											organizationId,
+											rawFileKey,
+											shareUrl: `${serverEnv().WEB_URL}/s/${videoId}`,
+											requestId,
+										},
 									},
 								};
 							},
@@ -6656,7 +7197,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"A valid Idempotency-Key header is required",
 							);
 						}
-						const database = yield* Database;
+						const database = yield* CloudflareDatabase;
 						const [account] = yield* database.use((db) =>
 							db
 								.select({
@@ -6677,8 +7218,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										eq(Db.agentApiIdempotency.userId, principal.id),
 										eq(Db.agentApiIdempotency.operation, "complete_upload"),
 										eq(Db.agentApiIdempotency.state, "complete"),
-										sql`JSON_UNQUOTE(JSON_EXTRACT(${Db.agentApiIdempotency.response}, '$.id')) = ${path.id}`,
-										sql`JSON_UNQUOTE(JSON_EXTRACT(${Db.agentApiIdempotency.response}, '$.rawFileKey')) = ${payload.rawFileKey}`,
+										sql`json_extract(${Db.agentApiIdempotency.response}, '$.id') = ${path.id}`,
+										sql`json_extract(${Db.agentApiIdempotency.response}, '$.rawFileKey') = ${payload.rawFileKey}`,
 									),
 								)
 								.limit(1),
@@ -6692,8 +7233,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									and(
 										eq(Db.agentApiIdempotency.userId, principal.id),
 										eq(Db.agentApiIdempotency.operation, "create_upload"),
-										sql`JSON_UNQUOTE(JSON_EXTRACT(${Db.agentApiIdempotency.response}, '$.id')) = ${path.id}`,
-										sql`JSON_UNQUOTE(JSON_EXTRACT(${Db.agentApiIdempotency.response}, '$.rawFileKey')) = ${payload.rawFileKey}`,
+										sql`json_extract(${Db.agentApiIdempotency.response}, '$.id') = ${path.id}`,
+										sql`json_extract(${Db.agentApiIdempotency.response}, '$.rawFileKey') = ${payload.rawFileKey}`,
 									),
 								)
 								.limit(1),
@@ -6726,31 +7267,38 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						if (!initialAgentUpload) return yield* notFound(requestId);
 						if (completedUploadRecord && !uploadVideo.metadata?.agentUpload) {
 							yield* database.use((db) =>
-								db.transaction(async (tx) => {
-									const [lockedVideo] = await tx
-										.select({ metadata: Db.videos.metadata })
-										.from(Db.videos)
-										.where(
-											and(
-												eq(Db.videos.id, path.id),
-												eq(Db.videos.ownerId, principal.id),
-											),
-										)
-										.limit(1)
-										.for("update");
-									if (!lockedVideo || lockedVideo.metadata?.agentUpload) return;
-									await tx
-										.update(Db.videos)
-										.set({
-											metadata: {
-												...(lockedVideo.metadata ?? {}),
-												agentUpload: {
-													state: "accepted",
-													rawFileKey: payload.rawFileKey,
+								atomic(db, async (snapshot) => {
+									const statements: AtomicStatement[] = [];
+									const [lockedVideo] = await snapshot.read((reader) =>
+										reader
+											.select({ metadata: Db.videos.metadata })
+											.from(Db.videos)
+											.where(
+												and(
+													eq(Db.videos.id, path.id),
+													eq(Db.videos.ownerId, principal.id),
+												),
+											)
+											.limit(1),
+									);
+									if (!lockedVideo || lockedVideo.metadata?.agentUpload)
+										return { statements, result: undefined };
+									statements.push(
+										db
+											.update(Db.videos)
+											.set({
+												metadata: {
+													...(lockedVideo.metadata ?? {}),
+													agentUpload: {
+														state: "accepted",
+														rawFileKey: payload.rawFileKey,
+													},
 												},
-											},
-										})
-										.where(eq(Db.videos.id, path.id));
+											})
+											.where(eq(Db.videos.id, path.id)),
+									);
+
+									return { statements, result: undefined };
 								}),
 							);
 						}
@@ -6794,45 +7342,69 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									);
 								}
 								yield* database.use((db) =>
-									db.transaction(async (tx) => {
-										await tx
-											.delete(Db.comments)
-											.where(eq(Db.comments.videoId, path.id));
-										await tx
-											.delete(Db.notifications)
-											.where(eq(Db.notifications.videoId, path.id));
-										await tx
-											.delete(Db.videoUploads)
-											.where(eq(Db.videoUploads.videoId, path.id));
-										await tx
-											.delete(Db.importedVideos)
-											.where(eq(Db.importedVideos.id, path.id));
-										await tx
-											.delete(Db.sharedVideos)
-											.where(eq(Db.sharedVideos.videoId, path.id));
-										await tx
-											.delete(Db.spaceVideos)
-											.where(eq(Db.spaceVideos.videoId, path.id));
-										await tx
-											.delete(Db.videoEdits)
-											.where(eq(Db.videoEdits.videoId, path.id));
-										await tx
-											.delete(Db.videos)
-											.where(
-												and(
-													eq(Db.videos.id, path.id),
-													eq(Db.videos.ownerId, principal.id),
+									atomic(db, async (_snapshot) => {
+										const statements: AtomicStatement[] = [];
+										statements.push(
+											db
+												.delete(Db.comments)
+												.where(eq(Db.comments.videoId, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.notifications)
+												.where(eq(Db.notifications.videoId, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.videoUploads)
+												.where(eq(Db.videoUploads.videoId, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.importedVideos)
+												.where(eq(Db.importedVideos.id, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.sharedVideos)
+												.where(eq(Db.sharedVideos.videoId, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.spaceVideos)
+												.where(eq(Db.spaceVideos.videoId, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.videoEdits)
+												.where(eq(Db.videoEdits.videoId, path.id)),
+										);
+										statements.push(
+											db
+												.delete(Db.videos)
+												.where(
+													and(
+														eq(Db.videos.id, path.id),
+														eq(Db.videos.ownerId, principal.id),
+													),
 												),
-											);
-										await tx
-											.delete(Db.agentApiIdempotency)
-											.where(
-												and(
-													eq(Db.agentApiIdempotency.userId, principal.id),
-													eq(Db.agentApiIdempotency.operation, "create_upload"),
-													sql`JSON_UNQUOTE(JSON_EXTRACT(${Db.agentApiIdempotency.response}, '$.id')) = ${path.id}`,
+										);
+										statements.push(
+											db
+												.delete(Db.agentApiIdempotency)
+												.where(
+													and(
+														eq(Db.agentApiIdempotency.userId, principal.id),
+														eq(
+															Db.agentApiIdempotency.operation,
+															"create_upload",
+														),
+														sql`json_extract(${Db.agentApiIdempotency.response}, '$.id') = ${path.id}`,
+													),
 												),
-											);
+										);
+
+										return { statements, result: undefined };
 									}),
 								);
 							});
@@ -6894,94 +7466,135 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								durationSeconds: measuredDuration ?? Number.NaN,
 								isPro,
 							});
+							const mutationTime33 = new Date();
+							const mutationTime34 = new Date();
 							const decision = yield* database.use((db) =>
-								db.transaction(async (tx) => {
-									const [lockedVideo] = await tx
-										.select({
-											id: Db.videos.id,
-											ownerId: Db.videos.ownerId,
-											metadata: Db.videos.metadata,
-										})
-										.from(Db.videos)
-										.where(eq(Db.videos.id, path.id))
-										.limit(1)
-										.for("update");
+								atomic<
+									| { state: "not_found" }
+									| { state: "invalid" }
+									| { state: "rejected" }
+									| { state: "accepted"; rawFileKey: string }
+								>(db, async (snapshot) => {
+									const statements: AtomicStatement[] = [];
+									const [lockedVideo] = await snapshot.read((reader) =>
+										reader
+											.select({
+												id: Db.videos.id,
+												ownerId: Db.videos.ownerId,
+												metadata: Db.videos.metadata,
+											})
+											.from(Db.videos)
+											.where(eq(Db.videos.id, path.id))
+											.limit(1),
+									);
 									if (!lockedVideo || lockedVideo.ownerId !== principal.id) {
-										return { state: "not_found" as const };
+										return {
+											statements,
+											result: { state: "not_found" as const },
+										};
 									}
 									const agentUpload =
 										lockedVideo.metadata?.agentUpload ??
 										(createUploadRecord
 											? ({ state: "pending" } as const)
 											: undefined);
-									if (!agentUpload) return { state: "not_found" as const };
+									if (!agentUpload)
+										return {
+											statements,
+											result: { state: "not_found" as const },
+										};
 									if (agentUpload.state === "accepted") {
-										return agentUpload.rawFileKey
-											? {
-													state: "accepted" as const,
-													rawFileKey: agentUpload.rawFileKey,
-												}
-											: { state: "invalid" as const };
+										return {
+											statements,
+											result: agentUpload.rawFileKey
+												? {
+														state: "accepted" as const,
+														rawFileKey: agentUpload.rawFileKey,
+													}
+												: { state: "invalid" as const },
+										};
 									}
 									if (agentUpload.state === "rejected") {
-										return { state: "rejected" as const };
+										return {
+											statements,
+											result: { state: "rejected" as const },
+										};
 									}
-									const [upload] = await tx
-										.select({ videoId: Db.videoUploads.videoId })
-										.from(Db.videoUploads)
-										.where(eq(Db.videoUploads.videoId, path.id))
-										.limit(1)
-										.for("update");
-									if (!upload) return { state: "not_found" as const };
+									const [upload] = await snapshot.read((reader) =>
+										reader
+											.select({ videoId: Db.videoUploads.videoId })
+											.from(Db.videoUploads)
+											.where(eq(Db.videoUploads.videoId, path.id))
+											.limit(1),
+									);
+									if (!upload)
+										return {
+											statements,
+											result: { state: "not_found" as const },
+										};
 									if (!allowed) {
-										await tx
+										statements.push(
+											db
+												.update(Db.videos)
+												.set({
+													metadata: {
+														...(lockedVideo.metadata ?? {}),
+														agentUpload: { state: "rejected" },
+													},
+												})
+												.where(eq(Db.videos.id, path.id)),
+										);
+										statements.push(
+											db
+												.update(Db.videoUploads)
+												.set({
+													phase: "error",
+													processingMessage: "Upload rejected",
+													processingError: AGENT_UPLOAD_REJECTION_ERROR,
+													updatedAt: mutationTime33,
+												})
+												.where(eq(Db.videoUploads.videoId, path.id)),
+										);
+										return {
+											statements,
+											result: { state: "rejected" as const },
+										};
+									}
+									statements.push(
+										db
 											.update(Db.videos)
 											.set({
+												...(measuredDuration === undefined
+													? {}
+													: { duration: measuredDuration }),
 												metadata: {
 													...(lockedVideo.metadata ?? {}),
-													agentUpload: { state: "rejected" },
+													agentUpload: {
+														state: "accepted",
+														rawFileKey: candidateRawFileKey,
+													},
 												},
 											})
-											.where(eq(Db.videos.id, path.id));
-										await tx
-											.update(Db.videoUploads)
-											.set({
-												phase: "error",
-												processingMessage: "Upload rejected",
-												processingError: AGENT_UPLOAD_REJECTION_ERROR,
-												updatedAt: new Date(),
-											})
-											.where(eq(Db.videoUploads.videoId, path.id));
-										return { state: "rejected" as const };
-									}
-									await tx
-										.update(Db.videos)
-										.set({
-											...(measuredDuration === undefined
-												? {}
-												: { duration: measuredDuration }),
-											metadata: {
-												...(lockedVideo.metadata ?? {}),
-												agentUpload: {
-													state: "accepted",
-													rawFileKey: candidateRawFileKey,
-												},
-											},
-										})
-										.where(eq(Db.videos.id, path.id));
+											.where(eq(Db.videos.id, path.id)),
+									);
 									if (payload.contentLength !== undefined) {
-										await tx
-											.update(Db.videoUploads)
-											.set({
-												uploaded: payload.contentLength,
-												total: payload.contentLength,
-												updatedAt: new Date(),
-											})
-											.where(eq(Db.videoUploads.videoId, path.id));
+										statements.push(
+											db
+												.update(Db.videoUploads)
+												.set({
+													uploaded: payload.contentLength,
+													total: payload.contentLength,
+													updatedAt: mutationTime34,
+												})
+												.where(eq(Db.videoUploads.videoId, path.id)),
+										);
 									}
 									return {
-										state: "accepted" as const,
-										rawFileKey: candidateRawFileKey,
+										statements,
+										result: {
+											state: "accepted" as const,
+											rawFileKey: candidateRawFileKey,
+										},
 									};
 								}),
 							);
@@ -7037,46 +7650,54 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								AgentUploadCompletionState,
 							),
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({
-										id: Db.videos.id,
-										ownerId: Db.videos.ownerId,
-										bucketId: Db.videos.bucket,
-										metadata: Db.videos.metadata,
-									})
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
+							execute: async (snapshot, _db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({
+											id: Db.videos.id,
+											ownerId: Db.videos.ownerId,
+											bucketId: Db.videos.bucket,
+											metadata: Db.videos.metadata,
+										})
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
 								const agentUpload = video.metadata?.agentUpload;
 								if (
 									agentUpload?.state !== "accepted" ||
 									agentUpload.rawFileKey !== acceptedRawFileKey
 								) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
-								const [upload] = await tx
-									.select({ videoId: Db.videoUploads.videoId })
-									.from(Db.videoUploads)
-									.where(eq(Db.videoUploads.videoId, path.id))
-									.limit(1)
-									.for("update");
-								if (!upload) return { state: "not_found" };
+								const [upload] = await snapshot.read((reader) =>
+									reader
+										.select({ videoId: Db.videoUploads.videoId })
+										.from(Db.videoUploads)
+										.where(eq(Db.videoUploads.videoId, path.id))
+										.limit(1),
+								);
+								if (!upload)
+									return { statements, result: { state: "not_found" } };
 								return {
-									state: "success",
-									response: {
-										id: video.id,
-										ownerId: video.ownerId,
-										bucketId: video.bucketId,
-										rawFileKey: agentUpload.rawFileKey,
-										requestId,
+									statements,
+									result: {
+										state: "success",
+										response: {
+											id: video.id,
+											ownerId: video.ownerId,
+											bucketId: video.bucketId,
+											rawFileKey: agentUpload.rawFileKey,
+											requestId,
+										},
 									},
 								};
 							},
@@ -7143,7 +7764,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						}
 						let aiEnabled = false;
 						if (includesAi) {
-							const database = yield* Database;
+							const database = yield* CloudflareDatabase;
 							const [owner] = yield* database.use((db) =>
 								db
 									.select({
@@ -7166,6 +7787,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								);
 							}
 						}
+						const mutationTime35 = new Date();
 						const state = yield* runAgentMutation({
 							principal,
 							operation: "process_cap",
@@ -7173,24 +7795,27 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { id: path.id, payload },
 							requestId,
 							decodeReplay: Schema.decodeUnknownSync(AgentProcessMutationState),
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({
-										id: Db.videos.id,
-										ownerId: Db.videos.ownerId,
-										transcriptionStatus: Db.videos.transcriptionStatus,
-										metadata: Db.videos.metadata,
-									})
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({
+											id: Db.videos.id,
+											ownerId: Db.videos.ownerId,
+											transcriptionStatus: Db.videos.transcriptionStatus,
+											metadata: Db.videos.metadata,
+										})
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
 								const metadata = normalizeAgentMetadata(video.metadata);
 								const aiStatus = metadata.aiGenerationStatus ?? null;
 								if (
@@ -7198,13 +7823,13 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									(aiStatus === "ERROR" || aiStatus === "SKIPPED") &&
 									payload.retry !== true
 								) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
 								if (
 									payload.target === "ai" &&
 									video.transcriptionStatus !== "COMPLETE"
 								) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
 								if (
 									payload.target === "all" &&
@@ -7213,20 +7838,26 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									aiStatus !== "PROCESSING" &&
 									aiStatus !== "COMPLETE"
 								) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
 								let transcriptionStatus = video.transcriptionStatus;
 								if (includesTranscript && transcriptionStatus === "ERROR") {
-									if (payload.retry !== true) return { state: "conflict" };
-									await tx
-										.update(Db.videos)
-										.set({ transcriptionStatus: null, updatedAt: new Date() })
-										.where(
-											and(
-												eq(Db.videos.id, path.id),
-												eq(Db.videos.transcriptionStatus, "ERROR"),
+									if (payload.retry !== true)
+										return { statements, result: { state: "conflict" } };
+									statements.push(
+										db
+											.update(Db.videos)
+											.set({
+												transcriptionStatus: null,
+												updatedAt: mutationTime35,
+											})
+											.where(
+												and(
+													eq(Db.videos.id, path.id),
+													eq(Db.videos.transcriptionStatus, "ERROR"),
+												),
 											),
-										);
+									);
 									transcriptionStatus = null;
 								}
 								if (
@@ -7234,18 +7865,21 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									(transcriptionStatus === "SKIPPED" ||
 										transcriptionStatus === "NO_AUDIO")
 								) {
-									return { state: "conflict" };
+									return { statements, result: { state: "conflict" } };
 								}
 								return {
-									state: "success",
-									response: {
-										id: video.id,
-										ownerId: video.ownerId,
-										target: payload.target,
-										transcriptionStatus,
-										aiGenerationStatus: aiStatus,
-										aiEnabled,
-										requestId,
+									statements,
+									result: {
+										state: "success",
+										response: {
+											id: video.id,
+											ownerId: video.ownerId,
+											target: payload.target,
+											transcriptionStatus,
+											aiGenerationStatus: aiStatus,
+											aiEnabled,
+											requestId,
+										},
 									},
 								};
 							},
@@ -7314,9 +7948,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						}
 						const storage = yield* Storage;
 						const [bucket] = yield* storage.getAccessForVideo(video);
-						const transcriptKey = `${video.ownerId}/${path.id}/transcription.vtt`;
 						const desiredRevision = agentTranscriptRevision(normalized.vtt);
-						const response = yield* runAgentMutation({
+						const mutation = {
 							principal,
 							operation: "replace_transcript",
 							idempotencyKey: yield* requestIdempotencyKey,
@@ -7329,54 +7962,109 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								Agent.AgentTranscriptUpdateResponse,
 							),
-							execute: async (tx) => {
-								const [ownedVideo] = await tx
-									.select({ id: Db.videos.id })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!ownedVideo) return { state: "not_found" };
-								const object = await Effect.runPromise(
-									bucket.getObject(transcriptKey),
+						};
+						const replay = yield* readAgentMutationReplay(mutation);
+						if (Option.isSome(replay)) return replay.value;
+						const database = yield* CloudflareDatabase;
+						const [currentVideo] = yield* database.use((db) =>
+							db
+								.select()
+								.from(Db.videos)
+								.where(
+									and(
+										eq(Db.videos.id, path.id),
+										eq(Db.videos.ownerId, principal.id),
+									),
+								)
+								.limit(1),
+						);
+						if (!currentVideo) return yield* notFound(requestId);
+						const store = createTranscriptStore(bucket);
+						const artifacts = yield* Effect.tryPromise({
+							try: () => readTranscriptArtifacts(currentVideo, store),
+							catch: () =>
+								temporarilyUnavailable(
+									requestId,
+									"Transcript content could not be read",
+								),
+						});
+						if (artifacts.vtt === null) return yield* notFound(requestId);
+						const currentRevision = agentTranscriptRevision(artifacts.vtt);
+						if (
+							currentRevision !== payload.expectedRevision &&
+							currentRevision !== desiredRevision
+						)
+							return yield* new Agent.AgentConflictError({
+								requestId,
+								code: "CONFLICT",
+								message: "The transcript changed; refresh and retry",
+								retryable: false,
+								retryAfterMs: null,
+							});
+						const prepared = yield* Effect.tryPromise({
+							try: () =>
+								prepareTranscriptPublication({
+									video: currentVideo,
+									store,
+									vtt: normalized.vtt,
+									editTranscript: artifacts.editTranscript,
+								}),
+							catch: () =>
+								temporarilyUnavailable(
+									requestId,
+									"Transcript content could not be prepared",
+								),
+						});
+						const now = new Date();
+						const response = yield* runAgentMutation({
+							...mutation,
+							execute: async (snapshot, db) => {
+								const [ownedVideo] = await snapshot.read((reader) =>
+									reader
+										.select()
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
 								);
-								if (Option.isNone(object)) return { state: "not_found" };
-								const currentRevision = agentTranscriptRevision(object.value);
-								if (
-									currentRevision !== payload.expectedRevision &&
-									currentRevision !== desiredRevision
-								) {
-									return { state: "conflict" };
-								}
-								if (currentRevision !== desiredRevision) {
-									await Effect.runPromise(
-										bucket.putObject(transcriptKey, normalized.vtt, {
-											contentType: "text/vtt",
-										}),
+								if (!ownedVideo)
+									return { statements: [], result: { state: "not_found" } };
+								let metadata: typeof Db.videos.$inferInsert.metadata;
+								try {
+									metadata = metadataWithTranscriptPublication(
+										ownedVideo,
+										prepared,
 									);
+								} catch (error) {
+									if (error instanceof TranscriptPublicationConflictError)
+										return { statements: [], result: { state: "conflict" } };
+									throw error;
 								}
-								const now = new Date();
-								await tx
-									.update(Db.videos)
-									.set({ updatedAt: now })
-									.where(eq(Db.videos.id, path.id));
 								return {
-									state: "success",
-									response: {
-										id: path.id,
-										revision: desiredRevision,
-										cueCount: normalized.cues.length,
-										updatedAt: now.toISOString(),
-										requestId,
+									statements: [
+										db
+											.update(Db.videos)
+											.set({ metadata, updatedAt: now })
+											.where(eq(Db.videos.id, path.id)),
+									],
+									result: {
+										state: "success",
+										response: {
+											id: path.id,
+											revision: desiredRevision,
+											cueCount: normalized.cues.length,
+											updatedAt: now.toISOString(),
+											requestId,
+										},
 									},
 								};
 							},
 						});
+
 						yield* Effect.sync(() => revalidatePath(`/s/${path.id}`));
 						return response;
 					}),
@@ -7419,6 +8107,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 						const nextPassword = password
 							? yield* Effect.tryPromise(() => hashPassword(password))
 							: null;
+						const mutationTime37 = new Date();
 						const response = yield* runAgentMutation({
 							principal,
 							operation: "update_cap_password",
@@ -7426,33 +8115,41 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { id: path.id, fingerprint },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.videos.id })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.videos)
-									.set({ password: nextPassword, updatedAt: now })
-									.where(eq(Db.videos.id, path.id));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.videos.id })
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime37;
+								statements.push(
+									db
+										.update(Db.videos)
+										.set({ password: nextPassword, updatedAt: now })
+										.where(eq(Db.videos.id, path.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										password ? "password_set" : "password_cleared",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											password ? "password_set" : "password_cleared",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -7510,6 +8207,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"defaultPlaybackSpeed must be between 0.25 and 4",
 							);
 						}
+						const mutationTime38 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_cap_settings",
@@ -7517,36 +8215,44 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { id: path.id, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ settings: Db.videos.settings })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.videos)
-									.set({
-										settings: mergeViewerSettings(video.settings, payload),
-										updatedAt: now,
-									})
-									.where(eq(Db.videos.id, path.id));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ settings: Db.videos.settings })
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime38;
+								statements.push(
+									db
+										.update(Db.videos)
+										.set({
+											settings: mergeViewerSettings(video.settings, payload),
+											updatedAt: now,
+										})
+										.where(eq(Db.videos.id, path.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"settings_updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"settings_updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -7568,6 +8274,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"createdAt must be a valid past UTC timestamp",
 							);
 						}
+						const mutationTime39 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_cap_date",
@@ -7575,39 +8282,47 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { id: path.id, createdAt: createdAt.toISOString() },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.videos.id, metadata: Db.videos.metadata })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.videos)
-									.set({
-										metadata: {
-											...(video.metadata ?? {}),
-											customCreatedAt: createdAt.toISOString(),
-										},
-										updatedAt: now,
-									})
-									.where(eq(Db.videos.id, path.id));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.videos.id, metadata: Db.videos.metadata })
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime39;
+								statements.push(
+									db
+										.update(Db.videos)
+										.set({
+											metadata: {
+												...(video.metadata ?? {}),
+												customCreatedAt: createdAt.toISOString(),
+											},
+											updatedAt: now,
+										})
+										.where(eq(Db.videos.id, path.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"date_updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"date_updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -7629,37 +8344,45 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { videoId: path.id, commentId: path.commentId },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [comment] = await tx
-									.select({ id: Db.comments.id })
-									.from(Db.comments)
-									.where(
-										and(
-											eq(Db.comments.id, path.commentId),
-											eq(Db.comments.videoId, path.id),
-											eq(Db.comments.authorId, principal.id),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [comment] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.comments.id })
+										.from(Db.comments)
+										.where(
+											and(
+												eq(Db.comments.id, path.commentId),
+												eq(Db.comments.videoId, path.id),
+												eq(Db.comments.authorId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!comment)
+									return { statements, result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.comments)
+										.where(
+											and(
+												eq(Db.comments.id, path.commentId),
+												eq(Db.comments.videoId, path.id),
+												eq(Db.comments.authorId, principal.id),
+											),
 										),
-									)
-									.limit(1)
-									.for("update");
-								if (!comment) return { state: "not_found" };
-								await tx
-									.delete(Db.comments)
-									.where(
-										and(
-											eq(Db.comments.id, path.commentId),
-											eq(Db.comments.videoId, path.id),
-											eq(Db.comments.authorId, principal.id),
-										),
-									);
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"feedback",
-										path.commentId,
-										"deleted",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"feedback",
+											path.commentId,
+											"deleted",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -7690,6 +8413,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							payload.container === "organization"
 								? payload.organizationId
 								: payload.spaceId;
+						const mutationTime40 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "move_cap",
@@ -7697,110 +8421,133 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { id: path.id, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.videos.id, orgId: Db.videos.orgId })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!video) return { state: "not_found" };
-								if (payload.folderId) {
-									const [folder] = await tx
-										.select({ id: Db.folders.id })
-										.from(Db.folders)
-										.where(
-											and(
-												eq(Db.folders.id, payload.folderId),
-												eq(Db.folders.organizationId, payload.organizationId),
-												payload.container === "personal"
-													? and(
-															isNull(Db.folders.spaceId),
-															eq(Db.folders.createdById, principal.id),
-														)
-													: eq(
-															Db.folders.spaceId,
-															payload.container === "organization"
-																? payload.organizationId
-																: (targetSpaceId ?? payload.organizationId),
-														),
-											),
-										)
-										.limit(1);
-									if (!folder) return { state: "forbidden" };
-								}
-								if (payload.container === "personal") {
-									if (video.orgId !== payload.organizationId) {
-										return { state: "forbidden" };
-									}
-									await tx
-										.update(Db.videos)
-										.set({ folderId: payload.folderId, updatedAt: new Date() })
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.videos.id, orgId: Db.videos.orgId })
+										.from(Db.videos)
 										.where(
 											and(
 												eq(Db.videos.id, path.id),
 												eq(Db.videos.ownerId, principal.id),
 											),
-										);
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								const targetFolderId = payload.folderId;
+								if (targetFolderId) {
+									const [folder] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.folders.id })
+											.from(Db.folders)
+											.where(
+												and(
+													eq(Db.folders.id, targetFolderId),
+													eq(Db.folders.organizationId, payload.organizationId),
+													payload.container === "personal"
+														? and(
+																isNull(Db.folders.spaceId),
+																eq(Db.folders.createdById, principal.id),
+															)
+														: eq(
+																Db.folders.spaceId,
+																payload.container === "organization"
+																	? payload.organizationId
+																	: (targetSpaceId ?? payload.organizationId),
+															),
+												),
+											)
+											.limit(1),
+									);
+									if (!folder)
+										return { statements, result: { state: "forbidden" } };
+								}
+								if (payload.container === "personal") {
+									if (video.orgId !== payload.organizationId) {
+										return { statements, result: { state: "forbidden" } };
+									}
+									statements.push(
+										db
+											.update(Db.videos)
+											.set({
+												folderId: payload.folderId,
+												updatedAt: mutationTime40,
+											})
+											.where(
+												and(
+													eq(Db.videos.id, path.id),
+													eq(Db.videos.ownerId, principal.id),
+												),
+											),
+									);
 								} else if (payload.container === "organization") {
-									const [share] = await tx
-										.select({ id: Db.sharedVideos.id })
-										.from(Db.sharedVideos)
-										.where(
-											and(
-												eq(Db.sharedVideos.videoId, path.id),
-												eq(
-													Db.sharedVideos.organizationId,
-													payload.organizationId,
+									const [share] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.sharedVideos.id })
+											.from(Db.sharedVideos)
+											.where(
+												and(
+													eq(Db.sharedVideos.videoId, path.id),
+													eq(
+														Db.sharedVideos.organizationId,
+														payload.organizationId,
+													),
 												),
-											),
-										)
-										.limit(1)
-										.for("update");
-									if (!share) return { state: "not_found" };
-									await tx
-										.update(Db.sharedVideos)
-										.set({ folderId: payload.folderId })
-										.where(eq(Db.sharedVideos.id, share.id));
+											)
+											.limit(1),
+									);
+									if (!share)
+										return { statements, result: { state: "not_found" } };
+									statements.push(
+										db
+											.update(Db.sharedVideos)
+											.set({ folderId: payload.folderId })
+											.where(eq(Db.sharedVideos.id, share.id)),
+									);
 								} else {
-									const [share] = await tx
-										.select({ id: Db.spaceVideos.id })
-										.from(Db.spaceVideos)
-										.innerJoin(
-											Db.spaces,
-											eq(Db.spaceVideos.spaceId, Db.spaces.id),
-										)
-										.where(
-											and(
-												eq(Db.spaceVideos.videoId, path.id),
-												eq(
-													Db.spaceVideos.spaceId,
-													targetSpaceId ?? payload.organizationId,
+									const [share] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.spaceVideos.id })
+											.from(Db.spaceVideos)
+											.innerJoin(
+												Db.spaces,
+												eq(Db.spaceVideos.spaceId, Db.spaces.id),
+											)
+											.where(
+												and(
+													eq(Db.spaceVideos.videoId, path.id),
+													eq(
+														Db.spaceVideos.spaceId,
+														targetSpaceId ?? payload.organizationId,
+													),
+													eq(Db.spaces.organizationId, payload.organizationId),
 												),
-												eq(Db.spaces.organizationId, payload.organizationId),
-											),
-										)
-										.limit(1)
-										.for("update");
-									if (!share) return { state: "not_found" };
-									await tx
-										.update(Db.spaceVideos)
-										.set({ folderId: payload.folderId })
-										.where(eq(Db.spaceVideos.id, share.id));
+											)
+											.limit(1),
+									);
+									if (!share)
+										return { statements, result: { state: "not_found" } };
+									statements.push(
+										db
+											.update(Db.spaceVideos)
+											.set({ folderId: payload.folderId })
+											.where(eq(Db.spaceVideos.id, share.id)),
+									);
 								}
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"moved",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"moved",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -7822,85 +8569,104 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
 								const [[video], [membership]] = await Promise.all([
-									tx
-										.select({ id: Db.videos.id })
-										.from(Db.videos)
-										.where(
-											and(
-												eq(Db.videos.id, path.id),
-												eq(Db.videos.ownerId, principal.id),
-											),
-										)
-										.limit(1),
-									tx
-										.select({ id: Db.organizationMembers.id })
-										.from(Db.organizationMembers)
-										.where(
-											and(
-												eq(Db.organizationMembers.userId, principal.id),
-												eq(
-													Db.organizationMembers.organizationId,
-													path.organizationId,
+									snapshot.read((reader) =>
+										reader
+											.select({ id: Db.videos.id })
+											.from(Db.videos)
+											.where(
+												and(
+													eq(Db.videos.id, path.id),
+													eq(Db.videos.ownerId, principal.id),
 												),
+											)
+											.limit(1),
+									),
+									snapshot.read((reader) =>
+										reader
+											.select({ id: Db.organizationMembers.id })
+											.from(Db.organizationMembers)
+											.where(
+												and(
+													eq(Db.organizationMembers.userId, principal.id),
+													eq(
+														Db.organizationMembers.organizationId,
+														path.organizationId,
+													),
+												),
+											)
+											.limit(1),
+									),
+								]);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								if (!membership)
+									return { statements, result: { state: "forbidden" } };
+								const targetFolderId = payload.folderId;
+								if (targetFolderId) {
+									const [folder] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.folders.id })
+											.from(Db.folders)
+											.where(
+												and(
+													eq(Db.folders.id, targetFolderId),
+													eq(Db.folders.organizationId, path.organizationId),
+													eq(Db.folders.spaceId, path.organizationId),
+												),
+											)
+											.limit(1),
+									);
+									if (!folder)
+										return { statements, result: { state: "forbidden" } };
+								}
+								const [existing] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.sharedVideos.id })
+										.from(Db.sharedVideos)
+										.where(
+											and(
+												eq(Db.sharedVideos.videoId, path.id),
+												eq(Db.sharedVideos.organizationId, path.organizationId),
 											),
 										)
 										.limit(1),
-								]);
-								if (!video) return { state: "not_found" };
-								if (!membership) return { state: "forbidden" };
-								if (payload.folderId) {
-									const [folder] = await tx
-										.select({ id: Db.folders.id })
-										.from(Db.folders)
-										.where(
-											and(
-												eq(Db.folders.id, payload.folderId),
-												eq(Db.folders.organizationId, path.organizationId),
-												eq(Db.folders.spaceId, path.organizationId),
-											),
-										)
-										.limit(1);
-									if (!folder) return { state: "forbidden" };
-								}
-								const [existing] = await tx
-									.select({ id: Db.sharedVideos.id })
-									.from(Db.sharedVideos)
-									.where(
-										and(
-											eq(Db.sharedVideos.videoId, path.id),
-											eq(Db.sharedVideos.organizationId, path.organizationId),
-										),
-									)
-									.limit(1)
-									.for("update");
+								);
 								if (existing) {
-									await tx
-										.update(Db.sharedVideos)
-										.set({ folderId: payload.folderId ?? null })
-										.where(eq(Db.sharedVideos.id, existing.id));
+									statements.push(
+										db
+											.update(Db.sharedVideos)
+											.set({ folderId: payload.folderId ?? null })
+											.where(eq(Db.sharedVideos.id, existing.id)),
+									);
 								} else {
-									await tx.insert(Db.sharedVideos).values({
-										id: deterministicAgentId(
-											"organization_share",
-											path.id,
-											path.organizationId,
-										),
-										videoId: path.id,
-										organizationId: path.organizationId,
-										folderId: payload.folderId ?? null,
-										sharedByUserId: principal.id,
-									});
+									statements.push(
+										db.insert(Db.sharedVideos).values({
+											id: deterministicAgentId(
+												"organization_share",
+												path.id,
+												path.organizationId,
+											),
+											videoId: path.id,
+											organizationId: path.organizationId,
+											folderId: payload.folderId ?? null,
+											sharedByUserId: principal.id,
+										}),
+									);
 								}
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"organization_shared",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"organization_shared",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -7922,34 +8688,43 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.videos.id })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.videos.id })
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.sharedVideos)
+										.where(
+											and(
+												eq(Db.sharedVideos.videoId, path.id),
+												eq(Db.sharedVideos.organizationId, path.organizationId),
+											),
 										),
-									)
-									.limit(1);
-								if (!video) return { state: "not_found" };
-								await tx
-									.delete(Db.sharedVideos)
-									.where(
-										and(
-											eq(Db.sharedVideos.videoId, path.id),
-											eq(Db.sharedVideos.organizationId, path.organizationId),
-										),
-									);
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"organization_unshared",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"organization_unshared",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -7973,68 +8748,84 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.videos.id })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
-										),
-									)
-									.limit(1);
-								if (!video) return { state: "not_found" };
-								if (payload.folderId) {
-									const [folder] = await tx
-										.select({ id: Db.folders.id })
-										.from(Db.folders)
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.videos.id })
+										.from(Db.videos)
 										.where(
 											and(
-												eq(Db.folders.id, payload.folderId),
-												eq(Db.folders.spaceId, path.spaceId),
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
 											),
 										)
-										.limit(1);
-									if (!folder) return { state: "forbidden" };
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								const targetFolderId = payload.folderId;
+								if (targetFolderId) {
+									const [folder] = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.folders.id })
+											.from(Db.folders)
+											.where(
+												and(
+													eq(Db.folders.id, targetFolderId),
+													eq(Db.folders.spaceId, path.spaceId),
+												),
+											)
+											.limit(1),
+									);
+									if (!folder)
+										return { statements, result: { state: "forbidden" } };
 								}
-								const [existing] = await tx
-									.select({ id: Db.spaceVideos.id })
-									.from(Db.spaceVideos)
-									.where(
-										and(
-											eq(Db.spaceVideos.videoId, path.id),
-											eq(Db.spaceVideos.spaceId, path.spaceId),
-										),
-									)
-									.limit(1)
-									.for("update");
+								const [existing] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.spaceVideos.id })
+										.from(Db.spaceVideos)
+										.where(
+											and(
+												eq(Db.spaceVideos.videoId, path.id),
+												eq(Db.spaceVideos.spaceId, path.spaceId),
+											),
+										)
+										.limit(1),
+								);
 								if (existing) {
-									await tx
-										.update(Db.spaceVideos)
-										.set({ folderId: payload.folderId ?? null })
-										.where(eq(Db.spaceVideos.id, existing.id));
+									statements.push(
+										db
+											.update(Db.spaceVideos)
+											.set({ folderId: payload.folderId ?? null })
+											.where(eq(Db.spaceVideos.id, existing.id)),
+									);
 								} else {
-									await tx.insert(Db.spaceVideos).values({
-										id: deterministicAgentId(
-											"space_share",
-											path.id,
-											path.spaceId,
-										),
-										spaceId: path.spaceId,
-										videoId: path.id,
-										folderId: payload.folderId ?? null,
-										addedById: principal.id,
-									});
+									statements.push(
+										db.insert(Db.spaceVideos).values({
+											id: deterministicAgentId(
+												"space_share",
+												path.id,
+												path.spaceId,
+											),
+											spaceId: path.spaceId,
+											videoId: path.id,
+											folderId: payload.folderId ?? null,
+											addedById: principal.id,
+										}),
+									);
 								}
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"space_shared",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"space_shared",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -8056,34 +8847,43 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [video] = await tx
-									.select({ id: Db.videos.id })
-									.from(Db.videos)
-									.where(
-										and(
-											eq(Db.videos.id, path.id),
-											eq(Db.videos.ownerId, principal.id),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [video] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.videos.id })
+										.from(Db.videos)
+										.where(
+											and(
+												eq(Db.videos.id, path.id),
+												eq(Db.videos.ownerId, principal.id),
+											),
+										)
+										.limit(1),
+								);
+								if (!video)
+									return { statements, result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.spaceVideos)
+										.where(
+											and(
+												eq(Db.spaceVideos.videoId, path.id),
+												eq(Db.spaceVideos.spaceId, path.spaceId),
+											),
 										),
-									)
-									.limit(1);
-								if (!video) return { state: "not_found" };
-								await tx
-									.delete(Db.spaceVideos)
-									.where(
-										and(
-											eq(Db.spaceVideos.videoId, path.id),
-											eq(Db.spaceVideos.spaceId, path.spaceId),
-										),
-									);
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"cap",
-										path.id,
-										"space_unshared",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"cap",
+											path.id,
+											"space_unshared",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -8125,7 +8925,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								return yield* forbidden(requestId);
 							}
 						}
-						if (payload.parentId) {
+						const targetParentId = payload.parentId;
+						if (targetParentId) {
 							const parent = yield* management.getFolderAccess(
 								principal.id,
 								payload.parentId,
@@ -8154,6 +8955,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							}
 						}
 						const folderId = Folder.FolderId.make(nanoId());
+						const mutationTime41 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "create_folder",
@@ -8161,29 +8963,35 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload: { ...payload, name }, folderId },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const now = new Date();
-								await tx.insert(Db.folders).values({
-									id: folderId,
-									name,
-									color: payload.color ?? "normal",
-									public: payload.public ?? false,
-									organizationId: path.organizationId,
-									createdById: principal.id,
-									parentId: payload.parentId ?? null,
-									spaceId: payload.spaceId ?? null,
-									createdAt: now,
-									updatedAt: now,
-								});
+							execute: async (_snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const now = mutationTime41;
+								statements.push(
+									db.insert(Db.folders).values({
+										id: folderId,
+										name,
+										color: payload.color ?? "normal",
+										public: payload.public ?? false,
+										organizationId: path.organizationId,
+										createdById: principal.id,
+										parentId: payload.parentId ?? null,
+										spaceId: payload.spaceId ?? null,
+										createdAt: now,
+										updatedAt: now,
+									}),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"folder",
-										folderId,
-										"created",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"folder",
+											folderId,
+											"created",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -8240,7 +9048,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								);
 							}
 						}
-						if (payload.parentId) {
+						const targetParentId = payload.parentId;
+						if (targetParentId) {
 							const parent = yield* management.getFolderAccess(
 								principal.id,
 								payload.parentId,
@@ -8253,6 +9062,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								return yield* forbidden(requestId);
 							}
 						}
+						const mutationTime42 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_folder",
@@ -8260,50 +9070,64 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload: { ...payload, name } },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [folder] = await tx
-									.select({ parentId: Db.folders.parentId })
-									.from(Db.folders)
-									.where(eq(Db.folders.id, path.folderId))
-									.limit(1)
-									.for("update");
-								if (!folder) return { state: "not_found" };
-								if (payload.parentId === path.folderId)
-									return { state: "conflict" };
-								let parentId = payload.parentId ?? null;
-								for (let depth = 0; parentId && depth < 100; depth += 1) {
-									if (parentId === path.folderId) return { state: "conflict" };
-									const [parent] = await tx
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [folder] = await snapshot.read((reader) =>
+									reader
 										.select({ parentId: Db.folders.parentId })
 										.from(Db.folders)
-										.where(eq(Db.folders.id, parentId))
-										.limit(1);
-									if (!parent) return { state: "not_found" };
+										.where(eq(Db.folders.id, path.folderId))
+										.limit(1),
+								);
+								if (!folder)
+									return { statements, result: { state: "not_found" } };
+								if (payload.parentId === path.folderId)
+									return { statements, result: { state: "conflict" } };
+								let parentId = payload.parentId ?? null;
+								for (let depth = 0; parentId && depth < 100; depth += 1) {
+									const currentParentId = parentId;
+									if (parentId === path.folderId)
+										return { statements, result: { state: "conflict" } };
+									const [parent] = await snapshot.read((reader) =>
+										reader
+											.select({ parentId: Db.folders.parentId })
+											.from(Db.folders)
+											.where(eq(Db.folders.id, currentParentId))
+											.limit(1),
+									);
+									if (!parent)
+										return { statements, result: { state: "not_found" } };
 									parentId = parent.parentId;
 								}
-								if (parentId) return { state: "conflict" };
-								const now = new Date();
-								await tx
-									.update(Db.folders)
-									.set({
-										name,
-										color: payload.color,
-										parentId: payload.parentId,
-										public: payload.public,
-										settings:
-											payload.settings as typeof Db.folders.$inferInsert.settings,
-										updatedAt: now,
-									})
-									.where(eq(Db.folders.id, path.folderId));
+								if (parentId)
+									return { statements, result: { state: "conflict" } };
+								const now = mutationTime42;
+								statements.push(
+									db
+										.update(Db.folders)
+										.set({
+											name,
+											color: payload.color,
+											parentId: payload.parentId,
+											public: payload.public,
+											settings:
+												payload.settings as typeof Db.folders.$inferInsert.settings,
+											updatedAt: now,
+										})
+										.where(eq(Db.folders.id, path.folderId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"folder",
-										path.folderId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"folder",
+											path.folderId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -8364,28 +9188,36 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [folder] = await tx
-									.select({
-										id: Db.folders.id,
-										parentId: Db.folders.parentId,
-										spaceId: Db.folders.spaceId,
-										organizationId: Db.folders.organizationId,
-									})
-									.from(Db.folders)
-									.where(eq(Db.folders.id, path.folderId))
-									.limit(1)
-									.for("update");
-								if (!folder) return { state: "not_found" };
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [folder] = await snapshot.read((reader) =>
+									reader
+										.select({
+											id: Db.folders.id,
+											parentId: Db.folders.parentId,
+											spaceId: Db.folders.spaceId,
+											organizationId: Db.folders.organizationId,
+										})
+										.from(Db.folders)
+										.where(eq(Db.folders.id, path.folderId))
+										.limit(1),
+								);
+								if (!folder)
+									return { statements, result: { state: "not_found" } };
 								const folderIds = [folder.id];
 								const seenFolderIds = new Set(folderIds);
 								for (let offset = 0; offset < folderIds.length; offset += 100) {
-									if (folderIds.length > 1_000) return { state: "conflict" };
+									if (folderIds.length > 1_000)
+										return { statements, result: { state: "conflict" } };
 									const parents = folderIds.slice(offset, offset + 100);
-									const children = await tx
-										.select({ id: Db.folders.id })
-										.from(Db.folders)
-										.where(inArray(Db.folders.parentId, parents));
+									const children = await snapshot.read((reader) =>
+										reader
+											.select({ id: Db.folders.id })
+											.from(Db.folders)
+											.where(
+												sql`${Db.folders.parentId} in (select value from json_each(${JSON.stringify(parents)}))`,
+											),
+									);
 									for (const child of children) {
 										if (seenFolderIds.has(child.id)) continue;
 										seenFolderIds.add(child.id);
@@ -8393,50 +9225,63 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 									}
 								}
 								if (folder.spaceId === null) {
-									await tx
-										.update(Db.videos)
-										.set({ folderId: folder.parentId })
-										.where(
-											and(
-												inArray(Db.videos.folderId, folderIds),
-												eq(Db.videos.ownerId, principal.id),
-											),
-										);
-								} else if (folder.spaceId === folder.organizationId) {
-									await tx
-										.update(Db.sharedVideos)
-										.set({ folderId: folder.parentId })
-										.where(
-											and(
-												inArray(Db.sharedVideos.folderId, folderIds),
-												eq(
-													Db.sharedVideos.organizationId,
-													folder.organizationId,
+									statements.push(
+										db
+											.update(Db.videos)
+											.set({ folderId: folder.parentId })
+											.where(
+												and(
+													sql`${Db.videos.folderId} in (select value from json_each(${JSON.stringify(folderIds)}))`,
+													eq(Db.videos.ownerId, principal.id),
 												),
 											),
-										);
-								} else {
-									await tx
-										.update(Db.spaceVideos)
-										.set({ folderId: folder.parentId })
-										.where(
-											and(
-												inArray(Db.spaceVideos.folderId, folderIds),
-												eq(Db.spaceVideos.spaceId, folder.spaceId),
+									);
+								} else if (folder.spaceId === folder.organizationId) {
+									statements.push(
+										db
+											.update(Db.sharedVideos)
+											.set({ folderId: folder.parentId })
+											.where(
+												and(
+													sql`${Db.sharedVideos.folderId} in (select value from json_each(${JSON.stringify(folderIds)}))`,
+													eq(
+														Db.sharedVideos.organizationId,
+														folder.organizationId,
+													),
+												),
 											),
-										);
+									);
+								} else {
+									statements.push(
+										db
+											.update(Db.spaceVideos)
+											.set({ folderId: folder.parentId })
+											.where(
+												and(
+													sql`${Db.spaceVideos.folderId} in (select value from json_each(${JSON.stringify(folderIds)}))`,
+													eq(Db.spaceVideos.spaceId, folder.spaceId),
+												),
+											),
+									);
 								}
-								await tx
-									.delete(Db.folders)
-									.where(inArray(Db.folders.id, folderIds));
+								statements.push(
+									db
+										.delete(Db.folders)
+										.where(
+											sql`${Db.folders.id} in (select value from json_each(${JSON.stringify(folderIds)}))`,
+										),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"folder",
-										path.folderId,
-										"deleted",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"folder",
+											path.folderId,
+											"deleted",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -8491,6 +9336,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							);
 						}
 						const spaceId = Space.SpaceId.make(nanoId());
+						const mutationTime43 = new Date();
+						const mutationId44 = nanoId();
 						return yield* runAgentMutation({
 							principal,
 							operation: "create_space",
@@ -8502,52 +9349,62 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							},
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [existing] = await tx
-									.select({ id: Db.spaces.id })
-									.from(Db.spaces)
-									.where(
-										and(
-											eq(Db.spaces.organizationId, path.organizationId),
-											eq(Db.spaces.name, name),
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [existing] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.spaces.id })
+										.from(Db.spaces)
+										.where(
+											and(
+												eq(Db.spaces.organizationId, path.organizationId),
+												eq(Db.spaces.name, name),
+											),
+										)
+										.limit(1),
+								);
+								if (existing)
+									return { statements, result: { state: "conflict" } };
+								const now = mutationTime43;
+								statements.push(
+									db.insert(Db.spaces).values({
+										id: spaceId,
+										name,
+										description,
+										organizationId: path.organizationId,
+										createdById: principal.id,
+										privacy: payload.privacy ?? "Private",
+										public: payload.public ?? false,
+										settings: mergeSpaceViewerSettings(
+											null,
+											payload.settings ?? {},
 										),
-									)
-									.limit(1)
-									.for("update");
-								if (existing) return { state: "conflict" };
-								const now = new Date();
-								await tx.insert(Db.spaces).values({
-									id: spaceId,
-									name,
-									description,
-									organizationId: path.organizationId,
-									createdById: principal.id,
-									privacy: payload.privacy ?? "Private",
-									public: payload.public ?? false,
-									settings: mergeSpaceViewerSettings(
-										null,
-										payload.settings ?? {},
-									),
-									createdAt: now,
-									updatedAt: now,
-								});
-								await tx.insert(Db.spaceMembers).values({
-									id: nanoId(),
-									spaceId,
-									userId: principal.id,
-									role: "admin",
-									createdAt: now,
-									updatedAt: now,
-								});
-								return {
-									state: "success",
-									response: mutationResponse(
-										"space",
+										createdAt: now,
+										updatedAt: now,
+									}),
+								);
+								statements.push(
+									db.insert(Db.spaceMembers).values({
+										id: mutationId44,
 										spaceId,
-										"created",
-										requestId,
-										now,
-									),
+										userId: principal.id,
+										role: "admin",
+										createdAt: now,
+										updatedAt: now,
+									}),
+								);
+								return {
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"space",
+											spaceId,
+											"created",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -8608,6 +9465,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"Cap Pro is required for these space settings",
 							);
 						}
+						const mutationTime45 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_space",
@@ -8615,46 +9473,54 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload: { ...payload, name, description } },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [space] = await tx
-									.select({
-										settings: Db.spaces.settings,
-										public: Db.spaces.public,
-									})
-									.from(Db.spaces)
-									.where(eq(Db.spaces.id, path.spaceId))
-									.limit(1)
-									.for("update");
-								if (!space) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.spaces)
-									.set({
-										name,
-										description:
-											payload.description === undefined
-												? undefined
-												: description,
-										privacy: payload.privacy,
-										public: payload.public,
-										settings: payload.settings
-											? mergeSpaceViewerSettings(
-													space.settings,
-													payload.settings,
-												)
-											: undefined,
-										updatedAt: now,
-									})
-									.where(eq(Db.spaces.id, path.spaceId));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [space] = await snapshot.read((reader) =>
+									reader
+										.select({
+											settings: Db.spaces.settings,
+											public: Db.spaces.public,
+										})
+										.from(Db.spaces)
+										.where(eq(Db.spaces.id, path.spaceId))
+										.limit(1),
+								);
+								if (!space)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime45;
+								statements.push(
+									db
+										.update(Db.spaces)
+										.set({
+											name,
+											description:
+												payload.description === undefined
+													? undefined
+													: description,
+											privacy: payload.privacy,
+											public: payload.public,
+											settings: payload.settings
+												? mergeSpaceViewerSettings(
+														space.settings,
+														payload.settings,
+													)
+												: undefined,
+											updatedAt: now,
+										})
+										.where(eq(Db.spaces.id, path.spaceId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"space",
-										path.spaceId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"space",
+											path.spaceId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -8715,35 +9581,48 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [space] = await tx
-									.select({ primary: Db.spaces.primary })
-									.from(Db.spaces)
-									.where(eq(Db.spaces.id, path.spaceId))
-									.limit(1)
-									.for("update");
-								if (!space) return { state: "not_found" };
-								if (space.primary) return { state: "conflict" };
-								await tx
-									.delete(Db.spaceVideos)
-									.where(eq(Db.spaceVideos.spaceId, path.spaceId));
-								await tx
-									.delete(Db.spaceMembers)
-									.where(eq(Db.spaceMembers.spaceId, path.spaceId));
-								await tx
-									.delete(Db.folders)
-									.where(eq(Db.folders.spaceId, path.spaceId));
-								await tx
-									.delete(Db.spaces)
-									.where(eq(Db.spaces.id, path.spaceId));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [space] = await snapshot.read((reader) =>
+									reader
+										.select({ primary: Db.spaces.primary })
+										.from(Db.spaces)
+										.where(eq(Db.spaces.id, path.spaceId))
+										.limit(1),
+								);
+								if (!space)
+									return { statements, result: { state: "not_found" } };
+								if (space.primary)
+									return { statements, result: { state: "conflict" } };
+								statements.push(
+									db
+										.delete(Db.spaceVideos)
+										.where(eq(Db.spaceVideos.spaceId, path.spaceId)),
+								);
+								statements.push(
+									db
+										.delete(Db.spaceMembers)
+										.where(eq(Db.spaceMembers.spaceId, path.spaceId)),
+								);
+								statements.push(
+									db
+										.delete(Db.folders)
+										.where(eq(Db.folders.spaceId, path.spaceId)),
+								);
+								statements.push(
+									db.delete(Db.spaces).where(eq(Db.spaces.id, path.spaceId)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"space",
-										path.spaceId,
-										"deleted",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"space",
+											path.spaceId,
+											"deleted",
+											requestId,
+										),
+									},
 								};
 							},
 						});
@@ -8764,6 +9643,8 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							path.spaceId,
 						);
 						if (!access.canManage) return yield* forbidden(requestId);
+						const mutationTime46 = new Date();
+						const mutationId47 = nanoId();
 						return yield* runAgentMutation({
 							principal,
 							operation: "add_space_member",
@@ -8771,53 +9652,64 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
 								const [[organizationMember], [existing]] = await Promise.all([
-									tx
-										.select({ id: Db.organizationMembers.id })
-										.from(Db.organizationMembers)
-										.where(
-											and(
-												eq(
-													Db.organizationMembers.organizationId,
-													access.organizationId,
+									snapshot.read((reader) =>
+										reader
+											.select({ id: Db.organizationMembers.id })
+											.from(Db.organizationMembers)
+											.where(
+												and(
+													eq(
+														Db.organizationMembers.organizationId,
+														access.organizationId,
+													),
+													eq(Db.organizationMembers.userId, payload.userId),
 												),
-												eq(Db.organizationMembers.userId, payload.userId),
-											),
-										)
-										.limit(1),
-									tx
-										.select({ id: Db.spaceMembers.id })
-										.from(Db.spaceMembers)
-										.where(
-											and(
-												eq(Db.spaceMembers.spaceId, path.spaceId),
-												eq(Db.spaceMembers.userId, payload.userId),
-											),
-										)
-										.limit(1)
-										.for("update"),
-								]);
-								if (!organizationMember) return { state: "forbidden" };
-								if (existing) return { state: "conflict" };
-								const now = new Date();
-								await tx.insert(Db.spaceMembers).values({
-									id: nanoId(),
-									spaceId: path.spaceId,
-									userId: payload.userId,
-									role: payload.role ?? "member",
-									createdAt: now,
-									updatedAt: now,
-								});
-								return {
-									state: "success",
-									response: mutationResponse(
-										"space_member",
-										payload.userId,
-										"added",
-										requestId,
-										now,
+											)
+											.limit(1),
 									),
+									snapshot.read((reader) =>
+										reader
+											.select({ id: Db.spaceMembers.id })
+											.from(Db.spaceMembers)
+											.where(
+												and(
+													eq(Db.spaceMembers.spaceId, path.spaceId),
+													eq(Db.spaceMembers.userId, payload.userId),
+												),
+											)
+											.limit(1),
+									),
+								]);
+								if (!organizationMember)
+									return { statements, result: { state: "forbidden" } };
+								if (existing)
+									return { statements, result: { state: "conflict" } };
+								const now = mutationTime46;
+								statements.push(
+									db.insert(Db.spaceMembers).values({
+										id: mutationId47,
+										spaceId: path.spaceId,
+										userId: payload.userId,
+										role: payload.role ?? "member",
+										createdAt: now,
+										updatedAt: now,
+									}),
+								);
+								return {
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"space_member",
+											payload.userId,
+											"added",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -8847,6 +9739,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 								"The space creator must remain an admin",
 							);
 						}
+						const mutationTime48 = new Date();
 						return yield* runAgentMutation({
 							principal,
 							operation: "update_space_member",
@@ -8854,33 +9747,41 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: { path, payload },
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [member] = await tx
-									.select({ id: Db.spaceMembers.id })
-									.from(Db.spaceMembers)
-									.where(
-										and(
-											eq(Db.spaceMembers.spaceId, path.spaceId),
-											eq(Db.spaceMembers.userId, path.userId),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!member) return { state: "not_found" };
-								const now = new Date();
-								await tx
-									.update(Db.spaceMembers)
-									.set({ role: payload.role, updatedAt: now })
-									.where(eq(Db.spaceMembers.id, member.id));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [member] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.spaceMembers.id })
+										.from(Db.spaceMembers)
+										.where(
+											and(
+												eq(Db.spaceMembers.spaceId, path.spaceId),
+												eq(Db.spaceMembers.userId, path.userId),
+											),
+										)
+										.limit(1),
+								);
+								if (!member)
+									return { statements, result: { state: "not_found" } };
+								const now = mutationTime48;
+								statements.push(
+									db
+										.update(Db.spaceMembers)
+										.set({ role: payload.role, updatedAt: now })
+										.where(eq(Db.spaceMembers.id, member.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"space_member",
-										path.userId,
-										"updated",
-										requestId,
-										now,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"space_member",
+											path.userId,
+											"updated",
+											requestId,
+											now,
+										),
+									},
 								};
 							},
 						});
@@ -8914,30 +9815,38 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							request: path,
 							requestId,
 							decodeReplay: decodeMutationResponse,
-							execute: async (tx) => {
-								const [member] = await tx
-									.select({ id: Db.spaceMembers.id })
-									.from(Db.spaceMembers)
-									.where(
-										and(
-											eq(Db.spaceMembers.spaceId, path.spaceId),
-											eq(Db.spaceMembers.userId, path.userId),
-										),
-									)
-									.limit(1)
-									.for("update");
-								if (!member) return { state: "not_found" };
-								await tx
-									.delete(Db.spaceMembers)
-									.where(eq(Db.spaceMembers.id, member.id));
+							execute: async (snapshot, db) => {
+								const statements: AtomicStatement[] = [];
+								const [member] = await snapshot.read((reader) =>
+									reader
+										.select({ id: Db.spaceMembers.id })
+										.from(Db.spaceMembers)
+										.where(
+											and(
+												eq(Db.spaceMembers.spaceId, path.spaceId),
+												eq(Db.spaceMembers.userId, path.userId),
+											),
+										)
+										.limit(1),
+								);
+								if (!member)
+									return { statements, result: { state: "not_found" } };
+								statements.push(
+									db
+										.delete(Db.spaceMembers)
+										.where(eq(Db.spaceMembers.id, member.id)),
+								);
 								return {
-									state: "success",
-									response: mutationResponse(
-										"space_member",
-										path.userId,
-										"removed",
-										requestId,
-									),
+									statements,
+									result: {
+										state: "success",
+										response: mutationResponse(
+											"space_member",
+											path.userId,
+											"removed",
+											requestId,
+										),
+									},
 								};
 							},
 						});

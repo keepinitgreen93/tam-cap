@@ -1,9 +1,15 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import {
+	comments,
+	notifications,
+	users,
+	videos,
+} from "@cap/database/cloudflare/schema";
 import { sendEmail } from "@cap/database/emails/config";
 import { FirstView } from "@cap/database/emails/first-view";
 import { NewComment } from "@cap/database/emails/new-comment";
 import { nanoId } from "@cap/database/helpers";
-import { comments, notifications, users, videos } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import type { Notification, NotificationBase } from "@cap/web-api-contract";
 import { Comment, User, Video } from "@cap/web-domain";
@@ -39,21 +45,19 @@ const ANON_NOTIF_WINDOW_MS = 5 * 60 * 1000;
 const ANON_NOTIF_MAX_PER_VIDEO = 50;
 
 const isDuplicateEntryError = (error: unknown) => {
-	if (!error || typeof error !== "object") return false;
-	const duplicateEntryError = error as {
-		code?: string;
-		errno?: number;
-		message?: string;
-		sqlMessage?: string;
-	};
-	if (
-		duplicateEntryError.code !== "ER_DUP_ENTRY" &&
-		duplicateEntryError.errno !== 1062
-	)
-		return false;
-	const message =
-		`${duplicateEntryError.sqlMessage ?? ""} ${duplicateEntryError.message ?? ""}`.trim();
-	return message.includes("dedup_key_idx");
+	const visited = new Set<unknown>();
+	let current = error;
+	while (current instanceof Error && !visited.has(current)) {
+		visited.add(current);
+		if (
+			current.message.includes(
+				"UNIQUE constraint failed: notifications.dedupKey",
+			)
+		)
+			return true;
+		current = current.cause;
+	}
+	return false;
 };
 
 export async function createNotification(
@@ -142,7 +146,7 @@ export async function createNotification(
 					and(
 						eq(notifications.type, "reply"),
 						eq(notifications.recipientId, recipientId),
-						sql`JSON_EXTRACT(${notifications.data}, '$.comment.id') = ${notification.comment.id}`,
+						sql`json_extract(${notifications.data}, '$.comment.id') = ${notification.comment.id}`,
 					),
 				)
 				.limit(1);
@@ -151,14 +155,20 @@ export async function createNotification(
 
 			const notificationId = nanoId();
 
-			await db().insert(notifications).values({
-				id: notificationId,
-				orgId: recipientUser.activeOrganizationId,
-				recipientId,
-				type,
-				data,
-				videoId: notification.videoId,
-			});
+			const inserted = await db()
+				.insert(notifications)
+				.values({
+					id: notificationId,
+					dedupKey: `reply:${recipientId}:${notification.comment.id}`,
+					orgId: recipientUser.activeOrganizationId,
+					recipientId,
+					type,
+					data,
+					videoId: notification.videoId,
+				})
+				.onConflictDoNothing({ target: notifications.dedupKey })
+				.returning({ id: notifications.id });
+			if (inserted.length === 0) return;
 
 			return { success: true, notificationId };
 		}
@@ -191,7 +201,7 @@ export async function createNotification(
 						eq(notifications.type, "view"),
 						eq(notifications.recipientId, videoResult.ownerId),
 						eq(notifications.videoId, notification.videoId),
-						sql`JSON_EXTRACT(${notifications.data}, '$.authorId') = ${notification.authorId}`,
+						sql`json_extract(${notifications.data}, '$.authorId') = ${notification.authorId}`,
 					),
 				)
 				.limit(1);
@@ -205,7 +215,7 @@ export async function createNotification(
 					and(
 						eq(notifications.type, type),
 						eq(notifications.recipientId, videoResult.ownerId),
-						sql`JSON_EXTRACT(${notifications.data}, '$.comment.id') = ${notification.comment.id}`,
+						sql`json_extract(${notifications.data}, '$.comment.id') = ${notification.comment.id}`,
 					),
 				)
 				.limit(1);
@@ -226,14 +236,23 @@ export async function createNotification(
 			return;
 		}
 
-		await db().insert(notifications).values({
-			id: notificationId,
-			orgId: videoResult.activeOrganizationId,
-			recipientId: videoResult.ownerId,
-			type,
-			data,
-			videoId: notification.videoId,
-		});
+		const inserted = await db()
+			.insert(notifications)
+			.values({
+				id: notificationId,
+				dedupKey:
+					type === "view"
+						? `view:${notification.videoId}:${notification.authorId}`
+						: `${type}:${videoResult.ownerId}:${notification.comment.id}`,
+				orgId: videoResult.activeOrganizationId,
+				recipientId: videoResult.ownerId,
+				type,
+				data,
+				videoId: notification.videoId,
+			})
+			.onConflictDoNothing({ target: notifications.dedupKey })
+			.returning({ id: notifications.id });
+		if (inserted.length === 0) return;
 
 		if (type === "comment") {
 			await sendNewCommentEmail({
@@ -318,6 +337,7 @@ async function sendNewCommentEmail(params: {
 		await sendEmail({
 			email: recipient.email,
 			subject: `New comment on your Cap: ${videoName}`,
+			idempotencyKey: `comment-notification-${params.comment.id}-${params.recipientId}`,
 			react: NewComment({
 				email: recipient.email,
 				url: videoUrl,
@@ -349,56 +369,74 @@ export async function createAnonymousViewNotification({
 
 	try {
 		const database = db();
+		const notificationId = nanoId();
+		await atomic(database, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
 
-		const [existingNotification] = await database
-			.select({ id: notifications.id })
-			.from(notifications)
-			.where(eq(notifications.dedupKey, dedupKey))
-			.limit(1);
+			const [existingNotification] = await snapshot.read((reader) =>
+				reader
+					.select({ id: notifications.id })
+					.from(notifications)
+					.where(eq(notifications.dedupKey, dedupKey))
+					.limit(1),
+			);
 
-		if (existingNotification) return;
+			if (existingNotification) return { statements, result: undefined };
 
-		const [videoWithOwner] = await database
-			.select({
-				videoId: videos.id,
-				ownerId: users.id,
-				activeOrganizationId: users.activeOrganizationId,
-				preferences: users.preferences,
-			})
-			.from(videos)
-			.innerJoin(users, eq(users.id, videos.ownerId))
-			.where(eq(videos.id, Video.VideoId.make(videoId)))
-			.limit(1);
+			const [videoWithOwner] = await snapshot.read((reader) =>
+				reader
+					.select({
+						videoId: videos.id,
+						ownerId: users.id,
+						activeOrganizationId: users.activeOrganizationId,
+						preferences: users.preferences,
+					})
+					.from(videos)
+					.innerJoin(users, eq(users.id, videos.ownerId))
+					.where(eq(videos.id, Video.VideoId.make(videoId)))
+					.limit(1),
+			);
 
-		if (!videoWithOwner?.activeOrganizationId) return;
+			if (!videoWithOwner?.activeOrganizationId)
+				return { statements, result: undefined };
 
-		const preferences = videoWithOwner.preferences as UserPreferences;
-		if (preferences?.notifications?.pauseAnonViews) return;
+			const preferences = videoWithOwner.preferences as UserPreferences;
+			if (preferences?.notifications?.pauseAnonViews)
+				return { statements, result: undefined };
 
-		const [recentNotificationCount] = await database
-			.select({ count: sql<number>`COUNT(*)` })
-			.from(notifications)
-			.where(
-				and(
-					eq(notifications.type, "anon_view"),
-					eq(notifications.recipientId, videoWithOwner.ownerId),
-					gte(notifications.createdAt, rateWindowStart),
-					eq(notifications.videoId, videoId),
-				),
+			const [recentNotificationCount] = await snapshot.read((reader) =>
+				reader
+					.select({ count: sql<number>`COUNT(*)` })
+					.from(notifications)
+					.where(
+						and(
+							eq(notifications.type, "anon_view"),
+							eq(notifications.recipientId, videoWithOwner.ownerId),
+							gte(notifications.createdAt, rateWindowStart),
+							eq(notifications.videoId, videoId),
+						),
+					)
+					.limit(1),
+			);
+
+			if (
+				Number(recentNotificationCount?.count ?? 0) >= ANON_NOTIF_MAX_PER_VIDEO
 			)
-			.limit(1);
+				return { statements, result: undefined };
 
-		if (Number(recentNotificationCount?.count ?? 0) >= ANON_NOTIF_MAX_PER_VIDEO)
-			return;
+			statements.push(
+				database.insert(notifications).values({
+					id: notificationId,
+					orgId: videoWithOwner.activeOrganizationId,
+					recipientId: videoWithOwner.ownerId,
+					type: "anon_view",
+					data: { videoId, anonName, location },
+					videoId,
+					dedupKey,
+				}),
+			);
 
-		await database.insert(notifications).values({
-			id: nanoId(),
-			orgId: videoWithOwner.activeOrganizationId,
-			recipientId: videoWithOwner.ownerId,
-			type: "anon_view",
-			data: { videoId, anonName, location },
-			videoId,
-			dedupKey,
+			return { statements, result: undefined };
 		});
 	} catch (error) {
 		if (isDuplicateEntryError(error)) return;
@@ -444,17 +482,18 @@ export async function sendFirstViewEmail(
 			if (preferences?.notifications?.pauseViews) return;
 		}
 
-		const [result] = await database
+		const result = await database
 			.update(videos)
 			.set({ firstViewEmailSentAt: new Date() })
 			.where(
 				and(
 					eq(videos.id, Video.VideoId.make(params.videoId)),
 					isNull(videos.firstViewEmailSentAt),
+					eq(videos.ownerId, videoWithOwner.ownerId),
 				),
 			);
 
-		if (result.affectedRows === 0) return;
+		if (result.meta.changes === 0) return;
 
 		let viewerName: string;
 		if (params.isAnonymous) {
@@ -475,6 +514,7 @@ export async function sendFirstViewEmail(
 		await sendEmail({
 			email: videoWithOwner.ownerEmail,
 			subject: `Your Cap "${displayName}" just got its first view!`,
+			idempotencyKey: `first-view-${params.videoId}`,
 			react: FirstView({
 				email: videoWithOwner.ownerEmail,
 				url: videoUrl,

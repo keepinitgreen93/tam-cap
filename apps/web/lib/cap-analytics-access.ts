@@ -1,12 +1,12 @@
 import "server-only";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	sharedVideos,
 	spaces,
 	spaceVideos,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { Organisation, type User, Video } from "@cap/web-domain";
 import { and, eq, exists, or } from "drizzle-orm";
 

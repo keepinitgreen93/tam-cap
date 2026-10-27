@@ -3,13 +3,24 @@ import {
 	CloudFrontClient,
 	CreateInvalidationCommand,
 } from "@aws-sdk/client-cloudfront";
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import type { AtomicStatement } from "@cap/database/cloudflare/atomic";
+import { AtomicConflictError } from "@cap/database/cloudflare/atomic";
 import {
 	comments,
 	videoEdits,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import {
+	discardTranscriptPreparation,
+	metadataWithTranscriptPublication,
+	prepareTranscriptPublication,
+	readTranscriptArtifacts,
+	readTranscriptPublicationOutcome,
+	type TranscriptObjectStore,
+	TranscriptPublicationConflictError,
+} from "@cap/database/cloudflare/transcript-publication";
 import type {
 	VideoEditRange,
 	VideoEditSpec,
@@ -26,18 +37,18 @@ import { retireDesktopRecordingJobForOutputReplacement } from "@/lib/desktop-rec
 import {
 	type EditTranscript,
 	editTranscriptWordsToCaptionVtt,
-	getEditTranscriptObjectKey,
 	parseEditTranscript,
 	remapEditTranscriptThroughSpec,
 } from "@/lib/edit-transcript";
-import { decryptEditTranscriptObject } from "@/lib/edit-transcript-storage";
 import { startAiGeneration } from "@/lib/generate-ai";
 import { transcribeVideo } from "@/lib/transcribe";
+import { remapCommentTimestamps } from "@/lib/video-edit-comment-remap";
 import {
 	clearFailedEdit,
 	type EditOperation,
 	getCompletedEdit,
 	getEditOutputKeys,
+	getEditProcessingState,
 	matchesEditOperation,
 	withEditOperation,
 	withoutEditProcessing,
@@ -287,7 +298,10 @@ async function renderVideoEditOnMediaServer(
 		videoId,
 		sourceKey,
 		operation,
-		async (_tx, video, _upload, state) => ({ video, dispatch: state.dispatch }),
+		async (_database, _snapshot, video, _upload, state) => ({
+			statements: [],
+			result: { video, dispatch: state.dispatch },
+		}),
 	);
 	if (current.dispatch !== "pending") return { status: "accepted" };
 	const video = current.video;
@@ -360,20 +374,23 @@ async function renderVideoEditOnMediaServer(
 		videoId,
 		sourceKey,
 		operation,
-		async (tx, current, upload, state) => {
-			if (state.dispatch !== "pending") return false;
+		async (database, _snapshot, current, upload, state) => {
+			const statements: AtomicStatement[] = [];
+			if (state.dispatch !== "pending") return { statements, result: false };
 			if (upload.phase !== "processing")
 				throw new FatalError("Edit is no longer waiting for dispatch");
-			await tx
-				.update(videos)
-				.set({
-					metadata: {
-						...current.metadata,
-						editProcessing: { ...state, dispatch: "dispatching" },
-					},
-				})
-				.where(eq(videos.id, current.id));
-			return true;
+			statements.push(
+				database
+					.update(videos)
+					.set({
+						metadata: {
+							...current.metadata,
+							editProcessing: { ...state, dispatch: "dispatching" },
+						},
+					})
+					.where(eq(videos.id, current.id)),
+			);
+			return { statements, result: true };
 		},
 	);
 	if (!claimed) return { status: "accepted" };
@@ -398,21 +415,27 @@ async function renderVideoEditOnMediaServer(
 		videoId,
 		sourceKey,
 		operation,
-		async (tx, current, _upload, state) => {
-			if (state.dispatch !== "dispatching") return;
-			await tx
-				.update(videos)
-				.set({
-					metadata: {
-						...current.metadata,
-						editProcessing: {
-							...state,
-							dispatch: dispatch.status === "accepted" ? "accepted" : "pending",
-							...(dispatch.jobId ? { jobId: dispatch.jobId } : {}),
+		async (database, _snapshot, current, _upload, state) => {
+			const statements: AtomicStatement[] = [];
+			if (state.dispatch !== "dispatching")
+				return { statements, result: undefined };
+			statements.push(
+				database
+					.update(videos)
+					.set({
+						metadata: {
+							...current.metadata,
+							editProcessing: {
+								...state,
+								dispatch:
+									dispatch.status === "accepted" ? "accepted" : "pending",
+								...(dispatch.jobId ? { jobId: dispatch.jobId } : {}),
+							},
 						},
-					},
-				})
-				.where(eq(videos.id, current.id));
+					})
+					.where(eq(videos.id, current.id)),
+			);
+			return { statements, result: undefined };
 		},
 	);
 	return dispatch;
@@ -424,16 +447,26 @@ async function markEditWaitingForCapacity(
 	operation: EditOperation,
 ): Promise<void> {
 	"use step";
-	await withEditOperation(videoId, sourceKey, operation, async (tx, video) => {
-		await tx
-			.update(videoUploads)
-			.set({
-				processingMessage: "Queued for video editing...",
-				processingError: null,
-				updatedAt: new Date(),
-			})
-			.where(eq(videoUploads.videoId, video.id));
-	});
+	const mutationTime = new Date();
+	await withEditOperation(
+		videoId,
+		sourceKey,
+		operation,
+		async (database, _snapshot, video) => {
+			const statements: AtomicStatement[] = [];
+			statements.push(
+				database
+					.update(videoUploads)
+					.set({
+						processingMessage: "Queued for video editing...",
+						processingError: null,
+						updatedAt: mutationTime,
+					})
+					.where(eq(videoUploads.videoId, video.id)),
+			);
+			return { statements, result: undefined };
+		},
+	);
 }
 
 async function probeVideoOnMediaServer(
@@ -597,85 +630,36 @@ async function queueTranscriptionRegeneration(
 	}
 }
 
-/**
- * Loads the immutable word transcript (stored in the ORIGINAL media timeline)
- * and returns it only when it still describes the original media.
- */
-async function loadOriginalEditTranscript(
+async function getTranscriptStore(
 	video: typeof videos.$inferSelect,
-	editSpec: VideoEditSpec,
-) {
+): Promise<TranscriptObjectStore> {
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),
 	).pipe(runWorkflowPromise);
-	const stored = await bucket
-		.getObject(getEditTranscriptObjectKey(video.ownerId, video.id))
-		.pipe(runWorkflowPromise);
+	return {
+		getText: async (key) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runWorkflowPromise)),
+		put: (key, text, contentType) =>
+			bucket.putObject(key, text, { contentType }).pipe(runWorkflowPromise),
+		delete: (key) => bucket.deleteObject(key).pipe(runWorkflowPromise),
+	};
+}
 
-	const decrypted = Option.isSome(stored)
-		? decryptEditTranscriptObject(stored.value, video.ownerId, video.id)
+async function loadOriginalEditTranscript(
+	video: typeof videos.$inferSelect,
+	editSpec: VideoEditSpec,
+	store: TranscriptObjectStore,
+) {
+	const artifacts = await readTranscriptArtifacts(video, store);
+	const transcript = artifacts.editTranscript
+		? parseEditTranscript(artifacts.editTranscript)
 		: null;
-	const transcript = decrypted ? parseEditTranscript(decrypted) : null;
 	if (!transcript) return null;
-
 	const expectedDurationMs = Math.round(editSpec.sourceDuration * 1000);
 	return Math.abs(transcript.durationMs - expectedDurationMs) <=
 		EDIT_TRANSCRIPT_CURRENCY_TOLERANCE_MS
 		? transcript
 		: null;
-}
-
-/**
- * Replaces every derived transcript object (captions plus stale translations
- * and status markers) with captions remapped through the new edit spec. The
- * word transcript itself is never touched — it is the single source of truth.
- */
-async function rewriteTranscriptObjectsForEdit(
-	video: typeof videos.$inferSelect,
-	transcript: EditTranscript,
-	editSpec: VideoEditSpec,
-) {
-	const [bucket] = await Storage.getAccessForVideo(
-		decodeStorageVideo(video),
-	).pipe(runWorkflowPromise);
-	const transcriptKey = getEditTranscriptObjectKey(video.ownerId, video.id);
-	const prefix = `${video.ownerId}/${video.id}/transcription`;
-	const listed = await bucket.listObjects({ prefix }).pipe(runWorkflowPromise);
-	const objects = (listed.Contents ?? [])
-		.map((object) => ({ Key: object.Key }))
-		.filter(
-			(object): object is { Key: string } =>
-				Boolean(object.Key) && object.Key !== transcriptKey,
-		);
-
-	if (objects.length > 0) {
-		await bucket.deleteObjects(objects).pipe(runWorkflowPromise);
-	}
-
-	await bucket
-		.putObject(
-			`${video.ownerId}/${video.id}/transcription.vtt`,
-			editTranscriptWordsToCaptionVtt(
-				remapEditTranscriptThroughSpec(transcript, editSpec).words,
-			),
-			{ contentType: "text/vtt" },
-		)
-		.pipe(runWorkflowPromise);
-}
-
-async function clearTranscriptObjects(video: typeof videos.$inferSelect) {
-	const [bucket] = await Storage.getAccessForVideo(
-		decodeStorageVideo(video),
-	).pipe(runWorkflowPromise);
-	const prefix = `${video.ownerId}/${video.id}/transcription`;
-	const listed = await bucket.listObjects({ prefix }).pipe(runWorkflowPromise);
-	const objects = (listed.Contents ?? [])
-		.map((object) => ({ Key: object.Key }))
-		.filter((object): object is { Key: string } => Boolean(object.Key));
-
-	if (objects.length > 0) {
-		await bucket.deleteObjects(objects).pipe(runWorkflowPromise);
-	}
 }
 
 async function readEditCompletion(
@@ -688,12 +672,13 @@ async function readEditCompletion(
 		videoId,
 		sourceKey,
 		operation,
-		async (_tx, _video, upload, state) => {
+		async (_database, _snapshot, _video, upload, state) => {
+			const statements: AtomicStatement[] = [];
 			if (upload.phase === "complete") {
 				const metadata = state.renderedMetadata;
 				if (!metadata)
 					throw new FatalError("Edit completed but video metadata is missing");
-				return { metadata };
+				return { statements, result: { metadata } };
 			}
 			if (upload.phase === "error" || upload.processingError)
 				throw new FatalError(
@@ -701,7 +686,7 @@ async function readEditCompletion(
 						upload.processingMessage ||
 						"Video edit failed",
 				);
-			return undefined;
+			return { statements, result: undefined };
 		},
 	);
 }
@@ -805,131 +790,202 @@ export async function saveEditResultAndComplete(
 		return { transcriptRemapped: completed.transcriptRemapped };
 	}
 
+	if (getEditProcessingState(video.metadata)?.resultCommitted) {
+		const transcriptRemapped =
+			video.metadata?.transcriptPublication?.vtt === true;
+		await completeEditProcessing(
+			videoId,
+			sourceKey,
+			operation,
+			transcriptRemapped,
+		);
+		return { transcriptRemapped };
+	}
+	const transcriptStore = await getTranscriptStore(video);
 	let originalTranscript: EditTranscript | null = null;
 	try {
-		originalTranscript = await loadOriginalEditTranscript(video, editSpec);
+		originalTranscript = await loadOriginalEditTranscript(
+			video,
+			editSpec,
+			transcriptStore,
+		);
 	} catch (error) {
 		console.warn(
 			"[editVideoWorkflow] Failed to load stored edit transcript",
 			error,
 		);
 	}
-
-	await withEditOperation(
-		videoId,
-		sourceKey,
-		operation,
-		async (tx, lockedVideo, upload, state) => {
-			if (upload.phase !== "complete")
-				throw new FatalError("Edit output is not complete");
-			if (state.resultCommitted) return;
-			await retireDesktopRecordingJobForOutputReplacement(tx, {
-				videoId: video.id,
-				userId: video.ownerId,
-			});
-			const source = {
-				...lockedVideo.source,
-				...getEditOutputKeys(lockedVideo.ownerId, videoId, operation),
-			};
-			if (source.type === "desktopMP4" || source.type === "webMP4") {
-				delete source.audioLevelSourceKey;
-				delete source.audioLevelOutputKey;
-			}
-			const nextMetadata = clearAiMetadata(lockedVideo.metadata);
-			delete nextMetadata.desktopRecordingUpload;
-			await tx
-				.update(videos)
-				.set({
-					source,
-					width: metadata.width,
-					height: metadata.height,
-					fps: metadata.fps,
-					metadata: {
-						...nextMetadata,
-						editProcessing: {
-							...state,
-							source: JSON.stringify(source),
-							resultCommitted: true,
-						},
-					},
-					// Derivable captions keep the transcription COMPLETE; only legacy
-					// videos without a stored word transcript get re-transcribed.
-					...(originalTranscript ? {} : { transcriptionStatus: null }),
-					...(duration === undefined ? {} : { duration }),
-				})
-				.where(eq(videos.id, videoId as Video.VideoId));
-
-			await tx
-				.insert(videoEdits)
-				.values({
-					videoId: videoId as Video.VideoId,
-					sourceKey,
-					editSpec,
-					updatedAt: new Date(),
-				})
-				.onDuplicateKeyUpdate({
-					set: {
-						sourceKey,
-						editSpec,
-						updatedAt: new Date(),
-					},
-				});
-
-			const timestampedComments = await tx
-				.select({
-					id: comments.id,
-					timestamp: comments.timestamp,
-				})
-				.from(comments)
-				.where(eq(comments.videoId, videoId as Video.VideoId));
-
-			for (const comment of timestampedComments) {
-				if (comment.timestamp === null) continue;
-				const nextTimestamp = remapCurrentOutputTimeThroughEdit(
-					comment.timestamp,
-					previousSpec,
-					editSpec,
-				);
-				if (nextTimestamp === comment.timestamp) continue;
-				await tx
-					.update(comments)
-					.set({ timestamp: nextTimestamp })
-					.where(eq(comments.id, comment.id));
-			}
-		},
-		true,
-	);
-
-	let transcriptRemapped = false;
-	if (originalTranscript) {
-		try {
-			await rewriteTranscriptObjectsForEdit(
-				video,
-				originalTranscript,
-				editSpec,
-			);
-			transcriptRemapped = true;
-		} catch (error) {
-			console.warn(
-				"[editVideoWorkflow] Failed to remap transcript objects",
-				error,
-			);
-		}
-	}
-	if (!transcriptRemapped) {
-		await withEditOperation(
+	const preparedTranscript = await prepareTranscriptPublication({
+		video,
+		store: transcriptStore,
+		vtt: originalTranscript
+			? editTranscriptWordsToCaptionVtt(
+					remapEditTranscriptThroughSpec(originalTranscript, editSpec).words,
+				)
+			: null,
+		editTranscript: originalTranscript
+			? JSON.stringify(originalTranscript)
+			: null,
+	});
+	const retirement = retireDesktopRecordingJobForOutputReplacement(db(), {
+		videoId: video.id,
+		userId: video.ownerId,
+	});
+	const mutationTime = new Date();
+	let committed: { publicationCommitted: boolean; transcriptRemapped: boolean };
+	try {
+		committed = await withEditOperation<{
+			publicationCommitted: boolean;
+			transcriptRemapped: boolean;
+		}>(
 			videoId,
 			sourceKey,
 			operation,
-			async (tx, current) => {
-				await tx
-					.update(videos)
-					.set({ transcriptionStatus: null })
-					.where(eq(videos.id, current.id));
+			async (database, snapshot, lockedVideo, upload, state) => {
+				const statements: AtomicStatement[] = [];
+				if (upload.phase !== "complete")
+					throw new FatalError("Edit output is not complete");
+				if (state.resultCommitted)
+					return {
+						statements,
+						result: {
+							publicationCommitted: false,
+							transcriptRemapped:
+								lockedVideo.metadata?.transcriptPublication?.vtt === true,
+						},
+					};
+				statements.push(retirement);
+				const source = {
+					...lockedVideo.source,
+					...getEditOutputKeys(lockedVideo.ownerId, videoId, operation),
+				};
+				if (source.type === "desktopMP4" || source.type === "webMP4") {
+					delete source.audioLevelSourceKey;
+					delete source.audioLevelOutputKey;
+				}
+				const nextMetadata = clearAiMetadata(lockedVideo.metadata);
+				delete nextMetadata.desktopRecordingUpload;
+				statements.push(
+					database
+						.update(videos)
+						.set({
+							source,
+							width: metadata.width,
+							height: metadata.height,
+							fps: metadata.fps,
+							metadata: metadataWithTranscriptPublication(
+								lockedVideo,
+								preparedTranscript,
+								{
+									...nextMetadata,
+									editProcessing: {
+										...state,
+										source: JSON.stringify(source),
+										resultCommitted: true,
+									},
+								},
+							),
+							// Derivable captions keep the transcription COMPLETE; only legacy
+							// videos without a stored word transcript get re-transcribed.
+							...(originalTranscript ? {} : { transcriptionStatus: null }),
+							...(duration === undefined ? {} : { duration }),
+						})
+						.where(eq(videos.id, videoId as Video.VideoId)),
+				);
+
+				statements.push(
+					database
+						.insert(videoEdits)
+						.values({
+							videoId: videoId as Video.VideoId,
+							sourceKey,
+							editSpec,
+							updatedAt: mutationTime,
+						})
+						.onConflictDoUpdate({
+							target: videoEdits.videoId,
+							set: {
+								sourceKey,
+								editSpec,
+								updatedAt: mutationTime,
+							},
+						}),
+				);
+
+				const timestampedComments = await snapshot.read((reader) =>
+					reader
+						.select({
+							id: comments.id,
+							timestamp: comments.timestamp,
+						})
+						.from(comments)
+						.where(eq(comments.videoId, videoId as Video.VideoId)),
+				);
+
+				const changes = timestampedComments.flatMap((comment) => {
+					if (comment.timestamp === null) return [];
+					const timestamp = remapCurrentOutputTimeThroughEdit(
+						comment.timestamp,
+						previousSpec,
+						editSpec,
+					);
+					return timestamp === comment.timestamp
+						? []
+						: [{ id: comment.id, timestamp }];
+				});
+				if (changes.length > 0)
+					statements.push(
+						remapCommentTimestamps(
+							database,
+							videoId as Video.VideoId,
+							changes,
+							mutationTime,
+						),
+					);
+				return {
+					statements,
+					result: {
+						publicationCommitted: true,
+						transcriptRemapped: originalTranscript !== null,
+					},
+				};
 			},
 		);
-		await clearTranscriptObjects(video);
+	} catch (error) {
+		const outcome = await readTranscriptPublicationOutcome(
+			db(),
+			preparedTranscript,
+		).catch(() => null);
+		if (outcome?.state === "published")
+			committed = {
+				publicationCommitted: true,
+				transcriptRemapped: originalTranscript !== null,
+			};
+		else {
+			if (
+				error instanceof TranscriptPublicationConflictError ||
+				error instanceof AtomicConflictError ||
+				error instanceof FatalError
+			) {
+				await discardTranscriptPreparation(
+					preparedTranscript,
+					transcriptStore,
+					{ commit: "rolled-back" },
+				).catch((cleanupError) =>
+					console.warn("Edit transcript preparation cleanup failed", {
+						videoId,
+						cleanupError,
+					}),
+				);
+			}
+			throw error;
+		}
 	}
+	if (!committed.publicationCommitted)
+		await discardTranscriptPreparation(preparedTranscript, transcriptStore, {
+			commit: "not-attempted",
+		});
+	const transcriptRemapped = committed.transcriptRemapped;
 	await completeEditProcessing(
 		videoId,
 		sourceKey,
@@ -949,19 +1005,25 @@ async function completeEditProcessing(
 		videoId,
 		sourceKey,
 		operation,
-		async (tx, video, upload, state) => {
+		async (database, _snapshot, video, upload, state) => {
+			const statements: AtomicStatement[] = [];
 			if (!state.resultCommitted || upload.phase !== "complete")
 				throw new FatalError("Edit result has not been committed");
-			await tx
-				.update(videos)
-				.set({
-					metadata: {
-						...withoutEditProcessing(video.metadata),
-						completedVideoEdit: { ...operation, transcriptRemapped },
-					},
-				})
-				.where(eq(videos.id, video.id));
-			await tx.delete(videoUploads).where(eq(videoUploads.videoId, video.id));
+			statements.push(
+				database
+					.update(videos)
+					.set({
+						metadata: {
+							...withoutEditProcessing(video.metadata),
+							completedVideoEdit: { ...operation, transcriptRemapped },
+						},
+					})
+					.where(eq(videos.id, video.id)),
+			);
+			statements.push(
+				database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
+			);
+			return { statements, result: undefined };
 		},
 	);
 }

@@ -1,12 +1,12 @@
 import "server-only";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	organizations,
 	spaces,
 	spaceVideos,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import {
 	resolveEffectiveVideoRules,
 	Storage,
@@ -25,6 +25,7 @@ import {
 } from "./agent-api";
 import { mcpIssuer } from "./mcp-auth";
 import { runPromise } from "./server";
+import { readTranscriptVtt } from "./transcript-publication";
 
 const maxList = 20;
 const maxCues = 30;
@@ -172,10 +173,12 @@ export const getMcpCapContext = async (
 				if (Option.isNone(loaded)) return null;
 				const storage = yield* Storage;
 				const [bucket] = yield* storage.getAccessForVideo(loaded.value[0]);
-				const object = yield* bucket.getObject(
-					`${row.ownerId}/${row.id}/transcription.vtt`,
+				return yield* Effect.promise(() =>
+					readTranscriptVtt(row, {
+						getText: async (key) =>
+							Option.getOrNull(await bucket.getObject(key).pipe(runPromise)),
+					}),
 				);
-				return Option.getOrNull(object);
 			}),
 		);
 		if (vtt && vtt.length > 2_000_000) transcriptStatus = "too_large";

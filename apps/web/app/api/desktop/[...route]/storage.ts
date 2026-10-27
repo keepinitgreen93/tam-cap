@@ -1,12 +1,15 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { db } from "@cap/database";
-import { decrypt, encrypt } from "@cap/database/crypto";
-import { nanoId } from "@cap/database/helpers";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	storageIntegrations,
 	storageObjects,
+	users,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { decrypt, encrypt } from "@cap/database/crypto";
+import { nanoId } from "@cap/database/helpers";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
@@ -18,7 +21,7 @@ import {
 } from "@cap/web-backend";
 import { Organisation, Storage, User } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { revalidatePath } from "next/cache";
 import { z } from "zod";
@@ -331,49 +334,65 @@ protectedApp.post(
 		const user = c.get("user");
 		const { provider } = c.req.valid("json");
 
-		const activated = await db().transaction(async (tx) => {
+		const database = db();
+		const activated = await atomic(database, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [currentUser] = await snapshot.read((reader) =>
+				reader
+					.select({ id: users.id })
+					.from(users)
+					.where(eq(users.id, user.id))
+					.limit(1),
+			);
+			if (!currentUser) throw new Error("Storage owner is unavailable");
 			const [driveToActivate] =
 				provider === "googleDrive"
-					? await tx
-							.select()
-							.from(storageIntegrations)
-							.where(
-								and(
-									eq(storageIntegrations.ownerId, user.id),
-									isNull(storageIntegrations.organizationId),
-									eq(storageIntegrations.provider, googleDriveProvider),
-									eq(storageIntegrations.status, "active"),
-								),
-							)
-							.orderBy(
-								desc(storageIntegrations.active),
-								desc(storageIntegrations.updatedAt),
-							)
-							.limit(1)
+					? await snapshot.read((reader) =>
+							reader
+								.select()
+								.from(storageIntegrations)
+								.where(
+									and(
+										eq(storageIntegrations.ownerId, user.id),
+										isNull(storageIntegrations.organizationId),
+										eq(storageIntegrations.provider, googleDriveProvider),
+										eq(storageIntegrations.status, "active"),
+									),
+								)
+								.orderBy(
+									desc(storageIntegrations.active),
+									desc(storageIntegrations.updatedAt),
+								)
+								.limit(1),
+						)
 					: [];
 
 			if (provider === "googleDrive" && !driveToActivate) {
-				return false;
+				return { statements, result: false };
 			}
 
-			await tx
-				.update(storageIntegrations)
-				.set({ active: false })
-				.where(
-					and(
-						eq(storageIntegrations.ownerId, user.id),
-						isNull(storageIntegrations.organizationId),
+			statements.push(
+				database
+					.update(storageIntegrations)
+					.set({ active: false })
+					.where(
+						and(
+							eq(storageIntegrations.ownerId, user.id),
+							isNull(storageIntegrations.organizationId),
+						),
 					),
-				);
+			);
 
 			if (provider === "googleDrive" && driveToActivate) {
-				await tx
-					.update(storageIntegrations)
-					.set({ active: true })
-					.where(eq(storageIntegrations.id, driveToActivate.id));
+				statements.push(
+					database
+						.update(storageIntegrations)
+						.set({ active: true })
+						.where(eq(storageIntegrations.id, driveToActivate.id)),
+				);
 			}
 
-			return true;
+			return { statements, result: true };
 		});
 
 		if (!activated) {
@@ -497,7 +516,26 @@ app.get("/google-drive/callback", async (c) => {
 		const displayName = email ? `Google Drive (${email})` : "Google Drive";
 		const active = !organizationId;
 
-		await db().transaction(async (tx) => {
+		const integrationId = Storage.StorageIntegrationId.make(nanoId());
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [currentUser] = await snapshot.read((reader) =>
+				reader
+					.select({ id: users.id })
+					.from(users)
+					.where(eq(users.id, userId))
+					.limit(1),
+			);
+			if (!currentUser) throw new Error("Storage owner is unavailable");
+			if (organizationId) {
+				const organization = await requireActiveOrganization(
+					snapshot,
+					organizationId,
+				);
+				if (organization.ownerId !== userId)
+					throw new Error("Organization owner changed");
+			}
 			const integrationScope = organizationId
 				? and(
 						eq(storageIntegrations.organizationId, organizationId),
@@ -508,70 +546,63 @@ app.get("/google-drive/callback", async (c) => {
 						isNull(storageIntegrations.organizationId),
 						eq(storageIntegrations.provider, googleDriveProvider),
 					);
-			const existingIntegrations = await tx
-				.select()
-				.from(storageIntegrations)
-				.where(integrationScope)
-				.orderBy(desc(storageIntegrations.updatedAt));
-
-			const dependencyChecks = await Promise.all(
-				existingIntegrations.map(async (integration) => {
-					const [object] = await tx
-						.select({ id: storageObjects.id })
-						.from(storageObjects)
-						.where(eq(storageObjects.integrationId, integration.id))
-						.limit(1);
-					const [video] = await tx
-						.select({ id: videos.id })
-						.from(videos)
-						.where(eq(videos.storageIntegrationId, integration.id))
-						.limit(1);
-
-					return {
-						integration,
-						hasStoredData: Boolean(object || video),
-					};
-				}),
+			const [reusable] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(storageIntegrations)
+					.where(
+						and(
+							integrationScope,
+							sql`not exists (select 1 from ${storageObjects} where ${storageObjects.integrationId} = ${storageIntegrations.id})`,
+							sql`not exists (select 1 from ${videos} where ${videos.storageIntegrationId} = ${storageIntegrations.id})`,
+						),
+					)
+					.orderBy(desc(storageIntegrations.updatedAt))
+					.limit(1),
 			);
-			const reusable = dependencyChecks.find(
-				({ hasStoredData }) => !hasStoredData,
-			)?.integration;
 
-			await tx
-				.update(storageIntegrations)
-				.set({ active: false, status: "disconnected" })
-				.where(integrationScope);
+			statements.push(
+				database
+					.update(storageIntegrations)
+					.set({ active: false, status: "disconnected" })
+					.where(integrationScope),
+			);
 
 			if (reusable) {
-				await tx
-					.update(storageIntegrations)
-					.set({
-						ownerId: userId,
-						organizationId: organizationId ?? null,
-						displayName,
-						status: "active",
-						active,
-						encryptedConfig,
-						googleDriveAccessToken: null,
-						googleDriveAccessTokenExpiresAt: null,
-						googleDriveTokenRefreshLeaseId: null,
-						googleDriveTokenRefreshLeaseExpiresAt: null,
-						googleDriveStorageQuotaCache: null,
-					})
-					.where(eq(storageIntegrations.id, reusable.id));
-				return;
+				statements.push(
+					database
+						.update(storageIntegrations)
+						.set({
+							ownerId: userId,
+							organizationId: organizationId ?? null,
+							displayName,
+							status: "active",
+							active,
+							encryptedConfig,
+							googleDriveAccessToken: null,
+							googleDriveAccessTokenExpiresAt: null,
+							googleDriveTokenRefreshLeaseId: null,
+							googleDriveTokenRefreshLeaseExpiresAt: null,
+							googleDriveStorageQuotaCache: null,
+						})
+						.where(eq(storageIntegrations.id, reusable.id)),
+				);
+				return { statements, result: undefined };
 			}
 
-			await tx.insert(storageIntegrations).values({
-				id: Storage.StorageIntegrationId.make(nanoId()),
-				ownerId: userId,
-				organizationId: organizationId ?? null,
-				provider: googleDriveProvider,
-				displayName,
-				status: "active",
-				active,
-				encryptedConfig,
-			});
+			statements.push(
+				database.insert(storageIntegrations).values({
+					id: integrationId,
+					ownerId: userId,
+					organizationId: organizationId ?? null,
+					provider: googleDriveProvider,
+					displayName,
+					status: "active",
+					active,
+					encryptedConfig,
+				}),
+			);
+			return { statements, result: undefined };
 		});
 
 		if (organizationId) {

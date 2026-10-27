@@ -10,8 +10,32 @@ import {
 } from "@aws-sdk/client-s3";
 import { migrateDb } from "@cap/database/migrate";
 import { buildEnv, serverEnv } from "@cap/env";
+import { validateCloudflareRuntime } from "./lib/cloudflare-runtime";
 
 export async function register() {
+	if (process.env.CAP_RUNTIME === "cloudflare") {
+		try {
+			validateCloudflareRuntime(process.env);
+			serverEnv();
+			const { getWorld } = await import("workflow/runtime");
+			const { createD1BridgeBinding } = await import(
+				"@cap/database/cloudflare/bridge"
+			);
+			const [database] = await Promise.all([
+				createD1BridgeBinding()
+					.prepare("SELECT 1 AS ok")
+					.first<{ ok: number }>(),
+				getWorld().getDeploymentId(),
+			]);
+			if (database?.ok !== 1) throw new Error("D1 readiness probe failed");
+			console.info("[cloudflare-runtime] D1 and durable workflow ready");
+		} catch (error) {
+			console.error("Cloudflare runtime configuration failed", error);
+			process.exit(1);
+		}
+		return;
+	}
+
 	if (process.env.NEXT_PUBLIC_IS_CAP) return;
 
 	// Exit, not throw: Next.js catches a throwing register() and serves 500s.

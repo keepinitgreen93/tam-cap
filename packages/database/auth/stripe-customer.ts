@@ -1,11 +1,11 @@
 import { isProSubscription, stripe } from "@cap/utils";
 import { eq } from "drizzle-orm";
-import type { MySql2Database } from "drizzle-orm/mysql2";
 import type Stripe from "stripe";
-import { users } from "../schema";
+import type { CloudflareDatabase } from "../cloudflare/index.ts";
+import { users } from "../cloudflare/schema.ts";
 
 export async function provisionStripeCustomer(
-	db: MySql2Database,
+	db: CloudflareDatabase,
 	row: typeof users.$inferSelect,
 ) {
 	const existingCustomers = await stripe().customers.list({

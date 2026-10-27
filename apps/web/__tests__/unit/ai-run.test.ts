@@ -1,4 +1,5 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { APICallError } from "ai";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AiModelSelection } from "@/lib/ai/provider";
 
 const getAiProviderChainMock = vi.hoisted(() => vi.fn());
@@ -21,8 +22,32 @@ const makeSelection = (provider: string): AiModelSelection => ({
 });
 
 describe("runWithAiProviders", () => {
+	afterEach(() => vi.unstubAllEnvs());
 	beforeEach(() => {
 		vi.spyOn(console, "error").mockImplementation(() => {});
+	});
+
+	it("does not log prompt contents or provider bodies on Cloudflare", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		getAiProviderChainMock.mockReturnValue([
+			makeSelection("openai-compatible"),
+		]);
+		const sensitive = "private-transcript-and-credential-sentinel";
+		const failure = new APICallError({
+			message: sensitive,
+			url: "https://api.cloudflare.com/example",
+			requestBodyValues: { prompt: sensitive },
+			statusCode: 400,
+			responseBody: sensitive,
+		});
+		await expect(
+			runWithAiProviders("generation", async () => {
+				throw failure;
+			}),
+		).rejects.toThrow(AiUnavailableError);
+		const entries = vi.mocked(console.error).mock.calls;
+		expect(entries.flat()).not.toContain(failure);
+		expect(JSON.stringify(entries)).not.toContain(sensitive);
 	});
 
 	it("returns the first successful result without touching later providers", async () => {

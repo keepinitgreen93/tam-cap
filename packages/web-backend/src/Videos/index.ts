@@ -1,11 +1,16 @@
+import * as Db from "@cap/database/cloudflare/schema";
+import {
+	metadataWithTranscriptPublication,
+	prepareTranscriptPublication,
+	readTranscriptArtifacts,
+	type TranscriptVideo,
+} from "@cap/database/cloudflare/transcript-publication";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
+
 import { buildEnv, NODE_ENV, serverEnv } from "@cap/env";
 import { dub } from "@cap/utils";
 import {
 	CurrentUser,
-	DatabaseError,
 	type Folder,
 	Policy,
 	Storage as StorageDomain,
@@ -15,7 +20,7 @@ import * as Dz from "drizzle-orm";
 import { Array as Arr, Effect, Exit, Option } from "effect";
 import type { Schema } from "effect/Schema";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { Storage as StorageService } from "../Storage/index.ts";
 import {
 	getPublishedRecordingCopyKeys,
@@ -23,6 +28,7 @@ import {
 	isInternalRecordingKey,
 } from "../Storage/recording-output.ts";
 import { Tinybird } from "../Tinybird/index.ts";
+import { activeVideo, updateVideoUploadProgress } from "./persistence.ts";
 import { VideosPolicy } from "./VideosPolicy.ts";
 import type { CreateVideoInput as RepoCreateVideoInput } from "./VideosRepo.ts";
 import { VideosRepo } from "./VideosRepo.ts";
@@ -251,7 +257,12 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 							password: Db.videos.password,
 						})
 						.from(Db.videos)
-						.where(Dz.inArray(Db.videos.id, [...new Set(videoIds)])),
+						.where(
+							Dz.and(
+								activeVideo,
+								Dz.sql`${Db.videos.id} in (select value from json_each(${JSON.stringify([...new Set(videoIds)])}))`,
+							),
+						),
 				);
 				const policyExits = yield* policy.canViewLoadedBulk(
 					rows.map(
@@ -280,8 +291,9 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 
 				return videoExits.map((exit, index) =>
 					Exit.map(exit, () => ({
-						count:
-							countsByPathname.get(buildPathname(videoIds[index] ?? "")) ?? 0,
+						count: videoIds[index]
+							? (countsByPathname.get(buildPathname(videoIds[index])) ?? 0)
+							: 0,
 					})),
 				);
 			},
@@ -302,7 +314,8 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					.where(
 						Dz.and(
 							Dz.eq(Db.videos.ownerId, ownerId),
-							Dz.inArray(Db.videos.id, uniqueVideoIds),
+							activeVideo,
+							Dz.sql`${Db.videos.id} in (select value from json_each(${JSON.stringify(uniqueVideoIds)}))`,
 						),
 					),
 			);
@@ -393,6 +406,55 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 
 				const prefix = `${video.ownerId}/${video.id}/`;
 				const newPrefix = `${video.ownerId}/${newVideoId}/`;
+				const [sourceEdit] = yield* db.use((database) =>
+					database
+						.select()
+						.from(Db.videoEdits)
+						.where(Dz.eq(Db.videoEdits.videoId, video.id))
+						.limit(1),
+				);
+				if (sourceEdit && !sourceEdit.sourceKey.startsWith(prefix))
+					return yield* Effect.fail(
+						new StorageDomain.StorageError({
+							cause: new Error("Original edit source is outside its recording"),
+						}),
+					);
+				const sourceReference: TranscriptVideo = {
+					id: video.id,
+					ownerId: video.ownerId,
+					orgId: video.orgId,
+					source: video.source,
+					metadata: Option.getOrNull(video.metadata),
+					bucket: Option.getOrNull(video.bucketId),
+					storageIntegrationId: Option.getOrNull(video.storageIntegrationId),
+					duration: Option.getOrNull(video.duration),
+					width: Option.getOrNull(video.width),
+					height: Option.getOrNull(video.height),
+				};
+				const copiedMetadata = { ...sourceReference.metadata };
+				delete copiedMetadata.desktopRecordingUpload;
+				delete copiedMetadata.customCreatedAt;
+				delete copiedMetadata.editProcessing;
+				delete copiedMetadata.completedVideoEdit;
+				delete copiedMetadata.processingRun;
+				delete copiedMetadata.transcriptionRun;
+				delete copiedMetadata.editTranscriptBackfill;
+				delete copiedMetadata.liveTranscript;
+				delete copiedMetadata.agentUpload;
+				delete copiedMetadata.loomImportRun;
+				delete copiedMetadata.loomImportUpload;
+				const targetReference: TranscriptVideo = {
+					...sourceReference,
+					id: newVideoId,
+					metadata: copiedMetadata,
+					source:
+						publishedKeys.size > 0
+							? {
+									type:
+										video.source.type === "webMP4" ? "webMP4" : "desktopMP4",
+								}
+							: video.source,
+				};
 				const attemptedKeys: string[] = [];
 				let publicationAttempted = false;
 
@@ -407,6 +469,8 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					});
 				yield* Effect.gen(function* () {
 					for (const key of publishedKeys) yield* copyObject(key);
+					if (sourceEdit && !publishedKeys.has(sourceEdit.sourceKey))
+						yield* copyObject(sourceEdit.sourceKey);
 					let continuationToken: string | undefined;
 					const seenTokens = new Set<string>();
 					do {
@@ -430,6 +494,8 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 								key.includes("/comments/") ||
 								isInternalRecordingKey(key) ||
 								publishedKeys.has(key) ||
+								key === sourceEdit?.sourceKey ||
+								key.startsWith(`${prefix}transcription`) ||
 								(publishedKeys.size > 0 && key.startsWith(`${prefix}segments/`))
 							) {
 								continue;
@@ -437,6 +503,50 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 							yield* copyObject(key);
 						}
 					} while (continuationToken);
+					const [copyTarget] = yield* storage.getAccessForVideo(video, {
+						copyTargetVideoId: newVideoId,
+						resolvePublishedOutput: false,
+					});
+					const sourceStore = {
+						getText: async (key: string) =>
+							Option.getOrNull(await Effect.runPromise(bucket.getObject(key))),
+						put: (key: string, text: string, contentType: string) =>
+							Effect.runPromise(bucket.putObject(key, text, { contentType })),
+						delete: (key: string) =>
+							Effect.runPromise(bucket.deleteObject(key)),
+					};
+					const targetStore = {
+						getText: async (key: string) =>
+							Option.getOrNull(
+								await Effect.runPromise(copyTarget.getObject(key)),
+							),
+						put: (key: string, text: string, contentType: string) => {
+							attemptedKeys.push(key);
+							return Effect.runPromise(
+								copyTarget.putObject(key, text, { contentType }),
+							);
+						},
+						delete: (key: string) =>
+							Effect.runPromise(copyTarget.deleteObject(key)),
+					};
+					const artifacts = yield* Effect.tryPromise({
+						try: () => readTranscriptArtifacts(sourceReference, sourceStore),
+						catch: (cause) => new StorageDomain.StorageError({ cause }),
+					});
+					const prepared = yield* Effect.tryPromise({
+						try: () =>
+							prepareTranscriptPublication({
+								video: targetReference,
+								store: targetStore,
+								...artifacts,
+							}),
+						catch: (cause) => new StorageDomain.StorageError({ cause }),
+					});
+					const metadata = metadataWithTranscriptPublication(
+						targetReference,
+						prepared,
+						copiedMetadata,
+					);
 					publicationAttempted = true;
 					const hasPassword = Option.isSome(password);
 					yield* repo.create(
@@ -445,31 +555,30 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 							orgId: video.orgId,
 							name: video.name,
 							public: video.public,
-							source:
-								publishedKeys.size > 0
-									? {
-											type:
-												video.source.type === "webMP4"
-													? "webMP4"
-													: "desktopMP4",
-										}
-									: video.source,
-							metadata: Option.map(video.metadata, (metadata) => {
-								const copied = { ...metadata };
-								delete copied.desktopRecordingUpload;
-								delete copied.customCreatedAt;
-								return copied;
-							}),
+							source: targetReference.source,
+							metadata: Option.some(metadata),
 							bucketId: video.bucketId,
 							storageIntegrationId: video.storageIntegrationId,
 							folderId: video.folderId,
-							transcriptionStatus: video.transcriptionStatus,
+							transcriptionStatus: Option.filter(
+								video.transcriptionStatus,
+								(status) => status !== "PROCESSING",
+							),
 							width: video.width,
 							height: video.height,
 							duration: video.duration,
 							...(hasPassword ? { password: password.value } : {}),
 						},
-						{ id: newVideoId },
+						{
+							id: newVideoId,
+							copySource: { video: sourceReference, edit: sourceEdit ?? null },
+							initialEdit: sourceEdit
+								? {
+										sourceKey: `${newPrefix}${sourceEdit.sourceKey.slice(prefix.length)}`,
+										editSpec: sourceEdit.editSpec,
+									}
+								: undefined,
+						},
 					);
 				}).pipe(
 					Effect.onError(() =>
@@ -562,54 +671,13 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 			updateUploadProgress: Effect.fn("Videos.updateUploadProgress")(function* (
 				input: UploadProgressUpdateInput,
 			) {
-				const uploaded = Math.min(input.uploaded, input.total);
-				const total = input.total;
-				const updatedAt = input.updatedAt;
-				const videoId = input.videoId;
-
-				const [record] = yield* db.use((db) =>
-					db
-						.select({
-							video: Db.videos,
-							upload: Db.videoUploads,
-						})
-						.from(Db.videos)
-						.leftJoin(
-							Db.videoUploads,
-							Dz.eq(Db.videos.id, Db.videoUploads.videoId),
-						)
-						.where(Dz.eq(Db.videos.id, videoId)),
-				);
-
-				if (!record) return yield* Effect.fail(new Video.NotFoundError());
-				yield* policy.isOwnerLoaded(record.video);
-
-				yield* db.use((db) =>
-					db.transaction(async (tx) => {
-						if (record.upload) {
-							await tx
-								.update(Db.videoUploads)
-								.set({
-									uploaded,
-									total,
-									updatedAt,
-								})
-								.where(
-									Dz.and(
-										Dz.eq(Db.videoUploads.videoId, videoId),
-										Dz.lte(Db.videoUploads.updatedAt, updatedAt),
-									),
-								);
-							return;
-						}
-
-						await tx.insert(Db.videoUploads).values({
-							videoId,
-							uploaded,
-							total,
-							updatedAt,
-						});
-					}),
+				const user = yield* CurrentUser;
+				const existing = yield* repo.getById(input.videoId);
+				if (Option.isNone(existing))
+					return yield* Effect.fail(new Video.NotFoundError());
+				yield* policy.isOwnerLoaded(existing.value[0]);
+				yield* db.use((database) =>
+					updateVideoUploadProgress(database, user.id, input),
 				);
 
 				return true as const;
@@ -648,14 +716,29 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 						},
 					)} ${now.getFullYear()}`;
 
+					const [organization] = yield* db.use((database) =>
+						database
+							.select()
+							.from(Db.organizations)
+							.where(
+								Dz.and(
+									Dz.eq(Db.organizations.id, input.orgId),
+									Dz.isNull(Db.organizations.tombstoneAt),
+								),
+							)
+							.limit(1),
+					);
+					if (!organization)
+						return yield* Effect.fail(new Policy.PolicyDeniedError());
+
 					const createData: RepoCreateVideoInput = {
 						ownerId: user.id,
 						orgId: input.orgId,
 						name: `Cap Recording - ${formattedDate}`,
-						public: yield* Effect.tryPromise({
-							try: () => getNewVideoPublic(input.orgId),
-							catch: (cause) => new DatabaseError({ cause }),
-						}),
+						public:
+							organization.defaultVideoVisibility === "private"
+								? false
+								: serverEnv().CAP_VIDEOS_DEFAULT_PUBLIC,
 						source: { type: "webMP4" },
 						bucketId,
 						storageIntegrationId,

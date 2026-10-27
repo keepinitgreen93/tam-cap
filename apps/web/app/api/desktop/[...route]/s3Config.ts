@@ -1,8 +1,9 @@
 import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import { s3Buckets, users } from "@cap/database/cloudflare/schema";
 import { decrypt, encrypt } from "@cap/database/crypto";
 import { nanoId } from "@cap/database/helpers";
-import { s3Buckets } from "@cap/database/schema";
 import { Organisation, S3Bucket } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
 import { and, desc, eq, isNull } from "drizzle-orm";
@@ -102,17 +103,30 @@ app.post(
 				active: true,
 			};
 
-			await db().transaction(async (tx) => {
-				await tx
-					.update(s3Buckets)
-					.set({ active: false })
-					.where(
-						and(
-							eq(s3Buckets.ownerId, user.id),
-							isNull(s3Buckets.organizationId),
+			const database = db();
+			await atomic(database, async (snapshot) => {
+				const statements: AtomicStatement[] = [];
+				const [currentUser] = await snapshot.read((reader) =>
+					reader
+						.select({ id: users.id })
+						.from(users)
+						.where(eq(users.id, user.id))
+						.limit(1),
+				);
+				if (!currentUser) throw new Error("Storage owner is unavailable");
+				statements.push(
+					database
+						.update(s3Buckets)
+						.set({ active: false })
+						.where(
+							and(
+								eq(s3Buckets.ownerId, user.id),
+								isNull(s3Buckets.organizationId),
+							),
 						),
-					);
-				await tx.insert(s3Buckets).values(encryptedConfig);
+				);
+				statements.push(database.insert(s3Buckets).values(encryptedConfig));
+				return { statements, result: undefined };
 			});
 
 			return c.json({ success: true });

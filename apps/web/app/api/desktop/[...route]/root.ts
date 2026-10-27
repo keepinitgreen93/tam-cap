@@ -1,14 +1,16 @@
-import { db } from "@cap/database";
 import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { sendEmail } from "@cap/database/emails/config";
-import { Feedback } from "@cap/database/emails/feedback";
+import { requireOrganizationManager } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	authApiKeys,
 	organizationMembers,
 	organizations,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { sendEmail } from "@cap/database/emails/config";
+import { Feedback } from "@cap/database/emails/feedback";
 import { serverEnv } from "@cap/env";
 import {
 	isProSubscription,
@@ -19,7 +21,7 @@ import {
 } from "@cap/utils";
 import { OrganizationBrandingPatchBody } from "@cap/web-api-contract";
 import { ImageUploads } from "@cap/web-backend";
-import { type ImageUpload, Organisation } from "@cap/web-domain";
+import { type ImageUpload, Organisation, type User } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
 import { and, eq, isNull } from "drizzle-orm";
 import { Effect, Option } from "effect";
@@ -155,6 +157,8 @@ function mergeDesktopOrganizationRows(...rowSets: DesktopOrganizationRow[][]) {
 async function applyOrganizationLogoUpdate(
 	row: DesktopOrganizationRow,
 	logo: ReturnType<typeof decodeOrganizationLogoUpdate>,
+	userId: User.UserId,
+	brandColors: Parameters<typeof mergeOrganizationBrandingMetadata>[1],
 ) {
 	if (logo.action === "keep") return;
 
@@ -174,13 +178,31 @@ async function applyOrganizationLogoUpdate(
 				row.iconUrl as ImageUpload.ImageUrlOrKey | null,
 			),
 			keyPrefix: `organizations/${row.id}`,
-			update: (db, urlOrKey) =>
-				db
-					.update(organizations)
-					.set({ iconUrl: urlOrKey })
-					.where(
-						eq(organizations.id, Organisation.OrganisationId.make(row.id)),
-					),
+			update: (database, urlOrKey) =>
+				atomic(database, async (snapshot) => {
+					const { organization } = await requireOrganizationManager(
+						snapshot,
+						Organisation.OrganisationId.make(row.id),
+						userId,
+					);
+					if (organization.iconUrl !== row.iconUrl)
+						throw new Error("Organization logo changed during update");
+					return {
+						statements: [
+							database
+								.update(organizations)
+								.set({
+									iconUrl: urlOrKey,
+									metadata: mergeOrganizationBrandingMetadata(
+										organization.metadata,
+										brandColors,
+									),
+								})
+								.where(eq(organizations.id, organization.id)),
+						],
+						result: undefined,
+					};
+				}),
 		});
 	}).pipe(runPromise);
 }
@@ -480,7 +502,12 @@ app.patch(
 					eq(organizationMembers.userId, user.id),
 				),
 			)
-			.where(eq(organizations.id, organizationId))
+			.where(
+				and(
+					eq(organizations.id, organizationId),
+					isNull(organizations.tombstoneAt),
+				),
+			)
 			.limit(1);
 
 		if (!row || row.tombstoneAt !== null) {
@@ -494,17 +521,37 @@ app.patch(
 			);
 		}
 
-		await applyOrganizationLogoUpdate(row, logoUpdate);
+		await applyOrganizationLogoUpdate(
+			row,
+			logoUpdate,
+			user.id,
+			body.brandColors,
+		);
 
-		await db()
-			.update(organizations)
-			.set({
-				metadata: mergeOrganizationBrandingMetadata(
-					row.metadata,
-					body.brandColors,
-				),
-			})
-			.where(eq(organizations.id, organizationId));
+		if (logoUpdate.action === "keep") {
+			const database = db();
+			await atomic(database, async (snapshot) => {
+				const { organization } = await requireOrganizationManager(
+					snapshot,
+					organizationId,
+					user.id,
+				);
+				return {
+					statements: [
+						database
+							.update(organizations)
+							.set({
+								metadata: mergeOrganizationBrandingMetadata(
+									organization.metadata,
+									body.brandColors,
+								),
+							})
+							.where(eq(organizations.id, organizationId)),
+					],
+					result: undefined,
+				};
+			});
+		}
 
 		const [updatedRow] = await db()
 			.select({
@@ -524,7 +571,12 @@ app.patch(
 					eq(organizationMembers.userId, user.id),
 				),
 			)
-			.where(eq(organizations.id, organizationId))
+			.where(
+				and(
+					eq(organizations.id, organizationId),
+					isNull(organizations.tombstoneAt),
+				),
+			)
 			.limit(1);
 
 		if (!updatedRow) {

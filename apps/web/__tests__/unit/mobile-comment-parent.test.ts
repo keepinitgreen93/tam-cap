@@ -1,4 +1,4 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import {
 	CurrentUser,
 	DatabaseError,
@@ -9,13 +9,13 @@ import {
 } from "@cap/web-domain";
 import { type HttpApi, HttpApiBuilder, HttpServer } from "@effect/platform";
 import type { SQL } from "drizzle-orm";
-import { MySqlDialect, type MySqlTable } from "drizzle-orm/mysql-core";
+import { SQLiteSyncDialect, type SQLiteTable } from "drizzle-orm/sqlite-core";
 import { Effect, Layer, Option } from "effect";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	Database,
-	type DbClient,
-} from "../../../../packages/web-backend/src/Database";
+	CloudflareDatabase,
+	type CloudflareDbClient,
+} from "../../../../packages/web-backend/src/CloudflareDatabase";
 
 const mocks = vi.hoisted(() => ({ notify: vi.fn(async () => undefined) }));
 vi.mock("server-only", () => ({}));
@@ -34,11 +34,11 @@ vi.mock("@/workflows/import-loom-video", () => ({}));
 vi.mock("workflow/api", () => ({ start: vi.fn() }));
 vi.mock("@cap/web-backend", async () => {
 	const { Context } = await import("effect");
-	const { Database } = await import(
-		"../../../../packages/web-backend/src/Database"
+	const { CloudflareDatabase } = await import(
+		"../../../../packages/web-backend/src/CloudflareDatabase"
 	);
 	return {
-		Database,
+		CloudflareDatabase,
 		Videos: Context.GenericTag("mobile-comment-test/Videos"),
 		ImageUploads: Context.GenericTag("mobile-comment-test/ImageUploads"),
 	};
@@ -54,7 +54,7 @@ const videoId = Video.VideoId.make("accessible-video");
 type Row = Record<string, unknown>;
 let parents: Row[];
 let inserted: Row[];
-const dialect = new MySqlDialect();
+const dialect = new SQLiteSyncDialect();
 
 function matchesParent(condition: SQL, row: Row) {
 	const { sql, params } = dialect.sqlToQuery(condition);
@@ -63,7 +63,7 @@ function matchesParent(condition: SQL, row: Row) {
 		.replaceAll(/[()]/g, "")
 		.split(" and ")
 		.every((clause) => {
-			const match = /^`comments`\.`([^`]+)` = \?$/.exec(clause);
+			const match = /^"comments"\."([^"]+)" = \?$/.exec(clause);
 			if (!match?.[1]) throw new Error(`Unsupported predicate: ${clause}`);
 			return row[match[1]] === params[index++];
 		});
@@ -71,7 +71,7 @@ function matchesParent(condition: SQL, row: Row) {
 
 const database = {
 	select: (columns?: Record<string, unknown>) => ({
-		from: (table: MySqlTable) => {
+		from: (table: SQLiteTable) => {
 			let condition: SQL;
 			const result = () => {
 				if (table === Db.users) return [{ preferences: {} }];
@@ -102,7 +102,7 @@ const database = {
 			return query;
 		},
 	}),
-	insert: (table: MySqlTable) => ({
+	insert: (table: SQLiteTable) => ({
 		values: async (row: Row) => {
 			if (table !== Db.comments) throw new Error("Unexpected insert");
 			inserted.push(row);
@@ -115,17 +115,22 @@ vi.mock("@/lib/server", async () => {
 	const { Videos, ImageUploads } = await import("@cap/web-backend");
 	return {
 		apiToHandler: (
-			api: Layer.Layer<HttpApi.Api, never, Database | HttpAuthMiddleware>,
+			api: Layer.Layer<
+				HttpApi.Api,
+				never,
+				CloudflareDatabase | HttpAuthMiddleware
+			>,
 		) => {
 			const web = HttpApiBuilder.toWebHandler(
 				api.pipe(
 					Layer.provide(
 						Layer.succeed(
-							Database,
-							Database.make({
+							CloudflareDatabase,
+							CloudflareDatabase.make({
 								use: (callback) =>
 									Effect.tryPromise({
-										try: () => callback(database as unknown as DbClient),
+										try: () =>
+											callback(database as unknown as CloudflareDbClient),
 										catch: (cause) => new DatabaseError({ cause }),
 									}),
 							}),

@@ -5,8 +5,13 @@ import {
 	Storage as StorageDomain,
 	Video,
 } from "@cap/web-domain";
+import { QueryPromise } from "drizzle-orm/query-promise";
 import { Effect, Option } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	databaseRevision,
+	snapshotGuard,
+} from "../../../../packages/database/cloudflare/concurrency-schema";
 
 const deletion = vi.hoisted(() => ({
 	deleteVideo: vi.fn(),
@@ -24,7 +29,28 @@ const schema = {
 	videoUploads: { table: "videoUploads" },
 	importedVideos: { table: "importedVideos" },
 	authApiKeys: { table: "authApiKeys" },
+	videoProcessingJobs: { table: "videoProcessingJobs" },
+	s3Buckets: { table: "s3Buckets" },
+	storageIntegrations: { table: "storageIntegrations" },
 };
+
+for (const [name, table] of Object.entries(schema))
+	Object.assign(
+		table,
+		Object.fromEntries(
+			[
+				"id",
+				"videoId",
+				"userId",
+				"ownerId",
+				"organizationId",
+				"orgId",
+				"tombstoneAt",
+				"errorCode",
+				"source",
+			].map((field) => [field, `${name}.${field}`]),
+		),
+	);
 
 const mockDb = {
 	select: vi.fn(),
@@ -56,6 +82,8 @@ vi.mock("@cap/database/auth/auth-options", () => ({
 }));
 
 vi.mock("@cap/database/schema", () => schema);
+vi.mock("@cap/database/cloudflare/schema", () => schema);
+vi.mock("@cap/database/cloudflare/application", () => ({ db: () => d1Mock }));
 
 vi.mock("@cap/database/emails/config", () => ({
 	sendEmail: vi.fn(),
@@ -135,6 +163,11 @@ vi.mock("@/lib/live-transcribe", () => ({
 }));
 
 vi.mock("drizzle-orm", () => ({
+	sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
+		strings,
+		values,
+	}),
+	isNull: (field: unknown) => ({ field, nullCheck: true }),
 	and: vi.fn((...args: unknown[]) => args),
 	eq: vi.fn((field: unknown, value: unknown) => ({ field, value })),
 	count: vi.fn(() => "count()"),
@@ -149,7 +182,216 @@ const { invalidateGoogleDriveStorageQuotaCache } = await import(
 const { maybeStartLiveTranscription } = await import("@/lib/live-transcribe");
 const { trackServerEvent } = await import("@/lib/server-analytics");
 
+type D1Row = Record<string, unknown>;
+type D1Mutation = {
+	table: unknown;
+	operation: "insert" | "update" | "delete";
+	values?: D1Row;
+	condition?: unknown;
+};
+let d1Revision = 0;
+let d1Planning = false;
+const d1Rows = new Map<unknown, D1Row[]>();
+const fieldName = (field: unknown) =>
+	typeof field === "string" ? field.split(".").at(-1) : undefined;
+function matchesD1(row: D1Row, condition: unknown): boolean {
+	if (Array.isArray(condition))
+		return condition.every((part) => matchesD1(row, part));
+	if (!condition || typeof condition !== "object" || !("field" in condition))
+		return true;
+	const name = fieldName(condition.field);
+	if (!name) return true;
+	return "nullCheck" in condition
+		? row[name] == null
+		: "value" in condition
+			? row[name] === condition.value
+			: true;
+}
+async function fixtureUser(): Promise<D1Row> {
+	const user: unknown = await mockGetCurrentUser.mock.results.at(-1)?.value;
+	return user && typeof user === "object" ? (user as D1Row) : {};
+}
+class D1Selection extends QueryPromise<D1Row[]> {
+	private table: unknown;
+	private condition: unknown;
+	private maximum: number | undefined;
+	private joins: Array<{ kind: "innerJoin" | "leftJoin"; args: unknown[] }> =
+		[];
+	constructor(private fields?: unknown) {
+		super();
+	}
+	from(table: unknown) {
+		this.table = table;
+		return this;
+	}
+	where(condition: unknown) {
+		this.condition = condition;
+		return this;
+	}
+	limit(maximum: number) {
+		this.maximum = maximum;
+		return this;
+	}
+	innerJoin(...args: unknown[]) {
+		this.joins.push({ kind: "innerJoin", args });
+		return this;
+	}
+	leftJoin(...args: unknown[]) {
+		this.joins.push({ kind: "leftJoin", args });
+		return this;
+	}
+	orderBy() {
+		return this;
+	}
+	async execute() {
+		if (this.table === databaseRevision) {
+			d1Planning = true;
+			return [{ revision: d1Revision }];
+		}
+		const user = await fixtureUser();
+		if (d1Planning) {
+			if (this.table === schema.users) return user.id ? [user] : [];
+			if (this.table === schema.s3Buckets)
+				return [
+					{
+						id: "bucket-1",
+						ownerId: user.id,
+						organizationId: null,
+						active: true,
+					},
+				];
+			const rows = (d1Rows.get(this.table) ?? []).filter((row) =>
+				matchesD1(row, this.condition),
+			);
+			if (this.table === schema.organizations)
+				for (const row of rows)
+					row.defaultVideoVisibility = (await defaultSharing.getNewVideoPublic(
+						row.id,
+					))
+						? "public"
+						: "private";
+			return rows
+				.slice(0, this.maximum ?? rows.length)
+				.map((row) => ({ ...row }));
+		}
+		mockDb.select(this.fields);
+		mockDb.from(this.table);
+		for (const join of this.joins) mockDb[join.kind](...join.args);
+		let result = mockDb.where(this.condition);
+		if (
+			this.maximum !== undefined &&
+			result &&
+			typeof result.limit === "function"
+		)
+			result = mockDb.limit(this.maximum);
+		const selected: unknown = await result;
+		const values = Array.isArray(selected) ? (selected as D1Row[]) : [];
+		if (
+			this.table === schema.organizations ||
+			this.table === schema.organizationMembers
+		) {
+			const organizations = d1Rows.get(schema.organizations) ?? [];
+			for (const row of values)
+				if (
+					typeof row.id === "string" &&
+					!organizations.some((org) => org.id === row.id)
+				)
+					organizations.push({
+						...row,
+						ownerId:
+							this.table === schema.organizations ? user.id : "other-owner",
+						tombstoneAt: null,
+					});
+			d1Rows.set(schema.organizations, organizations);
+			if (this.table === schema.organizationMembers)
+				d1Rows.set(
+					schema.organizationMembers,
+					values.map((row) => ({
+						organizationId: row.id,
+						userId: user.id,
+						role: "member",
+					})),
+				);
+		} else if (
+			this.table === schema.videos &&
+			values.some((row) => typeof row.id === "string")
+		)
+			d1Rows.set(schema.videos, values);
+		return values;
+	}
+}
+const d1Mock = {
+	select: (fields?: unknown) => new D1Selection(fields),
+	selectDistinct: (fields?: unknown) => new D1Selection(fields),
+	query: {},
+	insert: (table: unknown) => ({
+		values: (values: D1Row) => ({ table, operation: "insert", values }),
+	}),
+	update: (table: unknown) => ({
+		set: (values: D1Row) => ({
+			where: (condition: unknown) => ({
+				table,
+				operation: "update",
+				values,
+				condition,
+			}),
+		}),
+	}),
+	delete: (table: unknown) => ({
+		where: (condition: unknown) => ({ table, operation: "delete", condition }),
+	}),
+	async batch(statements: D1Mutation[]) {
+		const guard = statements.find(
+			(statement) =>
+				statement.table === snapshotGuard && statement.operation === "insert",
+		);
+		const valid = guard?.values?.valid as { values?: unknown[] } | undefined;
+		if (guard && valid?.values?.[1] !== d1Revision)
+			throw new Error("CHECK constraint failed: cap_d1_snapshot_guard");
+		const pending = statements.filter(
+			(statement) => statement.table !== snapshotGuard,
+		);
+		try {
+			await mockDb.transaction(async (tx: typeof mockDb) => {
+				for (const statement of pending) {
+					if (statement.operation === "insert")
+						await tx.insert(statement.table).values(statement.values);
+					else if (statement.operation === "update")
+						await tx
+							.update(statement.table)
+							.set(statement.values)
+							.where(statement.condition);
+					else await tx.delete(statement.table).where(statement.condition);
+				}
+			});
+			for (const statement of pending) {
+				const rows = d1Rows.get(statement.table) ?? [];
+				if (statement.operation === "insert")
+					rows.push({ ...statement.values });
+				else if (statement.operation === "update")
+					for (const row of rows.filter((row) =>
+						matchesD1(row, statement.condition),
+					))
+						Object.assign(row, statement.values);
+				else
+					d1Rows.set(
+						statement.table,
+						rows.filter((row) => !matchesD1(row, statement.condition)),
+					);
+				if (statement.operation !== "delete") d1Rows.set(statement.table, rows);
+			}
+			if (pending.length) d1Revision++;
+			return [];
+		} finally {
+			d1Planning = false;
+		}
+	},
+};
+
 function resetMockDb() {
+	d1Planning = false;
+	d1Revision = 0;
+	d1Rows.clear();
 	for (const key of Object.keys(mockDb)) {
 		const fn = mockDb[key as keyof typeof mockDb];
 		if (typeof fn?.mockClear === "function") {

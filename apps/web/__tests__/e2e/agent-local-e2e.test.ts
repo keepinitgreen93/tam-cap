@@ -842,7 +842,20 @@ agentE2e("Cap agent local Docker E2E", () => {
 		);
 
 		const { processVideoWorkflow } = await import("@/workflows/process-video");
+		const [processingRows] = await connection.query<RowDataPacket[]>(
+			"SELECT metadata FROM videos WHERE id = ?",
+			[uploadedVideoId],
+		);
+		const processingMetadata = asObject(
+			typeof processingRows[0]?.metadata === "string"
+				? JSON.parse(processingRows[0].metadata)
+				: processingRows[0]?.metadata,
+		);
+		const processingToken = asObject(processingMetadata.processingRun).token;
+		if (typeof processingToken !== "string")
+			throw new Error("The upload has no claimed processing token");
 		const result = await processVideoWorkflow({
+			processingToken,
 			videoId: uploadedVideoId,
 			userId,
 			rawFileKey,

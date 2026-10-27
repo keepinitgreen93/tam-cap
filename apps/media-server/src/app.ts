@@ -3,6 +3,7 @@ import { logger } from "hono/logger";
 import { beginRequest } from "./lib/lifecycle";
 import audio from "./routes/audio";
 import health from "./routes/health";
+import silenceAnalysis from "./routes/silence-analysis";
 import video from "./routes/video";
 
 const app = new Hono();
@@ -21,6 +22,7 @@ app.use("*", async (c, next) => {
 app.route("/health", health);
 app.route("/audio", audio);
 app.route("/video", video);
+app.route("/silence-analysis", silenceAnalysis);
 
 app.get("/", (c) => {
 	return c.json({
@@ -32,6 +34,7 @@ app.get("/", (c) => {
 			"/audio/check",
 			"/audio/extract",
 			"/audio/convert",
+			"/silence-analysis",
 			"/video/status",
 			"/video/probe",
 			"/video/thumbnail",

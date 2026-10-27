@@ -21,6 +21,28 @@ const mocks = vi.hoisted(() => ({
 	loomSourceUrl: "https://cdn.loom.com/original.mp4",
 }));
 
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => ({
+		select: () => ({
+			from: () => ({
+				where: mocks.where,
+				innerJoin: () => ({ where: mocks.where }),
+			}),
+		}),
+	}),
+}));
+vi.mock("@cap/database/cloudflare/schema", () => ({
+	videos: { id: "id", ownerId: "ownerId" },
+	users: {},
+	videoUploads: { videoId: "videoId" },
+}));
+vi.mock("@/lib/video-processing-state", () => ({
+	matchesProcessingRun: (video: { metadata?: { processingRun?: unknown } }) =>
+		Boolean(video.metadata?.processingRun),
+	claimProcessingAttempt: async () => processingRun,
+	applyVideoProcessingProgress: async () => true,
+	ProcessingRunSupersededError: class extends Error {},
+}));
 vi.mock("@cap/database", () => ({
 	db: () => ({
 		select: () => ({
@@ -89,6 +111,7 @@ const payload = {
 	rawFileKey: "owner/video/raw-upload.mp4",
 	bucketId: null,
 	loomVideoId: "loom-video",
+	processingToken: "a9699f1a-fe24-44f9-ac89-63d5744a058c",
 };
 const video = {
 	id: "video",
@@ -99,6 +122,30 @@ const video = {
 };
 const metadata = { duration: 30, width: 1920, height: 1080, fps: 30 };
 const pending = { phase: "processing", processingProgress: 25 };
+
+const processingRun = {
+	token: payload.processingToken,
+	attemptId: "b9699f1a-fe24-44f9-ac89-63d5744a058c",
+	attempt: 0,
+	rawFileKey: payload.rawFileKey,
+	state: "processing",
+	outputKey: "owner/video/.recording/outputs/process-run/attempt/result.mp4",
+	thumbnailKey:
+		"owner/video/.recording/outputs/process-run/attempt/screenshot.jpg",
+	previewKey: "owner/video/.recording/outputs/process-run/attempt/preview.gif",
+};
+const processingVideo = { ...video, metadata: { processingRun } };
+const completeVideo = {
+	...processingVideo,
+	...metadata,
+	metadata: { processingRun: { ...processingRun, state: "complete" } },
+};
+const failedVideo = (message: string) => ({
+	...processingVideo,
+	metadata: {
+		processingRun: { ...processingRun, state: "error", error: message },
+	},
+});
 
 function storageError(cause: unknown) {
 	return { _tag: "StorageError", cause: { _tag: "S3Error", cause } };
@@ -114,11 +161,13 @@ function s3Error(name: string, httpStatusCode: number) {
 describe("media processing workflows", () => {
 	beforeEach(() => {
 		mocks.hookDispose.mockReset();
-		mocks.createHook.mockReset().mockImplementation(() => ({
-			then: (resolve: (value: unknown) => void) =>
-				resolve({ phase: "complete" }),
-			dispose: mocks.hookDispose,
-		}));
+		mocks.createHook
+			.mockReset()
+			.mockImplementation(() =>
+				Object.assign(Promise.resolve({ phase: "complete" }), {
+					dispose: mocks.hookDispose,
+				}),
+			);
 		mocks.rows = [];
 		mocks.env = {};
 		mocks.loomSourceUrl = "https://cdn.loom.com/original.mp4";
@@ -176,14 +225,15 @@ describe("media processing workflows", () => {
 
 	it("dispatches an uploaded recording once while completion is delayed", async () => {
 		mocks.rows = [
-			[video],
-			[{ ...pending, rawFileKey: payload.rawFileKey }],
-			[video],
+			[processingVideo],
+			[processingVideo],
+			[processingVideo],
 			[pending],
+			[processingVideo],
 			[pending],
-			[],
-			[metadata],
-			[video],
+			[completeVideo],
+			[completeVideo],
+			[completeVideo],
 			[],
 		];
 		await expect(processVideoWorkflow(payload)).resolves.toMatchObject({
@@ -191,14 +241,14 @@ describe("media processing workflows", () => {
 			metadata,
 		});
 		expect(mocks.fetch).toHaveBeenCalledOnce();
-		expect(mocks.sleep.mock.calls).toEqual([[5_000], [10_000]]);
-		expect(mocks.remove).toHaveBeenCalledWith(payload.rawFileKey);
+		expect(mocks.sleep.mock.calls).toEqual([[5000], [10000]]);
+		expect(mocks.remove).not.toHaveBeenCalled();
 	});
-
 	it("marks deferred Loom originals so the worker accepts their decoder glitches", async () => {
-		const loomVideo = {
-			...video,
+		const deferred = {
+			...processingVideo,
 			metadata: {
+				...processingVideo.metadata,
 				loomDeferredProcessing: {
 					status: "started",
 					rawFileKey: payload.rawFileKey,
@@ -206,31 +256,27 @@ describe("media processing workflows", () => {
 			},
 		};
 		mocks.rows = [
-			[loomVideo],
-			[{ ...pending, rawFileKey: payload.rawFileKey }],
-			[loomVideo],
-			[pending],
-			[],
-			[metadata],
-			[loomVideo],
+			[deferred],
+			[deferred],
+			[completeVideo],
+			[completeVideo],
+			[completeVideo],
 			[],
 		];
 		await expect(processVideoWorkflow(payload)).resolves.toMatchObject({
 			success: true,
 		});
-		const body = JSON.parse(String(mocks.fetch.mock.calls[0]?.[1]?.body));
-		expect(body.importedOriginal).toBe(true);
+		expect(
+			JSON.parse(String(mocks.fetch.mock.calls[0]?.[1]?.body)).importedOriginal,
+		).toBe(true);
 	});
-
 	it("checks ordinary uploads strictly", async () => {
 		mocks.rows = [
-			[video],
-			[{ ...pending, rawFileKey: payload.rawFileKey }],
-			[video],
-			[pending],
-			[],
-			[metadata],
-			[video],
+			[processingVideo],
+			[processingVideo],
+			[completeVideo],
+			[completeVideo],
+			[completeVideo],
 			[],
 		];
 		await expect(processVideoWorkflow(payload)).resolves.toMatchObject({
@@ -238,44 +284,42 @@ describe("media processing workflows", () => {
 		});
 		const body = JSON.parse(String(mocks.fetch.mock.calls[0]?.[1]?.body));
 		expect(body.importedOriginal).toBeUndefined();
+		expect(body.processingToken).toBe(processingRun.attemptId);
+		expect(body.processingOutputKey).toBe(processingRun.outputKey);
 	});
-
 	it("keeps uploaded source data when processing fails", async () => {
 		mocks.rows = [
-			[video],
-			[{ ...pending, rawFileKey: payload.rawFileKey }],
-			[video],
-			[{ ...pending, processingError: "Worker failed" }],
-			[video],
-			[{ ...pending, processingError: "Worker failed" }],
-			[video],
-			[{ ...pending, processingError: "Worker failed" }],
+			[processingVideo],
+			[processingVideo],
+			[failedVideo("Worker failed")],
+			[processingVideo],
+			[failedVideo("Worker failed")],
+			[processingVideo],
+			[failedVideo("Worker failed")],
 		];
 		await expect(processVideoWorkflow(payload)).rejects.toThrow(
 			"Worker failed",
 		);
 		expect(mocks.remove).not.toHaveBeenCalled();
 		expect(mocks.fetch).toHaveBeenCalledTimes(3);
-		expect(mocks.sleep.mock.calls).toEqual([[15_000], [30_000]]);
+		expect(mocks.sleep.mock.calls).toEqual([[15000], [30000]]);
 	});
-
 	it("recovers from a confirmed worker failure with a bounded durable retry", async () => {
 		mocks.rows = [
-			[video],
-			[{ ...pending, rawFileKey: payload.rawFileKey }],
-			[video],
-			[{ ...pending, processingError: "Temporary storage failure" }],
-			[video],
-			[],
-			[metadata],
-			[video],
+			[processingVideo],
+			[processingVideo],
+			[failedVideo("Temporary storage failure")],
+			[processingVideo],
+			[completeVideo],
+			[completeVideo],
+			[completeVideo],
 			[],
 		];
 		await expect(processVideoWorkflow(payload)).resolves.toMatchObject({
 			success: true,
 		});
 		expect(mocks.fetch).toHaveBeenCalledTimes(2);
-		expect(mocks.sleep.mock.calls).toEqual([[15_000]]);
+		expect(mocks.sleep.mock.calls).toEqual([[15000]]);
 	});
 
 	it("sends Loom media directly to the worker with a required original destination", async () => {

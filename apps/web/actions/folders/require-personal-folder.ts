@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { folders } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { folders } from "@cap/database/cloudflare/schema";
 import type { Folder, Organisation, User } from "@cap/web-domain";
 import { and, eq, isNull } from "drizzle-orm";
 

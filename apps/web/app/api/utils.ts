@@ -1,14 +1,14 @@
-import { db } from "@cap/database";
 import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	authApiKeys,
 	developerApiKeys,
 	developerAppDomains,
 	developerApps,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { buildEnv } from "@cap/env";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Context } from "hono";

@@ -1,7 +1,7 @@
 import "server-only";
 
-import { db } from "@cap/database";
-import { organizations, users } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations, users } from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
 import type { Organisation, User } from "@cap/web-domain";
 import { eq } from "drizzle-orm";

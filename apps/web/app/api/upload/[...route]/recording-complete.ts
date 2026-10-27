@@ -1,5 +1,6 @@
-import { db } from "@cap/database";
-import * as Db from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import * as Db from "@cap/database/cloudflare/schema";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { Video } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
 import { and, eq } from "drizzle-orm";
@@ -35,7 +36,13 @@ export const app = new Hono().post(
 		const [video] = await db()
 			.select()
 			.from(Db.videos)
-			.where(and(eq(Db.videos.id, videoId), eq(Db.videos.ownerId, user.id)));
+			.where(
+				and(
+					writableVideo,
+					eq(Db.videos.id, videoId),
+					eq(Db.videos.ownerId, user.id),
+				),
+			);
 
 		if (!video) {
 			return c.json({ error: "Video not found" }, 404);

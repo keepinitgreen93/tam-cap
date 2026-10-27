@@ -2,18 +2,15 @@ import {
 	CloudFrontClient,
 	CreateInvalidationCommand,
 } from "@aws-sdk/client-cloudfront";
-import type { db } from "@cap/database";
-import {
-	videoProcessingJobs,
-	videos,
-	videoUploads,
-} from "@cap/database/schema";
+import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
+import type { TranscriptPublication } from "@cap/database/cloudflare/transcript-publication";
 import { serverEnv } from "@cap/env";
 import { AwsCredentials } from "@cap/web-backend";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
-import { retireDesktopRecordingJobForOutputReplacement } from "@/lib/desktop-recording-jobs";
 import {
 	assertDesktopReuploadTarget,
 	type DesktopReuploadToken,
@@ -26,20 +23,17 @@ type ReuploadedVideo = Pick<
 >;
 
 export async function prepareDesktopReupload(
-	tx: Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0],
+	snapshot: AtomicSnapshot,
 	video: ReuploadedVideo,
 	token: DesktopReuploadToken,
+	transcriptPublication: TranscriptPublication,
 ) {
-	await tx
-		.select({ videoId: videoProcessingJobs.videoId })
-		.from(videoProcessingJobs)
-		.where(eq(videoProcessingJobs.videoId, video.id))
-		.for("update");
-	const [locked] = await tx
-		.select()
-		.from(videos)
-		.where(eq(videos.id, video.id))
-		.for("update");
+	const [locked] = await snapshot.read((reader) =>
+		reader
+			.select()
+			.from(videos)
+			.where(and(writableVideo, eq(videos.id, video.id))),
+	);
 	if (
 		!locked ||
 		locked.id !== video.id ||
@@ -60,23 +54,26 @@ export async function prepareDesktopReupload(
 	) {
 		return null;
 	}
-	const [upload] = await tx
-		.select({ rawFileKey: videoUploads.rawFileKey })
-		.from(videoUploads)
-		.where(eq(videoUploads.videoId, video.id))
-		.for("update");
+	const [upload] = await snapshot.read((reader) =>
+		reader
+			.select({ rawFileKey: videoUploads.rawFileKey })
+			.from(videoUploads)
+			.where(eq(videoUploads.videoId, video.id)),
+	);
 	if (upload?.rawFileKey !== token.outputKey) {
 		throw new Error("Replacement upload was canceled or superseded");
 	}
-	await retireDesktopRecordingJobForOutputReplacement(tx, {
-		videoId: video.id,
-		userId: video.ownerId,
-	});
+
 	const metadata = { ...(locked.metadata ?? {}) };
 	delete metadata.desktopRecordingUpload;
 	delete metadata.summary;
 	delete metadata.chapters;
 	delete metadata.aiGenerationStatus;
+	delete metadata.transcriptionRun;
+	delete metadata.editTranscriptBackfill;
+	delete metadata.liveTranscript;
+	delete metadata.processingRun;
+	metadata.transcriptPublication = transcriptPublication;
 	Reflect.deleteProperty(metadata, "editProcessing");
 	Reflect.deleteProperty(metadata, "completedVideoEdit");
 	return {

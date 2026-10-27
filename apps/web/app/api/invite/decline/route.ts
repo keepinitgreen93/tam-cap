@@ -1,18 +1,8 @@
-import { db } from "@cap/database";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { releaseProSeatSubscription } from "@cap/database/pro-seat-subscription";
-import {
-	organizationInvites,
-	organizationMembers,
-	spaceMembers,
-	spaces,
-	users,
-} from "@cap/database/schema";
-import { Organisation } from "@cap/web-domain";
-import { and, eq, inArray } from "drizzle-orm";
+import { db } from "@cap/database/cloudflare/application";
+import { resolveCloudflareInvite } from "@cap/database/cloudflare/team";
 import { type NextRequest, NextResponse } from "next/server";
-
 export async function POST(request: NextRequest) {
 	const user = isCrossSiteCookieWrite(request) ? null : await getCurrentUser();
 	if (!user) {
@@ -34,90 +24,20 @@ export async function POST(request: NextRequest) {
 	}
 
 	try {
-		await db().transaction(async (tx) => {
-			const [invite] = await tx
-				.select()
-				.from(organizationInvites)
-				.where(eq(organizationInvites.id, inviteId))
-				.for("update");
-
-			if (!invite) {
-				throw new Error("INVITE_NOT_FOUND");
-			}
-
-			if (user.email.toLowerCase() !== invite.invitedEmail.toLowerCase()) {
-				throw new Error("EMAIL_MISMATCH");
-			}
-
-			const [membership] = await tx
-				.select({
-					id: organizationMembers.id,
-					hasProSeat: organizationMembers.hasProSeat,
-				})
-				.from(organizationMembers)
-				.where(
-					and(
-						eq(organizationMembers.organizationId, invite.organizationId),
-						eq(organizationMembers.userId, user.id),
-					),
-				)
-				.limit(1)
-				.for("update");
-
-			if (membership) {
-				await tx
-					.delete(organizationMembers)
-					.where(eq(organizationMembers.id, membership.id));
-
-				if (membership.hasProSeat) {
-					await releaseProSeatSubscription(tx, user.id);
-				}
-
-				const organizationSpaces = await tx
-					.select({ id: spaces.id })
-					.from(spaces)
-					.where(eq(spaces.organizationId, invite.organizationId));
-				const spaceIds = organizationSpaces.map((space) => space.id);
-
-				if (spaceIds.length > 0) {
-					await tx
-						.delete(spaceMembers)
-						.where(
-							and(
-								eq(spaceMembers.userId, user.id),
-								inArray(spaceMembers.spaceId, spaceIds),
-							),
-						);
-				}
-
-				const [remainingMembership] = await tx
-					.select({ organizationId: organizationMembers.organizationId })
-					.from(organizationMembers)
-					.where(eq(organizationMembers.userId, user.id))
-					.limit(1);
-
-				const userUpdate: Partial<typeof users.$inferInsert> = {};
-				if (user.activeOrganizationId === invite.organizationId) {
-					userUpdate.activeOrganizationId =
-						remainingMembership?.organizationId ??
-						Organisation.OrganisationId.make("");
-				}
-				if (user.defaultOrgId === invite.organizationId) {
-					userUpdate.defaultOrgId = remainingMembership?.organizationId ?? null;
-				}
-				if (Object.keys(userUpdate).length > 0) {
-					await tx.update(users).set(userUpdate).where(eq(users.id, user.id));
-				}
-			}
-
-			await tx
-				.delete(organizationInvites)
-				.where(eq(organizationInvites.id, inviteId));
+		await resolveCloudflareInvite(db(), {
+			userId: user.id,
+			inviteId,
+			accept: false,
 		});
 
 		return NextResponse.json({ success: true });
 	} catch (error) {
 		if (error instanceof Error) {
+			if (error.message === "INVITE_EXPIRED")
+				return NextResponse.json(
+					{ error: "Invitation has expired or was revoked" },
+					{ status: 400 },
+				);
 			if (error.message === "INVITE_NOT_FOUND") {
 				return NextResponse.json(
 					{ error: "Invite not found" },

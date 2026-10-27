@@ -62,6 +62,12 @@ function logProviderError(
 	selection: AiModelSelection,
 	error: unknown,
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare") {
+		console.error(`[ai] Cloudflare generation failed for the "${role}" role`, {
+			status: APICallError.isInstance(error) ? error.statusCode : undefined,
+		});
+		return;
+	}
 	// APICallError.responseBody captures provider error details (eg. the
 	// AssemblyAI gateway's request_id) that the message alone omits.
 	const responseBody = APICallError.isInstance(error)

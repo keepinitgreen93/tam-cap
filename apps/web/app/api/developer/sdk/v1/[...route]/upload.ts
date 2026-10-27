@@ -1,17 +1,18 @@
-import { db } from "@cap/database";
-import { nanoId } from "@cap/database/helpers";
-import {
-	developerCreditAccounts,
-	developerCreditTransactions,
-	developerVideos,
-} from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { developerVideos } from "@cap/database/cloudflare/schema";
+import { buildEnv } from "@cap/env";
 import { provideOptionalAuth, S3Buckets } from "@cap/web-backend";
 import { zValidator } from "@hono/zod-validator";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { Hono } from "hono";
 import { z } from "zod";
+import {
+	finishDeveloperUpload,
+	reserveDeveloperUpload,
+} from "@/lib/developer-usage";
 import { runPromise } from "@/lib/server";
+import { hasCompleteRecordingParts, matchesCompletedRecordingParts } from "@/lib/recording-multipart-integrity";
 import { withDeveloperPublicAuth } from "../../../../utils";
 
 const MICRO_CREDITS_PER_MINUTE = 5_000;
@@ -44,7 +45,9 @@ app.post(
 				s3Key: developerVideos.s3Key,
 			})
 			.from(developerVideos)
-			.where(eq(developerVideos.id, videoId))
+			.where(
+				and(eq(developerVideos.id, videoId), isNull(developerVideos.deletedAt)),
+			)
 			.limit(1);
 
 		if (!video || video.appId !== appId) {
@@ -111,7 +114,9 @@ app.post(
 				s3Key: developerVideos.s3Key,
 			})
 			.from(developerVideos)
-			.where(eq(developerVideos.id, videoId))
+			.where(
+				and(eq(developerVideos.id, videoId), isNull(developerVideos.deletedAt)),
+			)
 			.limit(1);
 
 		if (!video || video.appId !== appId) {
@@ -167,6 +172,7 @@ app.post(
 		const { videoId, uploadId, parts, durationInSecs, width, height, fps } =
 			c.req.valid("json");
 
+		if (!hasCompleteRecordingParts(parts)) return c.json({error:"Invalid multipart manifest"},400);
 		const clampedDuration = Math.min(durationInSecs, MAX_DURATION_SECS);
 
 		const [video] = await db()
@@ -176,7 +182,9 @@ app.post(
 				s3Key: developerVideos.s3Key,
 			})
 			.from(developerVideos)
-			.where(eq(developerVideos.id, videoId))
+			.where(
+				and(eq(developerVideos.id, videoId), isNull(developerVideos.deletedAt)),
+			)
 			.limit(1);
 
 		if (!video || video.appId !== appId) {
@@ -197,75 +205,29 @@ app.post(
 				MAX_DURATION_SECS,
 			);
 			const durationMinutes = billingDuration / 60;
-			const microCreditsToDebit = Math.floor(
-				durationMinutes * MICRO_CREDITS_PER_MINUTE,
-			);
+			const microCreditsToDebit =
+				buildEnv.NEXT_PUBLIC_IS_CAP === "true"
+					? Math.floor(durationMinutes * MICRO_CREDITS_PER_MINUTE)
+					: 0;
 
-			if (microCreditsToDebit > 0) {
-				const debited = await db().transaction(async (tx) => {
-					const [account] = await tx
-						.select({
-							id: developerCreditAccounts.id,
-							balanceMicroCredits: developerCreditAccounts.balanceMicroCredits,
-						})
-						.from(developerCreditAccounts)
-						.where(eq(developerCreditAccounts.appId, appId))
-						.limit(1);
-
-					if (!account) return null;
-
-					const [result] = await tx
-						.update(developerCreditAccounts)
-						.set({
-							balanceMicroCredits: sql`${developerCreditAccounts.balanceMicroCredits} - ${microCreditsToDebit}`,
-						})
-						.where(
-							and(
-								eq(developerCreditAccounts.id, account.id),
-								sql`${developerCreditAccounts.balanceMicroCredits} >= ${microCreditsToDebit}`,
-							),
-						);
-
-					const affectedRows =
-						(result as unknown as { affectedRows?: number })?.affectedRows ?? 0;
-					if (affectedRows === 0) {
-						return false;
-					}
-
-					const [updated] = await tx
-						.select({
-							balanceMicroCredits: developerCreditAccounts.balanceMicroCredits,
-						})
-						.from(developerCreditAccounts)
-						.where(eq(developerCreditAccounts.id, account.id))
-						.limit(1);
-
-					if (!updated) return false;
-
-					await tx.insert(developerCreditTransactions).values({
-						id: nanoId(),
-						accountId: account.id,
-						type: "video_create",
-						amountMicroCredits: -microCreditsToDebit,
-						balanceAfterMicroCredits: updated.balanceMicroCredits,
-						referenceId: videoId,
-						referenceType: "developer_video",
-						metadata: {
-							durationSeconds: billingDuration,
-							totalBytes,
-						},
-					});
-
-					return true;
-				});
-
-				if (debited === null) {
-					return c.json({ error: "Credit account not found" }, 402);
-				}
-				if (!debited) {
-					return c.json({ error: "Insufficient credits" }, 402);
-				}
-			}
+			const reservation = await reserveDeveloperUpload(db(), {
+				appId,
+				videoId,
+				uploadId,
+				amount: microCreditsToDebit,
+				durationSeconds: billingDuration,
+				totalBytes,
+			});
+			if (reservation === "missing")
+				return c.json({ error: "Credit account or video not found" }, 404);
+			if (reservation === "insufficient")
+				return c.json({ error: "Insufficient credits" }, 402);
+			if (reservation === "conflict")
+				return c.json(
+					{ error: "Upload does not match the reserved completion" },
+					409,
+				);
+			if (reservation === "complete") return c.json({ success: true });
 
 			await Effect.gen(function* () {
 				const [bucket] = yield* S3Buckets.getBucketAccess(Option.none());
@@ -278,22 +240,18 @@ app.post(
 					ETag: part.etag,
 				}));
 
-				yield* bucket.multipart.complete(s3Key, uploadId, {
-					MultipartUpload: { Parts: formattedParts },
-				});
+				yield* bucket.multipart.complete(s3Key,uploadId,{MultipartUpload:{Parts:formattedParts}}).pipe(Effect.catchAll((error)=>bucket.headObject(s3Key).pipe(Effect.flatMap((head)=>matchesCompletedRecordingParts(head,parts)?Effect.void:Effect.fail(error)))));
 			}).pipe(provideOptionalAuth, runPromise);
 
-			const updates: Partial<typeof developerVideos.$inferInsert> = {
+			await finishDeveloperUpload(db(), {
+				appId,
+				videoId,
+				uploadId,
 				duration: clampedDuration,
-			};
-			if (width !== undefined) updates.width = width;
-			if (height !== undefined) updates.height = height;
-			if (fps !== undefined) updates.fps = fps;
-
-			await db()
-				.update(developerVideos)
-				.set(updates)
-				.where(eq(developerVideos.id, videoId));
+				width,
+				height,
+				fps,
+			});
 
 			return c.json({ success: true });
 		} catch (error) {
@@ -323,7 +281,9 @@ app.post(
 				s3Key: developerVideos.s3Key,
 			})
 			.from(developerVideos)
-			.where(eq(developerVideos.id, videoId))
+			.where(
+				and(eq(developerVideos.id, videoId), isNull(developerVideos.deletedAt)),
+			)
 			.limit(1);
 
 		if (!video || video.appId !== appId) {

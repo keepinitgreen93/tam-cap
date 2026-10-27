@@ -1,14 +1,24 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
 import { revalidatePath } from "next/cache";
 import { runPromise } from "@/lib/server";
+import {
+	metadataWithTranscriptPublication,
+	type PreparedTranscriptPublication,
+	prepareTranscriptPublication,
+	readTranscriptArtifacts,
+	readTranscriptPublicationOutcome,
+	TranscriptPublicationConflictError,
+} from "@/lib/transcript-publication";
 import { updateVttEntryText } from "@/lib/transcript-vtt";
 import { decodeStorageVideo } from "@/lib/video-storage";
 
@@ -54,27 +64,54 @@ export async function editTranscriptEntry(
 		decodeStorageVideo(video),
 	).pipe(runPromise);
 
+	const store = {
+		getText: async (key: string) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runPromise)),
+		put: (key: string, value: string, contentType: string) =>
+			bucket.putObject(key, value, { contentType }).pipe(runPromise),
+		delete: (key: string) => bucket.deleteObject(key).pipe(runPromise),
+	};
+	let prepared: PreparedTranscriptPublication | undefined;
 	try {
-		const transcriptKey = `${video.ownerId}/${videoId}/transcription.vtt`;
-
-		const vttContent = await bucket.getObject(transcriptKey).pipe(runPromise);
-		if (Option.isNone(vttContent))
+		const artifacts = await readTranscriptArtifacts(video, store);
+		if (artifacts.vtt === null)
 			return { success: false, message: "Transcript file not found" };
-
 		const { content: updatedVttContent, updated } = updateVttEntryText(
-			vttContent.value,
+			artifacts.vtt,
 			entryId,
 			newText,
 		);
-		if (!updated) {
+		if (!updated)
 			return { success: false, message: "Transcript entry not found" };
-		}
-
-		await bucket
-			.putObject(transcriptKey, updatedVttContent, {
-				contentType: "text/vtt",
-			})
-			.pipe(runPromise);
+		prepared = await prepareTranscriptPublication({
+			video,
+			store,
+			vtt: updatedVttContent,
+			editTranscript: artifacts.editTranscript,
+		});
+		const candidate = prepared;
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			const [current] = await snapshot.read((reader) =>
+				reader.select().from(videos).where(eq(videos.id, videoId)),
+			);
+			if (!current || current.ownerId !== user.id)
+				throw new TranscriptPublicationConflictError();
+			if (current.orgId)
+				await requireActiveOrganization(snapshot, current.orgId);
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({
+							metadata: metadataWithTranscriptPublication(current, candidate),
+							transcriptionStatus: "COMPLETE",
+						})
+						.where(eq(videos.id, videoId)),
+				],
+				result: undefined,
+			};
+		});
 
 		revalidatePath(`/s/${videoId}`);
 
@@ -83,6 +120,16 @@ export async function editTranscriptEntry(
 			message: "Transcript entry updated successfully",
 		};
 	} catch (error) {
+		if (prepared) {
+			const outcome = await readTranscriptPublicationOutcome(db(), prepared);
+			if (outcome.state === "published") {
+				revalidatePath(`/s/${videoId}`);
+				return {
+					success: true,
+					message: "Transcript entry updated successfully",
+				};
+			}
+		}
 		console.error("Error updating transcript entry:", {
 			error: error instanceof Error ? error.message : error,
 			videoId,

@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { STRIPE_AVAILABLE } from "@cap/utils";
-import { type ImageUpload, Organisation, User } from "@cap/web-domain";
+
+import type { ImageUpload, User } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
-import type { MySql2Database } from "drizzle-orm/mysql2";
 import type { Adapter } from "next-auth/adapters";
-import { nanoId } from "../helpers.ts";
-import { enqueueLoopsSync } from "../loops/queue.ts";
+import { atomic } from "../cloudflare/atomic.ts";
+import type { CloudflareDatabase } from "../cloudflare/index.ts";
+import { loopsSyncStatements } from "../cloudflare/loops.ts";
 import {
 	accounts,
 	organizationInvites,
@@ -14,35 +14,19 @@ import {
 	sessions,
 	users,
 	verificationTokens,
-} from "../schema.ts";
+} from "../cloudflare/schema.ts";
+import { createCloudflareUser } from "../cloudflare/team.ts";
+import { nanoId } from "../helpers.ts";
+import { cloudflareAccessPolicy, normalizeEmail } from "./identity.ts";
 import type { ValidatedSsoIdentity } from "./sso.ts";
-import { provisionStripeCustomer } from "./stripe-customer.ts";
-
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
 
 type CreateUserData = Parameters<NonNullable<Adapter["createUser"]>>[0];
 type LinkAccountData = Parameters<NonNullable<Adapter["linkAccount"]>>[0];
 type UnlinkAccountData = Parameters<NonNullable<Adapter["unlinkAccount"]>>[0];
 type UpdateSessionData = Parameters<NonNullable<Adapter["updateSession"]>>[0];
 
-function getProvisionedUserName(email: string) {
-	return (
-		email
-			.split("@")[0]
-			?.replace(/[._-]+/g, " ")
-			.trim() || email
-	);
-}
-
 async function hasPendingProvisionedInvite(
-	db: MySql2Database,
+	db: CloudflareDatabase,
 	userId: User.UserId,
 	email: string,
 ) {
@@ -70,7 +54,7 @@ async function hasPendingProvisionedInvite(
 	return !!pendingInviteMember;
 }
 
-async function hasLinkedAccount(db: MySql2Database, userId: User.UserId) {
+async function hasLinkedAccount(db: CloudflareDatabase, userId: User.UserId) {
 	const [linkedAccount] = await db
 		.select({ id: accounts.id })
 		.from(accounts)
@@ -81,147 +65,30 @@ async function hasLinkedAccount(db: MySql2Database, userId: User.UserId) {
 }
 
 export function DrizzleAdapter(
-	db: MySql2Database,
+	db: CloudflareDatabase,
 	options?: { getSsoIdentity: () => ValidatedSsoIdentity | null },
 ): Adapter {
 	return {
 		async createUser(userData: CreateUserData) {
-			const normalizedEmail = userData.email.toLowerCase();
-			const ssoIdentity = options?.getSsoIdentity();
-			if (ssoIdentity && ssoIdentity.email !== normalizedEmail) {
+			const identity = options?.getSsoIdentity();
+			if (
+				identity &&
+				normalizeEmail(identity.email) !== normalizeEmail(userData.email)
+			)
 				throw new Error("The user does not match the verified SSO identity.");
-			}
-			let userId = User.UserId.make(nanoId());
-			await db.transaction(async (tx) => {
-				if (ssoIdentity) {
-					const [organization] = await tx
-						.select({ id: organizations.id })
-						.from(organizations)
-						.where(eq(organizations.id, ssoIdentity.organizationId))
-						.for("update");
-					if (!organization) throw new Error("SSO organization not found.");
-				}
-				const [existingUser] = await tx
-					.select()
-					.from(users)
-					.where(eq(users.email, normalizedEmail))
-					.limit(1);
-
-				if (existingUser) {
-					userId = existingUser.id;
-					const userUpdate: Partial<typeof users.$inferInsert> = {};
-
-					if (!existingUser.name && userData.name) {
-						userUpdate.name = userData.name;
-					}
-					if (!existingUser.name && !userData.name) {
-						userUpdate.name = getProvisionedUserName(normalizedEmail);
-					}
-					if (!existingUser.emailVerified && userData.emailVerified) {
-						userUpdate.emailVerified = userData.emailVerified;
-					}
-					if (!existingUser.image && userData.image) {
-						userUpdate.image = userData.image as ImageUpload.ImageUrlOrKey;
-					}
-
-					if (Object.keys(userUpdate).length > 0) {
-						await tx.update(users).set(userUpdate).where(eq(users.id, userId));
-					}
-
-					await enqueueLoopsSync(tx, userId);
-					return;
-				}
-
-				const [pendingInvite] = await tx
-					.select({ id: organizationInvites.id })
-					.from(organizationInvites)
-					.where(
-						and(
-							eq(organizationInvites.invitedEmail, normalizedEmail),
-							eq(organizationInvites.status, "pending"),
-						),
-					)
-					.limit(1);
-
-				const insertUser = tx.insert(users).values({
-					id: userId,
-					email: normalizedEmail,
-					emailVerified: userData.emailVerified,
-					name: userData.name,
-					image: userData.image as ImageUpload.ImageUrlOrKey | null,
-					activeOrganizationId: Organisation.OrganisationId.make(""),
-					marketingOrigin:
-						pendingInvite || ssoIdentity ? "teammate" : "independent",
-				});
-				if (ssoIdentity) {
-					await insertUser.onDuplicateKeyUpdate({
-						set: { email: normalizedEmail },
-					});
-					const [createdUser] = await tx
-						.select({ id: users.id })
-						.from(users)
-						.where(eq(users.email, normalizedEmail))
-						.limit(1);
-					if (!createdUser) throw new Error("User was not created.");
-					userId = createdUser.id;
-				} else {
-					await insertUser;
-				}
-
-				await enqueueLoopsSync(tx, userId);
-				if (pendingInvite || ssoIdentity) {
-					return;
-				}
-
-				const organizationId = Organisation.OrganisationId.make(nanoId());
-
-				await tx.insert(organizations).values({
-					id: organizationId,
-					ownerId: userId,
-					name: "My Organization",
-				});
-
-				await tx.insert(organizationMembers).values({
-					id: nanoId(),
-					organizationId,
-					userId,
-					role: "owner",
-				});
-
-				await tx
-					.update(users)
-					.set({
-						activeOrganizationId: organizationId,
-						defaultOrgId: organizationId,
-					})
-					.where(eq(users.id, userId));
-			});
-
-			const rows = await db
-				.select()
-				.from(users)
-				.where(eq(users.id, userId))
-				.limit(1);
-			let row = rows[0];
-			if (!row) throw new Error("User not found");
-
-			if (STRIPE_AVAILABLE() && !ssoIdentity) {
-				row = await provisionStripeCustomer(db, row);
-			}
-
-			return row;
+			return createCloudflareUser(db, userData, cloudflareAccessPolicy());
 		},
 		async getUser(id) {
 			const rows = await db
 				.select()
 				.from(users)
-				.where(eq(users.id, User.UserId.make(id)))
+				.where(eq(users.id, id as User.UserId))
 				.limit(1);
 			const row = rows[0];
 			return row ?? null;
 		},
 		async getUserByEmail(email) {
-			const normalizedEmail = email?.toLowerCase() ?? "";
+			const normalizedEmail = normalizeEmail(email);
 			const rows = await db
 				.select()
 				.from(users)
@@ -259,90 +126,102 @@ export function DrizzleAdapter(
 		},
 		async updateUser({ id, image, ...userData }) {
 			if (!id) throw new Error("User not found");
-			await db.transaction(async (tx) => {
-				await tx
-					.update(users)
-					.set({
-						...userData,
-						image: image as ImageUpload.ImageUrlOrKey | null,
-					})
-					.where(eq(users.id, User.UserId.make(id)));
-				await enqueueLoopsSync(tx, User.UserId.make(id));
-			});
-			const rows = await db
+			const update = db
+				.update(users)
+				.set({
+					...userData,
+					...(userData.email ? { email: normalizeEmail(userData.email) } : {}),
+					image: image as ImageUpload.ImageUrlOrKey | null,
+				})
+				.where(eq(users.id, id as User.UserId));
+			await atomic(db, async () => ({
+				statements: [update, ...loopsSyncStatements(db, id as User.UserId)],
+				result: undefined,
+			}));
+			const [row] = await db
 				.select()
 				.from(users)
-				.where(eq(users.id, User.UserId.make(id)))
+				.where(eq(users.id, id as User.UserId))
 				.limit(1);
-			const row = rows[0];
 			if (!row) throw new Error("User not found");
 			return row;
 		},
 		async deleteUser(userId) {
-			await db.delete(users).where(eq(users.id, User.UserId.make(userId)));
+			await db.delete(users).where(eq(users.id, userId as User.UserId));
 		},
 		async linkAccount(account: LinkAccountData) {
-			if (account.provider === "workos") {
-				const identity = options?.getSsoIdentity();
-				if (!identity || identity.profileId !== account.providerAccountId) {
-					throw new Error("The SSO identity has not been verified.");
-				}
-				await db.transaction(async (tx) => {
-					await tx
-						.select({ id: organizations.id })
-						.from(organizations)
-						.where(eq(organizations.id, identity.organizationId))
-						.for("update");
-					const [user] = await tx
-						.select({ email: users.email })
+			const identity = options?.getSsoIdentity();
+			if (
+				account.provider === "workos" &&
+				(!identity || identity.profileId !== account.providerAccountId)
+			)
+				throw new Error("The SSO identity has not been verified.");
+			const accountId = createHash("sha256")
+				.update(`${account.provider}:${account.providerAccountId}`)
+				.digest("base64url")
+				.slice(0, 15);
+			await atomic(db, async (snapshot) => {
+				const [user] = await snapshot.read((reader) =>
+					reader
+						.select()
 						.from(users)
-						.where(eq(users.id, User.UserId.make(account.userId)))
-						.for("update");
-					if (user?.email.toLowerCase() !== identity.email) {
-						throw new Error("The SSO account belongs to a different user.");
-					}
-					const linked = await tx
-						.selectDistinct({ userId: accounts.userId })
+						.where(eq(users.id, account.userId as User.UserId))
+						.limit(1),
+				);
+				if (!user) throw new Error("User not found");
+				if (account.provider === "workos" && identity) {
+					const [organization] = await snapshot.read((reader) =>
+						reader
+							.select()
+							.from(organizations)
+							.where(eq(organizations.id, identity.organizationId))
+							.limit(1),
+					);
+					if (
+						!organization ||
+						organization.tombstoneAt ||
+						normalizeEmail(user.email) !== normalizeEmail(identity.email)
+					)
+						throw new Error(
+							"The SSO account belongs to a different user or unavailable organization.",
+						);
+				}
+				const linked = await snapshot.read((reader) =>
+					reader
+						.select({ userId: accounts.userId })
 						.from(accounts)
 						.where(
 							and(
-								eq(accounts.provider, "workos"),
-								eq(accounts.providerAccountId, identity.profileId),
+								eq(accounts.provider, account.provider),
+								eq(accounts.providerAccountId, account.providerAccountId),
 							),
 						)
-						.limit(2);
-					if (linked.some((row) => row.userId !== account.userId)) {
-						throw new Error(
-							"The SSO identity is already linked to another account.",
-						);
-					}
-					if (linked.length > 0) return;
-					await tx.insert(accounts).values({
-						id: createHash("sha256")
-							.update(`workos:${identity.profileId}`)
-							.digest("base64url")
-							.slice(0, 15),
-						userId: account.userId,
-						type: account.type,
-						provider: "workos",
-						providerAccountId: identity.profileId,
-					});
-				});
-				return;
-			}
-			await db.insert(accounts).values({
-				id: User.UserId.make(nanoId()),
-				userId: account.userId,
-				type: account.type,
-				provider: account.provider,
-				providerAccountId: account.providerAccountId,
-				access_token: account.access_token,
-				expires_in: account.expires_in as number,
-				id_token: account.id_token,
-				refresh_token: account.refresh_token,
-				refresh_token_expires_in: account.refresh_token_expires_in as number,
-				scope: account.scope,
-				token_type: account.token_type,
+						.limit(2),
+				);
+				if (linked.some((row) => row.userId !== account.userId))
+					throw new Error("The identity is already linked to another account.");
+				return {
+					statements: linked.length
+						? []
+						: [
+								db.insert(accounts).values({
+									id: accountId,
+									userId: account.userId,
+									type: account.type,
+									provider: account.provider,
+									providerAccountId: account.providerAccountId,
+									access_token: account.access_token,
+									expires_in: account.expires_in as number,
+									id_token: account.id_token,
+									refresh_token: account.refresh_token,
+									refresh_token_expires_in:
+										account.refresh_token_expires_in as number,
+									scope: account.scope,
+									token_type: account.token_type,
+								}),
+							],
+					result: undefined,
+				};
 			});
 		},
 		async unlinkAccount({ providerAccountId, provider }: UnlinkAccountData) {
@@ -360,7 +239,7 @@ export function DrizzleAdapter(
 				id: nanoId(),
 				expires: data.expires,
 				sessionToken: data.sessionToken,
-				userId: User.UserId.make(data.userId),
+				userId: data.userId as User.UserId,
 			});
 			const rows = await db
 				.select()
@@ -393,7 +272,7 @@ export function DrizzleAdapter(
 				user,
 				session: {
 					id: session.id,
-					userId: User.UserId.make(session.userId),
+					userId: session.userId as User.UserId,
 					sessionToken: session.sessionToken,
 					expires: session.expires,
 				},
@@ -402,8 +281,7 @@ export function DrizzleAdapter(
 		async updateSession(session: UpdateSessionData) {
 			const sessionUpdate: Partial<typeof sessions.$inferInsert> = {};
 			if (session.expires) sessionUpdate.expires = session.expires;
-			if (session.userId)
-				sessionUpdate.userId = User.UserId.make(session.userId);
+			if (session.userId) sessionUpdate.userId = session.userId as User.UserId;
 
 			if (Object.keys(sessionUpdate).length > 0) {
 				await db
@@ -423,49 +301,21 @@ export function DrizzleAdapter(
 		async deleteSession(sessionToken) {
 			await db.delete(sessions).where(eq(sessions.sessionToken, sessionToken));
 		},
-		async createVerificationToken(verificationToken) {
-			const normalizedIdentifier =
-				verificationToken.identifier?.toLowerCase() ?? "";
-			const existingTokens = await db
-				.select()
-				.from(verificationTokens)
-				.where(eq(verificationTokens.identifier, normalizedIdentifier))
-				.limit(1);
-
-			if (existingTokens.length > 0) {
-				await db
-					.update(verificationTokens)
-					.set({
-						token: verificationToken.token,
-						expires: verificationToken.expires,
-					})
-					.where(eq(verificationTokens.identifier, normalizedIdentifier));
-
-				return await db
-					.select()
-					.from(verificationTokens)
-					.where(eq(verificationTokens.identifier, normalizedIdentifier))
-					.limit(1)
-					.then((rows) => rows[0]);
-			}
-
-			await db.insert(verificationTokens).values({
-				expires: verificationToken.expires,
-				identifier: normalizedIdentifier,
-				token: verificationToken.token,
-			});
-
-			const rows = await db
-				.select()
-				.from(verificationTokens)
-				.where(eq(verificationTokens.token, verificationToken.token))
-				.limit(1);
-			const row = rows[0];
-			if (!row) throw new Error("Error: inserted verification token not found");
-			return row;
+		async createVerificationToken(input) {
+			const value = { ...input, identifier: normalizeEmail(input.identifier) };
+			const [token] = await db
+				.insert(verificationTokens)
+				.values(value)
+				.onConflictDoUpdate({
+					target: verificationTokens.identifier,
+					set: { token: value.token, expires: value.expires },
+				})
+				.returning();
+			if (!token) throw new Error("Verification token was not created");
+			return token;
 		},
 		async useVerificationToken({ identifier, token }) {
-			const normalizedIdentifier = identifier?.toLowerCase() ?? "";
+			const normalizedIdentifier = normalizeEmail(identifier);
 			const rows = await db
 				.select()
 				.from(verificationTokens)
@@ -490,7 +340,7 @@ export function DrizzleAdapter(
 						eq(verificationTokens.token, row.token),
 					),
 				);
-			if (getAffectedRows(result) !== 1) {
+			if (result.meta.changes !== 1) {
 				console.warn("[useVerificationToken] Token already consumed");
 				return null;
 			}

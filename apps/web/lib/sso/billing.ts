@@ -154,6 +154,8 @@ async function lockOrganization(
 export async function getSsoBilling(
 	organizationId: Organisation.OrganisationId,
 ): Promise<SsoBilling | null> {
+	if (process.env.CAP_RUNTIME === "cloudflare") return null;
+
 	const [record] = await db()
 		.select()
 		.from(organizationSso)
@@ -163,6 +165,8 @@ export async function getSsoBilling(
 }
 
 export async function getSsoBillingForSubscription(subscriptionId: string) {
+	if (process.env.CAP_RUNTIME === "cloudflare") return null;
+
 	const [record] = await db()
 		.select()
 		.from(organizationSso)
@@ -254,6 +258,11 @@ function sameBillingSnapshot(left: SsoBilling, right: SsoBilling) {
 export async function syncSsoSubscription(
 	subscriptionId: string,
 ): Promise<SsoBilling | null> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap Cloud SAML billing is unavailable on this self-hosted server.",
+		);
+
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const observed = await getSsoBillingForSubscription(subscriptionId);
 		const subscription = await stripe().subscriptions.retrieve(subscriptionId, {
@@ -415,6 +424,11 @@ export async function attachSsoCheckout(
 		userId: User.UserId;
 	},
 ): Promise<SsoBilling | null> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap Cloud SAML billing is unavailable on this self-hosted server.",
+		);
+
 	if (!sessionId.startsWith("cs_") || sessionId.length > 255) {
 		throw new Error("Invalid SAML SSO payment confirmation.");
 	}
@@ -463,6 +477,8 @@ export async function attachSsoCheckout(
 export async function getSsoPrices(
 	organizationId?: Organisation.OrganisationId,
 ): Promise<{ currency: SupportedCurrency; unitAmount: number }[]> {
+	if (process.env.CAP_RUNTIME === "cloudflare") return [];
+
 	const [price, billingCurrency] = await Promise.all([
 		stripe().prices.retrieve(checkoutPriceId(), {
 			expand: ["currency_options"],
@@ -630,6 +646,11 @@ async function clearFinishedCheckout(reserved: SsoBilling, sessionId: string) {
 export async function createSsoCheckout(
 	request: CheckoutInput,
 ): Promise<string> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap Cloud SAML billing is unavailable on this self-hosted server.",
+		);
+
 	if (!isSupportedCurrency(request.currency))
 		throw new Error("Unsupported billing currency.");
 	const owner = await getOwner(request.organizationId);
@@ -855,6 +876,11 @@ async function requireSsoBillingAccount(
 export async function createSsoBillingPortal(
 	organizationId: Organisation.OrganisationId,
 ): Promise<string> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap Cloud SAML billing is unavailable on this self-hosted server.",
+		);
+
 	const { customerId } = await requireSsoBillingAccount(organizationId);
 	const session = await stripe().billingPortal.sessions.create({
 		customer: customerId,
@@ -897,6 +923,11 @@ function invoicePdfUrl(value: string | null | undefined): string | null {
 export async function listSsoInvoices(
 	organizationId: Organisation.OrganisationId,
 ): Promise<SsoInvoices> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap Cloud SAML billing is unavailable on this self-hosted server.",
+		);
+
 	const { customerId, subscriptionId } =
 		await requireSsoBillingAccount(organizationId);
 	const result = await stripe().invoices.list({

@@ -1,16 +1,21 @@
-"use server";
+import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
+import { queueVideoTranscription } from "@/lib/queue-video-transcription";
+
+("use server");
 
 import {
 	CloudFrontClient,
 	CreateInvalidationCommand,
 } from "@aws-sdk/client-cloudfront";
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { AwsCredentials, Storage } from "@cap/web-backend";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Effect } from "effect";
 
 import { retireDesktopRecordingJobForOutputReplacement } from "@/lib/desktop-recording-jobs";
@@ -68,16 +73,20 @@ export async function invalidateVideoCache(videoId: string) {
 	if (!head.ETag || !head.ContentLength || head.ContentLength <= 0) {
 		throw new Error("Replacement recording has not finished uploading");
 	}
-	await db().transaction(async (tx) => {
-		await retireDesktopRecordingJobForOutputReplacement(tx, {
-			videoId: video.id,
-			userId: video.ownerId,
-		});
-		const [lockedVideo] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, video.id))
-			.for("update");
+	const database = db();
+	const transcriptPublication = createTranscriptInvalidation();
+	const retirement = retireDesktopRecordingJobForOutputReplacement(database, {
+		videoId: video.id,
+		userId: video.ownerId,
+	});
+	await atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [retirement];
+		const [lockedVideo] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(and(writableVideo, eq(videos.id, video.id))),
+		);
 		if (
 			!lockedVideo ||
 			lockedVideo.ownerId !== video.ownerId ||
@@ -88,18 +97,39 @@ export async function invalidateVideoCache(videoId: string) {
 		}
 		const metadata = { ...(lockedVideo.metadata ?? {}) };
 		delete metadata.desktopRecordingUpload;
-		await tx
-			.update(videos)
-			.set({
-				metadata,
-				source:
-					lockedVideo.source.type === "webMP4"
-						? { type: "webMP4" }
-						: { type: "desktopMP4" },
-			})
-			.where(eq(videos.id, video.id));
-		await tx.delete(videoUploads).where(eq(videoUploads.videoId, video.id));
+		delete metadata.transcriptionRun;
+		delete metadata.editTranscriptBackfill;
+		delete metadata.liveTranscript;
+		delete metadata.processingRun;
+		delete metadata.summary;
+		delete metadata.chapters;
+		delete metadata.aiGenerationStatus;
+		metadata.transcriptPublication = transcriptPublication;
+		statements.push(
+			database
+				.update(videos)
+				.set({
+					metadata,
+					transcriptionStatus: null,
+					source:
+						lockedVideo.source.type === "webMP4"
+							? { type: "webMP4" }
+							: { type: "desktopMP4" },
+				})
+				.where(eq(videos.id, video.id)),
+		);
+		statements.push(
+			database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
+		);
+		return { statements, result: undefined };
 	});
+
+	await queueVideoTranscription(video.id).catch((error) =>
+		console.warn("Replacement transcription could not be queued", {
+			videoId: video.id,
+			error,
+		}),
+	);
 
 	if (video.bucket) {
 		return;

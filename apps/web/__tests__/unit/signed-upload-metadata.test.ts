@@ -1,4 +1,7 @@
+import * as Db from "@cap/database/cloudflare/schema";
+import { Option } from "effect";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => {
 	const updateWhere = vi.fn(async () => undefined);
@@ -20,9 +23,29 @@ const mocks = vi.hoisted(() => {
 	return { db, updateSet, updateWhere };
 });
 
-vi.mock("@cap/database", () => ({
-	db: () => mocks.db,
-	updateIfDefined: (value: unknown, column: unknown) => value ?? column,
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () =>
+		createRecordingD1Model({
+			read: ({ table }) =>
+				table === Db.videos
+					? [
+							{
+								id: "video-1",
+								ownerId: "user-1",
+								orgId: "org-1",
+								bucket: null,
+								storageIntegrationId: null,
+							},
+						]
+					: table === Db.organizations
+						? [{ id: "org-1", ownerId: "user-1", tombstoneAt: null }]
+						: [],
+			apply: async (statements) => {
+				for (const statement of statements)
+					if (statement.operation === "update")
+						await mocks.db.update().set(statement.values).where();
+			},
+		}),
 }));
 
 vi.mock("@cap/database/auth/session", () => ({
@@ -60,7 +83,11 @@ vi.mock("@/lib/server", async () => {
 });
 
 vi.mock("@/lib/video-storage", () => ({
-	decodeStorageVideo: (video: unknown) => video,
+	decodeStorageVideo: (video: object) => ({
+		...video,
+		bucketId: Option.none(),
+		storageIntegrationId: Option.none(),
+	}),
 }));
 
 import { app } from "@/app/api/upload/[...route]/signed";

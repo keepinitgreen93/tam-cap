@@ -1,9 +1,9 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	developerApps,
 	developerCreditAccounts,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { buildEnv, serverEnv } from "@cap/env";
 import { STRIPE_DEVELOPER_CREDITS_PRODUCT_ID, stripe } from "@cap/utils";
 import { zValidator } from "@hono/zod-validator";
@@ -29,6 +29,14 @@ app.post(
 		}),
 	),
 	async (c) => {
+		if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true")
+			return c.json(
+				{
+					error:
+						"Cap Cloud credit purchases are unavailable on this self-hosted server",
+				},
+				403,
+			);
 		const user = c.get("user");
 		const { appId, amountCents } = c.req.valid("json");
 

@@ -1,7 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import { provideOptionalAuth, Storage, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -71,6 +71,12 @@ export async function getLiveTranscript(
 		};
 	}
 
+	if (!video.metadata?.liveTranscript)
+		return {
+			success: false,
+			stop: true,
+			message: "Live transcription is not active",
+		};
 	try {
 		const content = await Effect.gen(function* () {
 			const [bucket] = yield* Storage.getAccessForVideo(
@@ -78,7 +84,11 @@ export async function getLiveTranscript(
 			);
 
 			return yield* bucket.getObject(
-				getLiveTranscriptObjectKey(video.ownerId, videoId),
+				getLiveTranscriptObjectKey(
+					video.ownerId,
+					videoId,
+					video.metadata?.liveTranscript?.id,
+				),
 			);
 		}).pipe(runPromise);
 

@@ -1,11 +1,19 @@
-import { db } from "@cap/database";
-import { organizations, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	organizations,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
+import { claimTranscriptionRun } from "@cap/database/cloudflare/transcription-state";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
-import { and, eq, isNull } from "drizzle-orm";
-import { start } from "workflow/api";
+import { eq } from "drizzle-orm";
 import { transcribeVideoWorkflow } from "@/workflows/transcribe";
 import { isTranscriptionConfigured } from "./transcription-config";
+import {
+	dispatchTranscriptionRun,
+	resumeTranscriptionDispatch,
+} from "./transcription-dispatch";
 
 type TranscribeResult = {
 	success: boolean;
@@ -30,16 +38,6 @@ const TRANSCRIPTION_ALREADY_HANDLED_MESSAGE =
  * to it. Chunks stamp every ~10s; 3 minutes tolerates long retries without
  * letting a dead workflow block transcription forever. */
 const LIVE_CLAIM_FRESHNESS_MS = 3 * 60 * 1000;
-
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
 
 export async function transcribeVideo(
 	videoId: Video.VideoId,
@@ -81,6 +79,14 @@ export async function transcribeVideo(
 	}
 
 	const { video } = result;
+	if (video.ownerId !== userId)
+		return { success: false, message: "Video owner does not match" };
+	if (
+		video.transcriptionStatus === "PROCESSING" &&
+		video.metadata?.transcriptionRun &&
+		video.metadata.transcriptionRun.dispatch !== "accepted"
+	)
+		await resumeTranscriptionDispatch(videoId, video.metadata.transcriptionRun);
 
 	if (!video) {
 		return { success: false, message: "Video information is missing" };
@@ -130,7 +136,7 @@ export async function transcribeVideo(
 	// twice. A stale stamp means the workflow died - proceed normally. The
 	// live workflow's own full-pass fallback uses earlyFromSegments, which is
 	// exempt so it can never deadlock against its opener.
-	if (!options.earlyFromSegments) {
+	if (!options.earlyFromSegments && process.env.CAP_RUNTIME !== "cloudflare") {
 		const live = video.metadata?.liveTranscript;
 		const stampedAt = live?.updatedAt ? Date.parse(live.updatedAt) : Number.NaN;
 		if (
@@ -165,43 +171,23 @@ export async function transcribeVideo(
 	}
 
 	try {
-		const transitionResult = await db()
-			.update(videos)
-			.set({ transcriptionStatus: "PROCESSING" })
-			.where(and(eq(videos.id, videoId), isNull(videos.transcriptionStatus)));
-
-		if (getAffectedRows(transitionResult) === 0) {
-			return {
-				success: true,
-				message: TRANSCRIPTION_ALREADY_HANDLED_MESSAGE,
-			};
-		}
-
-		console.log(
-			`[transcribeVideo] Triggering transcription workflow for video ${videoId}`,
+		const claimed = await claimTranscriptionRun(
+			db(),
+			videoId,
+			video.ownerId,
+			options,
 		);
-
-		await start(transcribeVideoWorkflow, [
-			{
-				videoId,
-				userId,
-				aiGenerationEnabled,
-				...(options.earlyFromSegments ? { earlyFromSegments: true } : {}),
-			},
-		]);
-
-		return {
-			success: true,
-			message: "Transcription workflow started",
-		};
+		if (!claimed)
+			return { success: true, message: TRANSCRIPTION_ALREADY_HANDLED_MESSAGE };
+		await dispatchTranscriptionRun(
+			transcribeVideoWorkflow,
+			claimed.video,
+			aiGenerationEnabled,
+			options.earlyFromSegments,
+		);
+		return { success: true, message: "Transcription workflow started" };
 	} catch (error) {
 		console.error("[transcribeVideo] Failed to trigger workflow:", error);
-
-		await db()
-			.update(videos)
-			.set({ transcriptionStatus: null })
-			.where(eq(videos.id, videoId));
-
 		return {
 			success: false,
 			message: "Failed to start transcription workflow",

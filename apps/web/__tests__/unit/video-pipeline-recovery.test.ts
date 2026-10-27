@@ -7,11 +7,11 @@ const mockLoomImportRunState = vi.fn();
 const mockTranscribeVideo = vi.fn();
 const mockStartAiGeneration = vi.fn();
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: mockDb,
 }));
 
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", () => ({
 	importedVideos: {
 		id: "importedVideos.id",
 		orgId: "importedVideos.orgId",
@@ -48,7 +48,7 @@ vi.mock("@cap/database/schema", () => ({
 }));
 
 vi.mock("@cap/env", () => ({
-	buildEnv: { NEXT_PUBLIC_IS_CAP: true },
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" },
 }));
 
 vi.mock("drizzle-orm", () => ({
@@ -67,6 +67,9 @@ vi.mock("drizzle-orm", () => ({
 	})),
 }));
 
+vi.mock("@/lib/video-processing", () => ({
+	startVideoProcessingWorkflow: mockStart,
+}));
 vi.mock("workflow/api", () => ({
 	start: mockStart,
 }));
@@ -130,7 +133,7 @@ function makeUpdateChain(affectedRows: number) {
 	};
 	chain.update.mockReturnValue(chain);
 	chain.set.mockReturnValue(chain);
-	chain.where.mockResolvedValue([{ affectedRows }]);
+	chain.where.mockResolvedValue({ meta: { changes: affectedRows } });
 	return chain;
 }
 
@@ -161,7 +164,7 @@ const staleAt = new Date("2026-07-20T14:00:00.000Z");
 
 beforeEach(() => {
 	vi.clearAllMocks();
-	mockStart.mockResolvedValue({ runId: "run-1" });
+	mockStart.mockResolvedValue("started");
 	mockStartLoomImport.mockReset().mockResolvedValue(undefined);
 	mockLoomImportRunState.mockReset().mockResolvedValue("inactive");
 	mockTranscribeVideo.mockResolvedValue({
@@ -248,9 +251,10 @@ describe("recoverStalledVideoPipeline", () => {
 		const { recoverStalledVideoPipeline } = await import(
 			"@/lib/video-pipeline-recovery"
 		);
+		mockStart.mockResolvedValueOnce("already-processing");
 		const result = await recoverStalledVideoPipeline({ now, concurrency: 1 });
 
-		expect(mockStart).not.toHaveBeenCalled();
+		expect(mockStart).toHaveBeenCalledOnce();
 		expect(result.media.statuses).toEqual({ "already-claimed": 1 });
 	});
 
@@ -438,12 +442,12 @@ describe("recoverStalledVideoPipeline", () => {
 			or: [
 				{
 					and: [
-						{ isNull: "sql:JSON_EXTRACT(?, '$.aiGenerationStatus')" },
-						"sql:JSON_EXTRACT(?, '$.transcribeOnView') IS NULL",
+						{ isNull: "sql:json_extract(?, '$.aiGenerationStatus')" },
+						"sql:json_extract(?, '$.transcribeOnView') IS NULL",
 					],
 				},
 				{
-					left: "sql:JSON_UNQUOTE(JSON_EXTRACT(?, '$.aiGenerationStatus'))",
+					left: "sql:json_extract(?, '$.aiGenerationStatus')",
 					right: ["QUEUED", "PROCESSING"],
 				},
 			],

@@ -3,7 +3,17 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"test": "node --test worker.test.mjs",
-		"typecheck": "tsc -p tsconfig.json"
+		"test": "node --test worker.test.mjs runtime.test.mjs workflow-store.test.mjs",
+		"typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.runtime.json"
+	},
+	"dependencies": {
+		"@cloudflare/containers": "0.3.7",
+		"@fantasticfour/world-cloudflare": "2.4.3"
+	},
+	"overrides": {
+		"zod": "4.6.6"
+	},
+	"devDependencies": {
+		"@cloudflare/workers-types": "5.20261027.1"
 	}
 }

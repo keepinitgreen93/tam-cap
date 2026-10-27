@@ -1,10 +1,9 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import { videos, videoUploads } from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
 import { userIsPro } from "@cap/utils";
 import { Storage as StorageService } from "@cap/web-backend";
 import {
@@ -18,6 +17,8 @@ import { Effect, Option } from "effect";
 import { revalidatePath } from "next/cache";
 import { requirePersonalFolder } from "@/actions/folders/require-personal-folder";
 import { requireOrganizationAccess } from "@/actions/organization/authorization";
+import { createRecordingUpload } from "@/lib/create-recording-upload";
+import { ownedRecordingPlan } from "@/lib/recording-upload-state";
 import { runPromise } from "@/lib/server";
 
 const MAX_S3_DELETE_ATTEMPTS = 3;
@@ -209,38 +210,36 @@ export async function createVideoAndGetUploadUrl({
 				? `screenshot/screen-capture.${screenshotExtension}`
 				: "result.mp4"
 		}`;
-		const { presignedPostData, upload, bucketId, storageIntegrationId } =
-			await getVideoUploadPresignedUrl({
-				fileKey,
-				duration: duration?.toString(),
-				resolution,
-				videoCodec,
-				audioCodec,
-				userId: user.id,
-				organizationId: orgId,
-				videoTitle,
-			});
-
-		const videoData = {
-			id: idToUse,
-			name: videoTitle,
-			ownerId: user.id,
+		const writable = await StorageService.getWritableAccessForUser(
+			user.id,
 			orgId,
-			source: { type: "webMP4" as const },
-			isScreenshot,
-			bucket: Option.getOrNull(bucketId),
-			storageIntegrationId: Option.getOrNull(storageIntegrationId),
-			public: await getNewVideoPublic(orgId),
-			...(folderId ? { folderId } : {}),
-		};
-
-		await db().transaction(async (tx) => {
-			await tx.insert(videos).values(videoData);
-
-			if (supportsUploadProgress)
-				await tx.insert(videoUploads).values({
-					videoId: idToUse,
-				});
+		).pipe(runPromise);
+		const { presignedPostData, upload } = await createRecordingUpload({
+			user,
+			value: {
+				id: idToUse,
+				name: videoTitle,
+				ownerId: user.id,
+				orgId,
+				source: { type: "webMP4" },
+				isScreenshot,
+				bucket: Option.getOrNull(writable.bucketId),
+				storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
+				...(folderId ? { folderId } : {}),
+			},
+			initialUpload: supportsUploadProgress ? {} : undefined,
+			upload: (video) =>
+				getVideoUploadPresignedUrl({
+					fileKey,
+					duration: duration?.toString(),
+					resolution,
+					videoCodec,
+					audioCodec,
+					userId: user.id,
+					organizationId: orgId,
+					videoTitle,
+					video,
+				}),
 		});
 
 		revalidatePath("/dashboard/caps");
@@ -295,9 +294,13 @@ export async function deleteVideoResultFile({
 	};
 
 	try {
-		await db().transaction(async (tx) => {
-			await tx.delete(videoUploads).where(eq(videoUploads.videoId, videoId));
-		});
+		const database = db();
+		await ownedRecordingPlan(database, videoDomain, async () => ({
+			statements: [
+				database.delete(videoUploads).where(eq(videoUploads.videoId, videoId)),
+			],
+			result: undefined,
+		}));
 	} catch (error) {
 		console.error("video.result.delete.transaction_failure", {
 			...logContext,

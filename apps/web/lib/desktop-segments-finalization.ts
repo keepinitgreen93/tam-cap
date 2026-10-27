@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { users, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users, videos } from "@cap/database/cloudflare/schema";
 import type { User, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { start } from "workflow/api";

@@ -623,9 +623,11 @@ function useLazyTimelineThumbnails({
 export function EditVideoClient({
 	video,
 	hasExistingEdits,
+	silenceSourceRevision,
 }: {
 	video: EditableVideo;
 	hasExistingEdits: boolean;
+	silenceSourceRevision?: string | null;
 }) {
 	const router = useRouter();
 	const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -699,7 +701,7 @@ export function EditVideoClient({
 		() => getTimelineDisplaySplitPoints(state),
 		[state],
 	);
-	const playbackSrc = `/api/playlist?userId=${video.ownerId}&videoId=${video.id}&videoType=mp4`;
+	const playbackSrc = `/api/playlist?userId=${video.ownerId}&videoId=${video.id}&videoType=mp4${silenceSourceRevision ? `&revision=${silenceSourceRevision}` : ""}`;
 	const timelineThumbnailUrl = useTimelineCoverThumbnail(video.id);
 	const visibleThumbnailRange = useVisibleTimelineThumbnailRange({
 		scrollContainerRef,
@@ -1991,6 +1993,7 @@ export function EditVideoClient({
 
 			{video.transcriptionStatus === "COMPLETE" && (
 				<TranscriptSidebar
+					sourceRevision={silenceSourceRevision}
 					videoId={video.id}
 					videoRef={videoRef}
 					keepRanges={keepRanges}

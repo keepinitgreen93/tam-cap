@@ -6,7 +6,9 @@ const { select, from, where } = vi.hoisted(() => ({
 	where: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({ db: () => ({ select }) }));
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => ({ select }),
+}));
 
 import { getDesktopRecordingHealth } from "@/lib/desktop-recording-health";
 

@@ -14,7 +14,8 @@ type RecordingVideo = {
 };
 
 export function isInternalRecordingKey(key: string) {
-	return key.split("/")[2] === ".recording";
+	const segment = key.split("/")[2];
+	return segment === ".recording" || segment === ".transcripts";
 }
 
 export function getPublishedRecordingOutputKey(video: RecordingVideo) {

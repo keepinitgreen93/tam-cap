@@ -1,9 +1,9 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import type { Space, User, Video } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Array, Effect } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 
 export class SpacesRepo extends Effect.Service<SpacesRepo>()("SpacesRepo", {
 	effect: Effect.gen(function* () {

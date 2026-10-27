@@ -1,12 +1,13 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	organizationMembers,
 	organizations,
 	s3Buckets,
 	storageIntegrations,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { activeIntegration } from "@cap/web-backend/src/Storage/persistence";
 import type { Organisation, User } from "@cap/web-domain";
-import { and, desc, eq, isNull, or } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 
 const googleDriveProvider = "googleDrive";
 
@@ -68,6 +69,7 @@ export const getOrganizationGoogleDriveIntegration = async (
 		.where(
 			and(
 				eq(storageIntegrations.organizationId, organizationId),
+				activeIntegration,
 				eq(storageIntegrations.provider, googleDriveProvider),
 			),
 		)
@@ -89,6 +91,7 @@ export const getActiveOrganizationGoogleDriveIntegration = async (
 		.where(
 			and(
 				eq(storageIntegrations.organizationId, organizationId),
+				activeIntegration,
 				eq(storageIntegrations.provider, googleDriveProvider),
 				eq(storageIntegrations.active, true),
 				eq(storageIntegrations.status, "active"),
@@ -109,6 +112,7 @@ export const getOrganizationS3Bucket = async (
 		.where(
 			and(
 				eq(s3Buckets.organizationId, organizationId),
+				sql`exists (select 1 from ${organizations} where ${organizations.id} = ${s3Buckets.organizationId} and ${organizations.tombstoneAt} is null)`,
 				eq(s3Buckets.active, true),
 			),
 		)

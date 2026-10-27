@@ -1,15 +1,18 @@
 import { inspect } from "node:util";
-
-import { db, updateIfDefined } from "@cap/database";
-import * as Db from "@cap/database/schema";
+import { updateIfDefined } from "@cap/database/cloudflare";
+import { db } from "@cap/database/cloudflare/application";
+import type { AtomicStatement } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
 import { isInternalRecordingKey } from "@cap/web-backend/src/Storage/recording-output";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { Video } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
 import { and, eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { Hono } from "hono";
 import { z } from "zod";
+import { ownedRecordingPlan } from "@/lib/recording-upload-state";
 
 import { runPromise } from "@/lib/server";
 import { decodeStorageVideo } from "@/lib/video-storage";
@@ -49,7 +52,7 @@ app.post(
 							(s) =>
 								!s.includes("..") &&
 								!s.startsWith("/") &&
-								s.split("/")[0] !== ".recording",
+								![".recording", ".transcripts"].includes(s.split("/")[0] ?? ""),
 							"Invalid subpath",
 						),
 				)
@@ -65,7 +68,9 @@ app.post(
 			const [video] = await db()
 				.select()
 				.from(Db.videos)
-				.where(eq(Db.videos.id, Video.VideoId.make(videoId)));
+				.where(
+					and(writableVideo, eq(Db.videos.id, Video.VideoId.make(videoId))),
+				);
 
 			if (!video) return c.json({ error: "Video not found" }, 404);
 			if (video.ownerId !== user.id) return c.json({ error: "Forbidden" }, 403);
@@ -142,7 +147,12 @@ app.post(
 			const [video] = await db()
 				.select()
 				.from(Db.videos)
-				.where(eq(Db.videos.id, Video.VideoId.make(videoIdToUse)));
+				.where(
+					and(
+						writableVideo,
+						eq(Db.videos.id, Video.VideoId.make(videoIdToUse)),
+					),
+				);
 
 			if (!video) return c.json({ error: "Video not found" }, 404);
 			if (video.ownerId !== user.id) return c.json({ error: "Forbidden" }, 403);
@@ -185,7 +195,9 @@ app.post(
 
 			console.log("Presigned URL created successfully");
 
-			if (videoIdToUse) {
+			const database = db();
+			await ownedRecordingPlan(database, videoDomain, async () => {
+				const statements: AtomicStatement[] = [];
 				const videoId = Video.VideoId.make(videoIdToUse);
 				if (
 					durationInSecs !== undefined ||
@@ -193,28 +205,33 @@ app.post(
 					height !== undefined ||
 					fps !== undefined
 				)
-					await db()
-						.update(Db.videos)
-						.set({
-							duration: updateIfDefined(durationInSecs, Db.videos.duration),
-							width: updateIfDefined(width, Db.videos.width),
-							height: updateIfDefined(height, Db.videos.height),
-							fps: updateIfDefined(fps, Db.videos.fps),
-						})
-						.where(
-							and(eq(Db.videos.id, videoId), eq(Db.videos.ownerId, user.id)),
-						);
+					statements.push(
+						database
+							.update(Db.videos)
+							.set({
+								duration: updateIfDefined(durationInSecs, Db.videos.duration),
+								width: updateIfDefined(width, Db.videos.width),
+								height: updateIfDefined(height, Db.videos.height),
+								fps: updateIfDefined(fps, Db.videos.fps),
+							})
+							.where(
+								and(eq(Db.videos.id, videoId), eq(Db.videos.ownerId, user.id)),
+							),
+					);
 
 				const clientSupportsUploadProgress = isFromDesktopSemver(
 					c.req,
 					UPLOAD_PROGRESS_VERSION,
 				);
 				if (fileKey.endsWith("result.mp4") && clientSupportsUploadProgress)
-					await db()
-						.update(Db.videoUploads)
-						.set({ mode: "singlepart" })
-						.where(eq(Db.videoUploads.videoId, videoId));
-			}
+					statements.push(
+						database
+							.update(Db.videoUploads)
+							.set({ mode: "singlepart" })
+							.where(eq(Db.videoUploads.videoId, videoId)),
+					);
+				return { statements, result: undefined };
+			});
 
 			if (data.type === "s3Post") {
 				return c.json({

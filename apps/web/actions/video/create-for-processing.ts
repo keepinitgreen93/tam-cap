@@ -1,10 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { nanoId } from "@cap/database/helpers";
-import { videos, videoUploads } from "@cap/database/schema";
-import { getNewVideoPublic } from "@cap/database/video-sharing-default";
 import { userIsPro } from "@cap/utils";
 import { Storage as StorageService } from "@cap/web-backend";
 import {
@@ -17,6 +14,7 @@ import { Option } from "effect";
 import { revalidatePath } from "next/cache";
 import { requirePersonalFolder } from "@/actions/folders/require-personal-folder";
 import { requireOrganizationAccess } from "@/actions/organization/authorization";
+import { createRecordingUpload } from "@/lib/create-recording-upload";
 import { runPromise } from "@/lib/server";
 
 export interface CreateForProcessingResult {
@@ -74,42 +72,45 @@ export async function createVideoForServerProcessing({
 	const rawFileKey = `${user.id}/${videoId}/raw-upload.mp4`;
 	const videoTitle = `Cap Upload - ${formattedDate}`;
 
-	const uploadResult = await StorageService.createUploadTargetForUser(
+	const writable = await StorageService.getWritableAccessForUser(
 		user.id,
-		rawFileKey,
-		{
-			contentType: "video/mp4",
-			videoTitle,
-			method: "put",
-			fields: {
-				"x-amz-meta-userid": user.id,
-				"x-amz-meta-duration": duration?.toString() ?? "",
-				"x-amz-meta-resolution": resolution ?? "",
-			},
-		},
 		orgId,
 	).pipe(runPromise);
-
-	await db().transaction(async (tx) => {
-		await tx.insert(videos).values({
+	const uploadResult = await createRecordingUpload({
+		user,
+		value: {
 			id: videoId,
 			name: videoTitle,
 			ownerId: user.id,
 			orgId,
-			source: { type: "webMP4" as const },
-			bucket: Option.getOrNull(uploadResult.bucketId),
-			storageIntegrationId: Option.getOrNull(uploadResult.storageIntegrationId),
-			public: await getNewVideoPublic(orgId),
+			source: { type: "webMP4" },
+			bucket: Option.getOrNull(writable.bucketId),
+			storageIntegrationId: Option.getOrNull(writable.storageIntegrationId),
 			...(folderId ? { folderId } : {}),
-		});
-
-		await tx.insert(videoUploads).values({
-			videoId,
+		},
+		initialUpload: {
 			mode: "singlepart",
 			phase: "uploading",
 			processingProgress: 0,
 			rawFileKey,
-		});
+		},
+		upload: async (video) => ({
+			...writable,
+			upload: await StorageService.createUploadTargetForVideo(
+				video,
+				rawFileKey,
+				{
+					contentType: "video/mp4",
+					videoTitle,
+					method: "put",
+					fields: {
+						"x-amz-meta-userid": user.id,
+						"x-amz-meta-duration": duration?.toString() ?? "",
+						"x-amz-meta-resolution": resolution ?? "",
+					},
+				},
+			).pipe(runPromise),
+		}),
 	});
 
 	revalidatePath("/dashboard/caps");

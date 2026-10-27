@@ -1,9 +1,9 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import { type Organisation, Policy, type Space } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { OrganisationsPolicy } from "../Organisations/OrganisationsPolicy.ts";
 import { SpacesPolicy } from "./SpacesPolicy.ts";
 
@@ -35,7 +35,16 @@ export class Spaces extends Effect.Service<Spaces>()("Spaces", {
 								),
 							})
 							.from(Db.spaces)
-							.where(Dz.eq(Db.spaces.id, spaceOrOrgId))
+							.innerJoin(
+								Db.organizations,
+								Dz.eq(Db.organizations.id, Db.spaces.organizationId),
+							)
+							.where(
+								Dz.and(
+									Dz.eq(Db.spaces.id, spaceOrOrgId),
+									Dz.isNull(Db.organizations.tombstoneAt),
+								),
+							)
 							.limit(1),
 					),
 					db.use((db) =>
@@ -47,9 +56,12 @@ export class Spaces extends Effect.Service<Spaces>()("Spaces", {
 							})
 							.from(Db.organizations)
 							.where(
-								Dz.eq(
-									Db.organizations.id,
-									spaceOrOrgId as Organisation.OrganisationId,
+								Dz.and(
+									Dz.isNull(Db.organizations.tombstoneAt),
+									Dz.eq(
+										Db.organizations.id,
+										spaceOrOrgId as Organisation.OrganisationId,
+									),
 								),
 							)
 							.limit(1),

@@ -1,4 +1,4 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import { CurrentUser, type User } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect } from "effect";

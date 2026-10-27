@@ -1,10 +1,11 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { developerApps, developerCreditAccounts } from "@cap/database/schema";
-import { and, eq, isNull } from "drizzle-orm";
+import { developerCreditAccounts } from "@cap/database/cloudflare/schema";
+import { buildEnv } from "@cap/env";
+import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
+import { mutateOwnedDeveloperApp } from "@/lib/developer-persistence";
 
 export async function updateDeveloperAutoTopUp(data: {
 	appId: string;
@@ -14,20 +15,10 @@ export async function updateDeveloperAutoTopUp(data: {
 }) {
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
-
-	const [app] = await db()
-		.select()
-		.from(developerApps)
-		.where(
-			and(
-				eq(developerApps.id, data.appId),
-				eq(developerApps.ownerId, user.id),
-				isNull(developerApps.deletedAt),
-			),
-		)
-		.limit(1);
-
-	if (!app) throw new Error("App not found");
+	if (buildEnv.NEXT_PUBLIC_IS_CAP !== "true" && data.enabled)
+		throw new Error(
+			"Credit auto top-up is unavailable on this self-hosted server",
+		);
 
 	if (
 		data.thresholdMicroCredits !== undefined &&
@@ -53,10 +44,12 @@ export async function updateDeveloperAutoTopUp(data: {
 		updates.autoTopUpAmountCents = data.amountCents;
 	}
 
-	await db()
-		.update(developerCreditAccounts)
-		.set(updates)
-		.where(eq(developerCreditAccounts.appId, data.appId));
+	await mutateOwnedDeveloperApp(user.id, data.appId, (database) => [
+		database
+			.update(developerCreditAccounts)
+			.set(updates)
+			.where(eq(developerCreditAccounts.appId, data.appId)),
+	]);
 
 	revalidatePath("/dashboard/developers");
 	return { success: true };

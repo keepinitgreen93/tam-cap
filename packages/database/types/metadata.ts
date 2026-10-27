@@ -5,7 +5,56 @@
 /**
  * Video metadata structure
  */
+export interface VideoProcessingRun {
+	token: string;
+	ownerId: string;
+	organizationId: string;
+	bucketId: string | null;
+	storageIntegrationId: string | null;
+	source: string;
+	rawFileKey: string;
+	state: "queued" | "processing" | "complete" | "error";
+	dispatch: "pending" | "accepted" | "uncertain";
+	dispatchStartedAt: number;
+	workflowRunId?: string;
+	workflowQueue?: string;
+	deploymentId?: string;
+	attempt: number;
+	attemptId: string;
+	jobId?: string;
+	outputKey: string;
+	thumbnailKey: string;
+	previewKey: string;
+	error?: string;
+	completedAt?: string;
+}
+
+export interface TranscriptionRun {
+	id: string;
+	sourceRevision: string;
+	dispatch: "pending" | "accepted" | "uncertain" | "rejected";
+	requestedAt: string;
+	workflowRunId?: string;
+	workflowQueue?: string;
+	deploymentId?: string;
+}
+export interface TranscriptPublication {
+	version: 1;
+	id: string;
+	vtt: boolean;
+	edit: boolean;
+	revision: string | null;
+}
+
 export interface VideoMetadata {
+	editTranscriptBackfill?: {
+		status: "processing" | "error";
+		requestId: string;
+		requestedAt: string;
+	};
+	transcriptionRun?: TranscriptionRun;
+	transcriptPublication?: TranscriptPublication;
+	processingRun?: VideoProcessingRun;
 	loomImportRun?: {
 		runId: string;
 		dispatch: "pending" | "accepted" | "rejected" | "uncertain";
@@ -124,6 +173,7 @@ export interface VideoMetadata {
 	 * behavior. Cleared when the canonical transcription completes.
 	 */
 	liveTranscript?: {
+		id?: string;
 		status: "active" | "complete" | "stopped";
 		updatedAt?: string;
 	};

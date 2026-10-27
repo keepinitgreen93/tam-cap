@@ -1,21 +1,19 @@
 import "server-only";
 
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	agentApiAuthorizationCodes,
 	agentApiIdempotency,
 	agentApiKeys,
 	agentApiOperations,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { and, inArray, lt, or } from "drizzle-orm";
 
-const affectedRows = (result: unknown) =>
-	Array.isArray(result)
-		? ((result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0)
-		: ((result as { affectedRows?: number }).affectedRows ?? 0);
+const affectedRows = (result: { meta: { changes: number } }) =>
+	result.meta.changes;
 
 const deleteInBatches = async (
-	deleteBatch: () => Promise<unknown>,
+	deleteBatch: () => PromiseLike<{ meta: { changes: number } }>,
 	batchSize: number,
 	maxBatches: number,
 ) => {
@@ -56,8 +54,16 @@ export const cleanupExpiredAgentApiRecords = async (input?: {
 		() =>
 			database
 				.delete(agentApiAuthorizationCodes)
-				.where(lt(agentApiAuthorizationCodes.expiresAt, now))
-				.limit(batchSize),
+				.where(
+					inArray(
+						agentApiAuthorizationCodes.id,
+						database
+							.select({ id: agentApiAuthorizationCodes.id })
+							.from(agentApiAuthorizationCodes)
+							.where(lt(agentApiAuthorizationCodes.expiresAt, now))
+							.limit(batchSize),
+					),
+				),
 		batchSize,
 		maxBatches,
 	);
@@ -65,36 +71,56 @@ export const cleanupExpiredAgentApiRecords = async (input?: {
 		() =>
 			database
 				.delete(agentApiIdempotency)
-				.where(lt(agentApiIdempotency.expiresAt, now))
-				.limit(batchSize),
+				.where(
+					inArray(
+						agentApiIdempotency.id,
+						database
+							.select({ id: agentApiIdempotency.id })
+							.from(agentApiIdempotency)
+							.where(lt(agentApiIdempotency.expiresAt, now))
+							.limit(batchSize),
+					),
+				),
 		batchSize,
 		maxBatches,
 	);
 	const operations = await deleteInBatches(
 		() =>
-			database
-				.delete(agentApiOperations)
-				.where(
-					and(
-						inArray(agentApiOperations.state, ["succeeded", "failed"]),
-						lt(agentApiOperations.updatedAt, operationRetentionCutoff),
-					),
-				)
-				.limit(batchSize),
+			database.delete(agentApiOperations).where(
+				inArray(
+					agentApiOperations.id,
+					database
+						.select({ id: agentApiOperations.id })
+						.from(agentApiOperations)
+						.where(
+							and(
+								inArray(agentApiOperations.state, ["succeeded", "failed"]),
+								lt(agentApiOperations.updatedAt, operationRetentionCutoff),
+							),
+						)
+						.limit(batchSize),
+				),
+			),
 		batchSize,
 		maxBatches,
 	);
 	const accessTokens = await deleteInBatches(
 		() =>
-			database
-				.delete(agentApiKeys)
-				.where(
-					or(
-						lt(agentApiKeys.expiresAt, keyRetentionCutoff),
-						lt(agentApiKeys.revokedAt, keyRetentionCutoff),
-					),
-				)
-				.limit(batchSize),
+			database.delete(agentApiKeys).where(
+				inArray(
+					agentApiKeys.id,
+					database
+						.select({ id: agentApiKeys.id })
+						.from(agentApiKeys)
+						.where(
+							or(
+								lt(agentApiKeys.expiresAt, keyRetentionCutoff),
+								lt(agentApiKeys.revokedAt, keyRetentionCutoff),
+							),
+						)
+						.limit(batchSize),
+				),
+			),
 		batchSize,
 		maxBatches,
 	);

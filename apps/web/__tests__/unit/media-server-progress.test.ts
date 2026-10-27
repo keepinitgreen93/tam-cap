@@ -1,5 +1,3 @@
-import type { SQL } from "drizzle-orm";
-import { MySqlDialect } from "drizzle-orm/mysql-core";
 import { Effect } from "effect";
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -7,6 +5,7 @@ import type { DesktopRecordingJob } from "@/lib/desktop-recording-jobs";
 
 const mocks = vi.hoisted(() => ({
 	secret: "media-secret" as string | undefined,
+	fixtureVideo: {} as Record<string, unknown>,
 	db: vi.fn(),
 	getState: vi.fn(),
 	retry: vi.fn(),
@@ -29,11 +28,31 @@ const mocks = vi.hoisted(() => ({
 	},
 }));
 
-vi.mock("@cap/database", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/atomic", () => ({
+	atomic: async (
+		database: { batch: (statements: unknown[]) => Promise<unknown> },
+		planner: (snapshot: {
+			read: (
+				reader: (database: unknown) => PromiseLike<unknown>,
+			) => Promise<unknown>;
+		}) => Promise<{ statements: unknown[]; result: unknown }>,
+	) => {
+		const plan = await planner({ read: async (reader) => reader(database) });
+		await database.batch(plan.statements);
+		return plan.result;
+	},
+}));
+vi.mock("@cap/web-backend/src/Videos/persistence", () => ({
+	requireWritableVideo: async () => mocks.fixtureVideo,
+	requireOwnedVideo: async () => mocks.fixtureVideo,
+	writableVideo: undefined,
+}));
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
 vi.mock("@/lib/audio-level-publication", () => ({
 	handleAudioLevelPublication: mocks.audio,
 }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/schema", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@cap/database/cloudflare/schema")>()),
 	videos: mocks.tables.videos,
 	videoProcessingJobs: mocks.tables.jobs,
 	videoUploads: mocks.tables.uploads,
@@ -196,56 +215,35 @@ function databaseFixture(initial: DesktopRecordingJob | null = fixture().job) {
 		if (table === mocks.tables.uploads) return [{ rawFileKey }];
 		throw new Error("Unexpected table");
 	};
-	const writes = (pending: Mutation[]) => ({
+	const batch = vi.fn(async (pending: Mutation[]) => {
+		for (const mutation of pending) {
+			mutations.push(mutation);
+			if (mutation.operation !== "update") continue;
+			if (mutation.table === mocks.tables.jobs && current)
+				current = { ...current, ...mutation.values };
+			else if (mutation.table === mocks.tables.videos)
+				Object.assign(video, mutation.values);
+		}
+	});
+	mocks.fixtureVideo = video;
+	mocks.db.mockReturnValue({
+		select: () => ({
+			from: (table: unknown) => ({
+				where: () =>
+					Object.assign(Promise.resolve(rows(table)), {
+						limit: () => Promise.resolve(rows(table)),
+					}),
+			}),
+		}),
 		update: (table: unknown) => ({
 			set: (values: Record<string, unknown>) => ({
-				where: async () => {
-					pending.push({ operation: "update", table, values });
-					return [{ affectedRows: 1 }];
-				},
+				where: () => ({ operation: "update", table, values }),
 			}),
 		}),
 		delete: (table: unknown) => ({
-			where: async () => {
-				pending.push({ operation: "delete", table });
-				return [{ affectedRows: 1 }];
-			},
+			where: () => ({ operation: "delete", table }),
 		}),
-	});
-	function transactionHandle(pending: Mutation[]) {
-		return {
-			select: () => ({
-				from: (table: unknown) => ({
-					where: () => ({ for: async () => rows(table) }),
-				}),
-			}),
-			...writes(pending),
-		};
-	}
-	const transaction = vi.fn(
-		async (
-			operation: (tx: ReturnType<typeof transactionHandle>) => Promise<unknown>,
-		) => {
-			const pending: Mutation[] = [];
-			const result = await operation(transactionHandle(pending));
-			for (const mutation of pending) {
-				mutations.push(mutation);
-				if (mutation.operation !== "update") continue;
-				if (mutation.table === mocks.tables.jobs && current) {
-					current = { ...current, ...mutation.values };
-				} else if (mutation.table === mocks.tables.videos) {
-					Object.assign(video, mutation.values);
-				}
-			}
-			return result;
-		},
-	);
-	mocks.db.mockReturnValue({
-		select: () => ({
-			from: (table: unknown) => ({ where: async () => rows(table) }),
-		}),
-		...writes(mutations),
-		transaction,
+		batch,
 	});
 	mocks.getState.mockImplementation(async () =>
 		current ? parseDesktopRecordingJob(structuredClone(current)) : null,
@@ -253,7 +251,7 @@ function databaseFixture(initial: DesktopRecordingJob | null = fixture().job) {
 	return {
 		mutations,
 		video,
-		transaction,
+		transaction: batch,
 		setRawFileKey: (key: string) => {
 			rawFileKey = key;
 		},
@@ -281,6 +279,7 @@ function request(
 
 describe("media-server recording progress webhook", () => {
 	beforeEach(() => {
+		vi.stubEnv("CAP_RUNTIME", "");
 		mocks.secret = "media-secret";
 		mocks.audio.mockReset().mockResolvedValue({ status: "prepared" });
 		mocks.storage.mockReturnValue(Effect.succeed([{ headObject: mocks.head }]));
@@ -833,11 +832,10 @@ describe("Loom importer completions", () => {
 				({ table, values }) =>
 					table === mocks.tables.videos && values?.metadata !== undefined,
 			)
-			.map(({ values }) =>
-				new MySqlDialect().sqlToQuery(values?.metadata as SQL),
-			);
+			.map(({ values }) => values?.metadata as Record<string, unknown>);
 
 	beforeEach(() => {
+		vi.stubEnv("CAP_RUNTIME", "");
 		mocks.transcribe.mockReset().mockResolvedValue({ success: true });
 		mocks.queue.mockReset();
 		vi.spyOn(console, "log").mockImplementation(() => undefined);
@@ -859,10 +857,8 @@ describe("Loom importer completions", () => {
 		expect(response.status).toBe(200);
 		expect(mocks.transcribe).not.toHaveBeenCalled();
 		const [write] = metadataWrites(database.mutations);
-		expect(write?.sql).toContain(
-			"'$.transcribeOnView', JSON_EXTRACT('true', '$')",
-		);
-		expect(write?.sql).not.toContain("loomDeferredProcessing");
+		expect(write).toMatchObject({ transcribeOnView: true });
+		expect(write).not.toHaveProperty("loomDeferredProcessing");
 		expect(database.mutations).toContainEqual({
 			operation: "delete",
 			table: mocks.tables.uploads,
@@ -878,10 +874,9 @@ describe("Loom importer completions", () => {
 			"?retryable=true&transcription=on-view",
 		);
 		const [write] = metadataWrites(database.mutations);
-		expect(write?.sql).toContain(
-			"JSON_OBJECT('rawFileKey', ?, 'status', 'pending')",
-		);
-		expect(write?.params).toContain(key);
+		expect(write).toMatchObject({
+			loomDeferredProcessing: { rawFileKey: key, status: "pending" },
+		});
 	});
 
 	it.each([
@@ -896,7 +891,7 @@ describe("Loom importer completions", () => {
 			"?retryable=true&transcription=on-view",
 		);
 		for (const write of metadataWrites(database.mutations))
-			expect(write.sql).not.toContain("loomDeferredProcessing");
+			expect(write).not.toHaveProperty("loomDeferredProcessing");
 	});
 
 	it("keeps an existing deferred claim when a completion is repeated", async () => {
@@ -907,9 +902,9 @@ describe("Loom importer completions", () => {
 			"?retryable=true&transcription=on-view",
 		);
 		const [write] = metadataWrites(database.mutations);
-		expect(write?.sql).toContain(
-			"IF(JSON_EXTRACT(?, '$.loomDeferredProcessing') IS NULL",
-		);
+		expect(write).toMatchObject({
+			loomDeferredProcessing: { status: "pending" },
+		});
 	});
 
 	it("marks a deferred original complete once it has been processed", async () => {
@@ -921,9 +916,9 @@ describe("Loom importer completions", () => {
 		database.setRawFileKey(key);
 		await request(complete(), "media-secret", "?retryable=true");
 		const [write] = metadataWrites(database.mutations);
-		expect(write?.sql).toContain(
-			"'$.loomDeferredProcessing.status', 'complete'",
-		);
+		expect(write).toMatchObject({
+			loomDeferredProcessing: { status: "complete" },
+		});
 		expect(mocks.transcribe).toHaveBeenCalledWith(videoId);
 	});
 
@@ -935,9 +930,7 @@ describe("Loom importer completions", () => {
 			"?retryable=true&transcription=on-view&preview=on-view",
 		);
 		const [write] = metadataWrites(database.mutations);
-		expect(write?.sql).toContain(
-			"'$.loomPreviewGif', COALESCE(JSON_EXTRACT(?, '$.loomPreviewGif'), JSON_OBJECT('status', 'pending'))",
-		);
+		expect(write).toMatchObject({ loomPreviewGif: { status: "pending" } });
 	});
 
 	it("does not wait for a preview view when the original still needs processing", async () => {
@@ -948,7 +941,7 @@ describe("Loom importer completions", () => {
 			"?retryable=true&transcription=on-view&preview=on-view",
 		);
 		for (const write of metadataWrites(database.mutations))
-			expect(write.sql).not.toContain("loomPreviewGif");
+			expect(write).not.toHaveProperty("loomPreviewGif");
 	});
 
 	it("wakes the waiting import once the finished state is saved", async () => {
@@ -1010,8 +1003,8 @@ describe("Loom importer completions", () => {
 		);
 		expect(mocks.transcribe).toHaveBeenCalledWith(videoId);
 		expect(
-			metadataWrites(database.mutations).some(({ sql }) =>
-				sql.includes("transcribeOnView"),
+			metadataWrites(database.mutations).some(
+				(metadata) => "transcribeOnView" in metadata,
 			),
 		).toBe(false);
 	});

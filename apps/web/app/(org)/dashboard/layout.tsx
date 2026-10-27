@@ -1,12 +1,11 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizationInvites } from "@cap/database/schema";
+
 import { userIsPro } from "@cap/utils";
-import { and, eq } from "drizzle-orm";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { AuthContextProvider } from "@/app/Layout/AuthContext";
 import { resolveCurrentUser } from "@/app/Layout/current-user";
+import { getPendingInviteIdForUser } from "@/lib/organization-invite-read";
 import { runPromise } from "@/lib/server";
 import { getShareableLinkUsage } from "@/lib/shareable-link-quota";
 import DashboardInner from "./_components/DashboardInner";
@@ -25,21 +24,6 @@ import {
 } from "./dashboard-data";
 
 export const dynamic = "force-dynamic";
-
-async function getPendingInviteIdForUser(email: string) {
-	const [invite] = await db()
-		.select({ id: organizationInvites.id })
-		.from(organizationInvites)
-		.where(
-			and(
-				eq(organizationInvites.invitedEmail, email.toLowerCase()),
-				eq(organizationInvites.status, "pending"),
-			),
-		)
-		.limit(1);
-
-	return invite?.id ?? null;
-}
 
 export default async function DashboardLayout({
 	children,

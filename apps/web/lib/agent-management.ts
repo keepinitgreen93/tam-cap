@@ -1,3 +1,4 @@
+import { buildEnv } from "@cap/env";
 import type { Agent } from "@cap/web-domain";
 
 type ActionInput = {
@@ -293,7 +294,7 @@ export const normalizeOrganization = (
 		name: row.name,
 		ownerId: row.ownerId,
 		role,
-		hasProSeat: row.hasProSeat,
+		hasProSeat: buildEnv.NEXT_PUBLIC_IS_CAP !== "true" || row.hasProSeat,
 		allowedEmailDomain: row.allowedEmailDomain,
 		customDomain: row.customDomain,
 		domainVerifiedAt: row.domainVerifiedAt?.toISOString() ?? null,
@@ -301,8 +302,12 @@ export const normalizeOrganization = (
 		shareableLinkIcon: row.shareableLinkIcon,
 		settings: agentOrganizationSettings(row.settings),
 		billing: {
-			status: row.ownerSubscriptionStatus,
+			status:
+				buildEnv.NEXT_PUBLIC_IS_CAP !== "true"
+					? "self_hosted"
+					: row.ownerSubscriptionStatus,
 			plan:
+				buildEnv.NEXT_PUBLIC_IS_CAP !== "true" ||
 				row.ownerThirdPartySubscriptionId !== null ||
 				["active", "trialing", "complete", "paid"].includes(
 					row.ownerSubscriptionStatus ?? "",

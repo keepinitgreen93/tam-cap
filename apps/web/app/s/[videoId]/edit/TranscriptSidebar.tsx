@@ -29,6 +29,11 @@ import {
 	requestEditTranscript,
 } from "@/actions/videos/get-edit-transcript";
 import {
+	getSilenceAnalysis,
+	getSilenceSourceRevision,
+	requestSilenceAnalysis,
+} from "@/actions/videos/silence-analysis";
+import {
 	type EditTranscriptGroup,
 	type EditTranscriptWord,
 	getDeletedTranscriptWordIds,
@@ -38,12 +43,15 @@ import {
 	planFillerCuts,
 	planTranscriptCut,
 } from "@/lib/edit-transcript";
+import { scanVideoSilence } from "@/lib/silence-audio";
+import { planSilenceCuts, type SilenceRange } from "@/lib/silence-cuts";
 import { useActiveTranscriptWordIndex } from "./use-active-transcript-word-index";
 
 type TranscriptResponse = Awaited<ReturnType<typeof getEditTranscript>>;
 
 type TranscriptSidebarProps = {
 	videoId: Video.VideoId;
+	sourceRevision?: string | null;
 	videoRef: RefObject<HTMLVideoElement | null>;
 	keepRanges: VideoEditRange[];
 	onDeleteRanges: (ranges: VideoEditRange[]) => void;
@@ -227,8 +235,321 @@ const TranscriptGroupRow = memo(function TranscriptGroupRow({
 	);
 });
 
+function SilenceCleanup({
+	videoId,
+	sourceRevision,
+	videoRef,
+	keepRanges,
+	onDeleteRanges,
+	words,
+	durationMs,
+}: TranscriptSidebarProps & {
+	words: readonly EditTranscriptWord[];
+	durationMs: number;
+}) {
+	const [scanning, setScanning] = useState(false);
+	const [analysis, setAnalysis] = useState<{
+		src: string;
+		duration: number;
+		ranges: SilenceRange[];
+	} | null>(null);
+	const [selected, setSelected] = useState<Set<string>>(new Set());
+	const [message, setMessage] = useState<string | null>(null);
+	const requestRef = useRef<AbortController | null>(null);
+	const previewCleanupRef = useRef<(() => void) | null>(null);
+	const currentInputsRef = useRef({ keepRanges, words, durationMs });
+	currentInputsRef.current = { keepRanges, words, durationMs };
+	const rangeKey = (range: SilenceRange) => `${range.startMs}:${range.endMs}`;
+
+	useEffect(() => {
+		let frame = 0;
+		let detach: (() => void) | undefined;
+		const reset = () => {
+			requestRef.current?.abort();
+			previewCleanupRef.current?.();
+			setAnalysis(null);
+			setSelected(new Set());
+			setScanning(false);
+			setMessage(null);
+		};
+		reset();
+		const attach = () => {
+			const video = videoRef.current;
+			if (!video) {
+				frame = requestAnimationFrame(attach);
+				return;
+			}
+			video.addEventListener("loadstart", reset);
+			video.addEventListener("emptied", reset);
+			video.addEventListener("durationchange", reset);
+			detach = () => {
+				video.removeEventListener("loadstart", reset);
+				video.removeEventListener("emptied", reset);
+				video.removeEventListener("durationchange", reset);
+			};
+		};
+		attach();
+		return () => {
+			cancelAnimationFrame(frame);
+			detach?.();
+			requestRef.current?.abort();
+			previewCleanupRef.current?.();
+		};
+	}, [videoRef]);
+
+	const plan = useMemo(
+		() =>
+			planSilenceCuts({
+				candidates: analysis?.ranges ?? [],
+				words,
+				keepRanges,
+				durationMs,
+			}),
+		[analysis, words, keepRanges, durationMs],
+	);
+
+	const scan = async () => {
+		const video = videoRef.current;
+		if (!video?.currentSrc || !Number.isFinite(video.duration)) {
+			setMessage("Wait for the video to finish loading before scanning.");
+			return;
+		}
+		if (Math.abs(video.duration * 1000 - durationMs) > 50) {
+			setMessage(
+				"The transcript timing does not match the video. Reload before scanning.",
+			);
+			return;
+		}
+		requestRef.current?.abort();
+		const controller = new AbortController();
+		requestRef.current = controller;
+		const src = video.currentSrc;
+		const duration = video.duration;
+		setScanning(true);
+		setAnalysis(null);
+		setSelected(new Set());
+		setMessage(null);
+		try {
+			let ranges: SilenceRange[];
+			if (sourceRevision) {
+				let response = await requestSilenceAnalysis(videoId, sourceRevision);
+				while (response.status === "processing") {
+					controller.signal.throwIfAborted();
+					await new Promise<void>((resolve, reject) => {
+						const abort = () => {
+							clearTimeout(timeout);
+							reject(controller.signal.reason);
+						};
+						const timeout = setTimeout(() => {
+							controller.signal.removeEventListener("abort", abort);
+							resolve();
+						}, 2000);
+						controller.signal.addEventListener("abort", abort, { once: true });
+					});
+					response = await getSilenceAnalysis(videoId, sourceRevision);
+				}
+				if (response.status === "error") throw new Error(response.message);
+				if (
+					response.revision !== sourceRevision ||
+					Math.abs(response.result.durationMs - duration * 1000) > 50
+				)
+					throw new Error(
+						"The video changed. Reload before applying silence cuts.",
+					);
+				ranges = response.result.ranges;
+			} else {
+				ranges = await scanVideoSilence(src, duration, controller.signal);
+			}
+			if (
+				controller.signal.aborted ||
+				video.currentSrc !== src ||
+				video.duration !== duration
+			)
+				return;
+			setAnalysis({ src, duration, ranges });
+		} catch (error) {
+			if (!controller.signal.aborted) {
+				setMessage(
+					error instanceof Error
+						? error.message
+						: "Audio analysis failed. Please try again.",
+				);
+			}
+		} finally {
+			if (requestRef.current === controller) setScanning(false);
+		}
+	};
+
+	const sourceMatches = () => {
+		const video = videoRef.current;
+		return (
+			analysis &&
+			video &&
+			analysis.src === video.currentSrc &&
+			analysis.duration === video.duration
+		);
+	};
+
+	const listen = async (range: SilenceRange) => {
+		const video = videoRef.current;
+		if (!video || !sourceMatches()) return;
+		if (video.muted || video.volume === 0) {
+			setMessage("Unmute the video player before listening to a quiet range.");
+			return;
+		}
+		setMessage(null);
+		previewCleanupRef.current?.();
+		video.pause();
+		video.currentTime = range.startMs / 1000;
+		const stop = () => {
+			video.pause();
+			video.removeEventListener("timeupdate", checkEnd);
+			previewCleanupRef.current = null;
+		};
+		const checkEnd = () => {
+			if (video.currentTime >= range.endMs / 1000) stop();
+		};
+		previewCleanupRef.current = stop;
+		video.addEventListener("timeupdate", checkEnd);
+		try {
+			await video.play();
+		} catch {
+			stop();
+			setMessage(
+				"Audio preview could not play. Use the video player to review this range.",
+			);
+		}
+	};
+
+	const apply = async () => {
+		if (sourceRevision) {
+			try {
+				if ((await getSilenceSourceRevision(videoId)) !== sourceRevision)
+					throw new Error("Video changed");
+			} catch {
+				setAnalysis(null);
+				setMessage(
+					"The video changed or is unavailable. Reload before applying cuts.",
+				);
+				return;
+			}
+		}
+		if (!sourceMatches()) {
+			setAnalysis(null);
+			setMessage("The video changed. Scan again before applying cuts.");
+			return;
+		}
+		const selectedPlan = planSilenceCuts({
+			candidates: plan.ranges.filter((range) => selected.has(rangeKey(range))),
+			...currentInputsRef.current,
+		});
+		if (selectedPlan.error || selectedPlan.ranges.length === 0) {
+			setMessage(selectedPlan.error ?? "Select a quiet range to remove.");
+			return;
+		}
+		previewCleanupRef.current?.();
+		onDeleteRanges(toVideoRanges(selectedPlan.ranges));
+		setSelected(new Set());
+		toast.success(
+			"Quiet ranges removed. Use Undo to restore them, or Save to export.",
+		);
+	};
+
+	return (
+		<section
+			aria-label="Silence cleanup"
+			className="border-b border-gray-3 p-3 text-xs"
+		>
+			<div className="flex items-center justify-between gap-2">
+				<span className="font-semibold text-gray-12">Silence cleanup</span>
+				<button
+					type="button"
+					disabled={scanning}
+					onClick={() => void scan()}
+					className="rounded-full border border-gray-5 px-3 py-1.5 disabled:opacity-50"
+				>
+					{scanning ? "Analyzing audio…" : "Find quiet ranges"}
+				</button>
+			</div>
+			{scanning && (
+				<button
+					type="button"
+					className="mt-2 underline"
+					onClick={() => {
+						requestRef.current?.abort();
+						setScanning(false);
+					}}
+				>
+					Cancel scan
+				</button>
+			)}
+			{(message || plan.error) && (
+				<output className="mt-2 block text-gray-11">
+					{message ?? plan.error}
+				</output>
+			)}
+			{analysis && !plan.error && (
+				<>
+					<p className="mt-2 text-gray-9">
+						{plan.ranges.length
+							? "Low-volume audio can include speech or music. Listen, then select the ranges to remove. Undo restores your cuts."
+							: "No removable quiet ranges found."}
+					</p>
+					<div className="mt-2 max-h-40 space-y-2 overflow-y-auto">
+						{plan.ranges.map((range) => (
+							<div
+								key={rangeKey(range)}
+								className="flex items-center justify-between gap-2"
+							>
+								<label className="flex items-center gap-2">
+									<input
+										type="checkbox"
+										checked={selected.has(rangeKey(range))}
+										onChange={(event) => {
+											const checked = event.target.checked;
+											setSelected((current) => {
+												const next = new Set(current);
+												if (checked) next.add(rangeKey(range));
+												else next.delete(rangeKey(range));
+												return next;
+											});
+										}}
+									/>
+									{formatTimestamp(range.startMs)}–
+									{formatTimestamp(range.endMs)} (
+									{((range.endMs - range.startMs) / 1000).toFixed(1)}s)
+								</label>
+								<button
+									type="button"
+									className="underline"
+									onClick={() => void listen(range)}
+								>
+									Listen
+								</button>
+							</div>
+						))}
+					</div>
+					{plan.ranges.length > 0 && (
+						<button
+							type="button"
+							disabled={
+								!plan.ranges.some((range) => selected.has(rangeKey(range)))
+							}
+							onClick={() => void apply()}
+							className="mt-3 rounded-full bg-gray-12 px-3 py-2 font-semibold text-white disabled:opacity-50"
+						>
+							Apply selected cuts
+						</button>
+					)}
+				</>
+			)}
+		</section>
+	);
+}
+
 export function TranscriptSidebar({
 	videoId,
+	sourceRevision,
 	videoRef,
 	keepRanges,
 	onDeleteRanges,
@@ -603,6 +924,16 @@ export function TranscriptSidebar({
 				<p className="mt-1.5 max-w-60 text-[11px] leading-[18px] text-gray-9">
 					The timeline editor is still available for manual edits.
 				</p>
+				<SilenceCleanup
+					key={`${videoId}:${sourceRevision}:${transcript.durationMs}`}
+					videoId={videoId}
+					sourceRevision={sourceRevision}
+					videoRef={videoRef}
+					keepRanges={keepRanges}
+					onDeleteRanges={onDeleteRanges}
+					words={transcript.words}
+					durationMs={transcript.durationMs}
+				/>
 			</aside>
 		);
 	}
@@ -720,6 +1051,16 @@ export function TranscriptSidebar({
 				</div>
 			</div>
 
+			<SilenceCleanup
+				key={`${videoId}:${sourceRevision}:${transcript.durationMs}`}
+				videoId={videoId}
+				sourceRevision={sourceRevision}
+				videoRef={videoRef}
+				keepRanges={keepRanges}
+				onDeleteRanges={onDeleteRanges}
+				words={transcript.words}
+				durationMs={transcript.durationMs}
+			/>
 			<div className="relative min-h-0 flex-1">
 				<div
 					ref={transcriptScrollRef}

@@ -1,5 +1,8 @@
-import { db } from "@cap/database";
-import { organizationMembers, organizations } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	organizationMembers,
+	organizations,
+} from "@cap/database/cloudflare/schema";
 import type { Organisation, User } from "@cap/web-domain";
 import { and, eq, isNull, or } from "drizzle-orm";
 import {

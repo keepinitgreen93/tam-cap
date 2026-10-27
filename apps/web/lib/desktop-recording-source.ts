@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { videos } from "@cap/database/schema";
+import type { videos } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend/src/Storage/index";
 import { getRecordingObjectIdentity } from "@cap/web-backend/src/Storage/recording-object-identity";

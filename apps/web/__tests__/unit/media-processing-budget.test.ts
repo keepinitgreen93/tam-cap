@@ -1,65 +1,73 @@
-import { beforeEach, expect, it, vi } from "vitest";
+import * as Db from "@cap/database/cloudflare/schema";
+import { Organisation, User, Video } from "@cap/web-domain";
+import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import {
 	getMediaProcessingReservation,
 	RECORDING_PROCESSING_ATTEMPTS,
-	reserveMediaProcessingBudget,
+	reserveMediaProcessingBudget as reserveRaw,
 } from "@/lib/media-processing-budget";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
 
 const state = vi.hoisted(() => ({
-	rows: new Map<
-		string,
-		{ id: string; limitBytes: number; reservedBytes: number }
-	>(),
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
 }));
-vi.mock("@cap/database/schema", () => ({
-	mediaProcessingBudgets: {
-		id: "id",
-		reservedBytes: "reservedBytes",
-		expiresAt: "expiresAt",
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!state.database) throw new Error("Missing budget database");
+		return state.database;
 	},
 }));
-vi.mock("drizzle-orm", () => ({
-	asc: (value: unknown) => value,
-	lt: vi.fn(),
-	inArray: (_column: unknown, ids: string[]) => ids,
-	sql: (_strings: TemplateStringsArray, ...values: unknown[]) => values,
-}));
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		transaction: async (run: (tx: unknown) => Promise<number>) =>
-			run({
-				insert: () => ({
-					values: (rows: Array<{ id: string; limitBytes: number }>) => ({
-						onDuplicateKeyUpdate: async () => {
-							for (const row of rows)
-								if (!state.rows.has(row.id))
-									state.rows.set(row.id, { ...row, reservedBytes: 0 });
-						},
-					}),
-				}),
-				select: () => ({
-					from: () => ({
-						where: (ids: string[]) => ({
-							orderBy: () => ({
-								for: async () => ids.map((id) => state.rows.get(id)),
-							}),
-						}),
-					}),
-				}),
-				update: () => ({
-					set: (values: { reservedBytes: [unknown, number] }) => ({
-						where: async (ids: string[]) => {
-							for (const id of ids) {
-								const row = state.rows.get(id);
-								if (row) row.reservedBytes += values.reservedBytes[1];
-							}
-						},
-					}),
-				}),
-			}),
-	}),
-}));
-beforeEach(() => state.rows.clear());
+let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
+const ownerId = User.UserId.make("budget-owner");
+const orgId = Organisation.OrganisationId.make("budget-org");
+beforeAll(async () => {
+	runtime = await createTestDatabase();
+	state.database = runtime.database;
+	await runtime.database.insert(Db.users).values({
+		id: ownerId,
+		email: "budget@test.invalid",
+		activeOrganizationId: orgId,
+	});
+	await runtime.database
+		.insert(Db.organizations)
+		.values({ id: orgId, ownerId, name: "Budgets" });
+}, 60000);
+afterAll(async () => runtime?.dispose());
+beforeEach(async () => {
+	await runtime.database.delete(Db.mediaProcessingBudgets);
+	await runtime.database.delete(Db.videoProcessingJobs);
+	await runtime.database.delete(Db.videos);
+});
+async function reserveMediaProcessingBudget(
+	input: Parameters<typeof reserveRaw>[0],
+) {
+	const videoId = Video.VideoId.make(input.videoId);
+	await runtime.database
+		.insert(Db.videos)
+		.values({
+			id: videoId,
+			ownerId,
+			orgId,
+			source: { type: "desktopSegments" },
+		})
+		.onConflictDoNothing();
+	const job = {
+		videoId,
+		ownerId,
+		generation: input.generation,
+		attemptId: input.attemptId,
+		state: "processing" as const,
+		nextRetryAt: input.now ?? new Date(),
+		leaseExpiresAt: new Date((input.now?.getTime() ?? Date.now()) + 60000),
+	};
+	await runtime.database
+		.insert(Db.videoProcessingJobs)
+		.values(job)
+		.onConflictDoUpdate({ target: Db.videoProcessingJobs.videoId, set: job });
+	return reserveRaw(input);
+}
 
 it("processes unrelated recordings regardless of the former daily allowance", async () => {
 	vi.stubEnv("MEDIA_PROCESSING_DAILY_BUDGET_GIB", "1");
@@ -75,7 +83,9 @@ it("processes unrelated recordings regardless of the former daily allowance", as
 				}),
 			).resolves.toBe(getMediaProcessingReservation(1024 ** 3).attemptBytes);
 		}
-		expect(state.rows.size).toBe(20);
+		expect(
+			await runtime.database.select().from(Db.mediaProcessingBudgets),
+		).toHaveLength(20);
 	} finally {
 		vi.unstubAllEnvs();
 	}
@@ -99,10 +109,11 @@ it("reuses an attempt reservation across dispatch retries and midnight", async (
 				now: new Date("2026-09-07T00:00:01Z"),
 			}),
 		).toBe(first);
-	expect([...state.rows.values()].map((row) => row.reservedBytes)).toEqual([
-		first,
-		first,
-	]);
+	expect(
+		(await runtime.database.select().from(Db.mediaProcessingBudgets)).map(
+			(row) => row.reservedBytes,
+		),
+	).toEqual([first, first]);
 });
 
 it("allows every automatic attempt before bounding repeated processing of the same source", async () => {

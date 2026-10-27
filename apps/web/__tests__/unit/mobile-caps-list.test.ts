@@ -9,13 +9,13 @@ import {
 	type Video,
 } from "@cap/web-domain";
 import { type HttpApi, HttpApiBuilder, HttpServer } from "@effect/platform";
-import { drizzle } from "drizzle-orm/mysql-proxy";
+import { drizzle } from "drizzle-orm/sqlite-proxy";
 import { Effect, Layer, Option } from "effect";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
-	Database,
-	type DbClient,
-} from "../../../../packages/web-backend/src/Database";
+	CloudflareDatabase,
+	type CloudflareDbClient,
+} from "../../../../packages/web-backend/src/CloudflareDatabase";
 
 vi.mock("server-only", () => ({}));
 vi.mock("@cap/env", () => ({
@@ -34,11 +34,11 @@ vi.mock("@/workflows/import-loom-video", () => ({}));
 vi.mock("workflow/api", () => ({}));
 vi.mock("@cap/web-backend", async () => {
 	const { Context } = await import("effect");
-	const { Database } = await import(
-		"../../../../packages/web-backend/src/Database"
+	const { CloudflareDatabase } = await import(
+		"../../../../packages/web-backend/src/CloudflareDatabase"
 	);
 	return {
-		Database,
+		CloudflareDatabase,
 		Videos: Context.GenericTag("mobile-caps-test/Videos"),
 		ImageUploads: Context.GenericTag("mobile-caps-test/ImageUploads"),
 	};
@@ -50,7 +50,7 @@ const user = {
 	activeOrganizationId: Organisation.OrganisationId.make("org"),
 	iconUrlOrKey: Option.none(),
 };
-const date = "2026-10-24 12:00:00";
+const date = new Date("2026-10-24T12:00:00Z").getTime();
 let size = 30;
 let sharedList = false;
 let empty = false;
@@ -75,84 +75,98 @@ function preferences(id: string) {
 }
 
 const client = drizzle(async (sql, params) => {
-	queries.push(sql);
-	peakQueries = Math.max(peakQueries, ++activeQueries);
-	try {
-		if (latency) await delay(latency);
-		if (failDatabase) throw new Error("database unavailable");
-		if (sql.includes("from `organizations`")) {
-			return {
-				rows: denied ? [] : [["org", "Organization", "viewer", "owner"]],
-			};
-		}
-		if (sql.includes("from `spaces`")) {
-			return { rows: [["team", "Team", "Public", "viewer", "admin", false]] };
-		}
-		if (sql.includes(" group by ")) {
-			return {
-				rows: empty
-					? []
-					: Array.from({ length: size }, (_, index) => {
-							const id = owner(index);
-							return [
+	const query = async () => {
+		queries.push(sql);
+		peakQueries = Math.max(peakQueries, ++activeQueries);
+		try {
+			if (latency) await delay(latency);
+			if (failDatabase) throw new Error("database unavailable");
+			if (sql.includes('from "organizations"')) {
+				return {
+					rows: denied ? [] : [["org", "Organization", "viewer", "owner"]],
+				};
+			}
+			if (sql.includes('from "spaces"')) {
+				return { rows: [["team", "Team", "Public", "viewer", "admin", false]] };
+			}
+			if (sql.includes(" group by ")) {
+				return {
+					rows: empty
+						? []
+						: Array.from({ length: size }, (_, index) => {
+								const id = owner(index);
+								return [
+									`video-${index}`,
+									id,
+									`Cap ${index}`,
+									date,
+									date,
+									id === "owner-3" ? null : id,
+									...(sql.includes('"users"."preferences"')
+										? [id === "owner-3" ? null : preferences(id)]
+										: []),
+									60 + index,
+									null,
+									true,
+									index === 3,
+									index === 7,
+									2,
+									1,
+									null,
+									null,
+									null,
+									null,
+									null,
+									null,
+									null,
+									null,
+									null,
+								];
+							}),
+				};
+			}
+			if (sql.startsWith('select "preferences"')) {
+				return { rows: [[preferences("viewer")]] };
+			}
+			if (sql.startsWith('select "id", "preferences"')) {
+				return {
+					rows: ["viewer", "owner-1", "owner-2"].map((id) => [
+						id,
+						preferences(id),
+					]),
+				};
+			}
+			if (sql.includes('from "folders"')) {
+				return { rows: [["folder", "Folder", "normal", null, 4]] };
+			}
+			if (sql.includes("COUNT(")) return { rows: [[61, 81]] };
+			if (sql.includes(' order by "videos"."effectiveCreatedAt" desc limit ')) {
+				return {
+					rows: empty
+						? []
+						: Array.from({ length: size }, (_, index) => [
 								`video-${index}`,
-								id,
-								`Cap ${index}`,
-								date,
-								date,
-								id === "owner-3" ? null : id,
-								...(sql.includes("`users`.`preferences`")
-									? [id === "owner-3" ? null : preferences(id)]
-									: []),
-								60 + index,
-								null,
-								true,
-								index === 3,
-								index === 7,
-								2,
-								1,
-								null,
-								null,
-								null,
-								null,
-								null,
-								null,
-								null,
-								null,
-								null,
-							];
-						}),
-			};
+								params.includes("folder") ? "folder" : null,
+							]),
+				};
+			}
+			throw new Error(`Unexpected query: ${sql}`);
+		} finally {
+			activeQueries--;
 		}
-		if (sql.startsWith("select `preferences`")) {
-			return { rows: [[preferences("viewer")]] };
-		}
-		if (sql.startsWith("select `id`, `preferences`")) {
-			return {
-				rows: ["viewer", "owner-1", "owner-2"].map((id) => [
-					id,
-					preferences(id),
-				]),
-			};
-		}
-		if (sql.includes("from `folders`")) {
-			return { rows: [["folder", "Folder", "normal", null, 4]] };
-		}
-		if (sql.includes("COUNT(")) return { rows: [[61, 81]] };
-		if (sql.includes(" order by `videos`.`effectiveCreatedAt` desc limit ")) {
-			return {
-				rows: empty
-					? []
-					: Array.from({ length: size }, (_, index) => [
-							`video-${index}`,
-							params.includes("folder") ? "folder" : null,
-						]),
-			};
-		}
-		throw new Error(`Unexpected query: ${sql}`);
-	} finally {
-		activeQueries--;
-	}
+	};
+	const result = await query();
+	return {
+		rows: result.rows.map((row) =>
+			row.map((value) =>
+				typeof value === "boolean"
+					? Number(value)
+					: value && typeof value === "object"
+						? JSON.stringify(value)
+						: value,
+			),
+		),
+	};
 });
 
 let dispose: () => Promise<void>;
@@ -160,17 +174,22 @@ vi.mock("@/lib/server", async () => {
 	const { Videos, ImageUploads } = await import("@cap/web-backend");
 	return {
 		apiToHandler: (
-			api: Layer.Layer<HttpApi.Api, never, Database | HttpAuthMiddleware>,
+			api: Layer.Layer<
+				HttpApi.Api,
+				never,
+				CloudflareDatabase | HttpAuthMiddleware
+			>,
 		) => {
 			const web = HttpApiBuilder.toWebHandler(
 				api.pipe(
 					Layer.provide(
 						Layer.succeed(
-							Database,
-							Database.make({
+							CloudflareDatabase,
+							CloudflareDatabase.make({
 								use: (callback) =>
 									Effect.tryPromise({
-										try: () => callback(client as unknown as DbClient),
+										try: () =>
+											callback(client as unknown as CloudflareDbClient),
 										catch: (cause) => new DatabaseError({ cause }),
 									}),
 							}),

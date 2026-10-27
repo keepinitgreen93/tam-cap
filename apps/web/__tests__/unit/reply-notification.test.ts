@@ -7,8 +7,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const client = drizzle(mocks.query);
 	return { db: () => client };
 });
@@ -32,10 +32,12 @@ function prepareReply({
 		.mockResolvedValueOnce({ rows: [["owner", "owner-org", null]] })
 		.mockResolvedValueOnce({ rows: recipientId ? [[recipientId]] : [] })
 		.mockResolvedValueOnce({
-			rows: [[{ notifications: { pauseReplies } }, "reply-org"]],
+			rows: [
+				[JSON.stringify({ notifications: { pauseReplies } }), "reply-org"],
+			],
 		})
 		.mockResolvedValueOnce({ rows: existingReply ? [["existing-reply"]] : [] })
-		.mockResolvedValueOnce({ rows: [{ affectedRows: 1, insertId: 0 }] });
+		.mockResolvedValueOnce({ rows: [["notification"]] });
 }
 
 function reply(authorId: string) {
@@ -50,7 +52,7 @@ function reply(authorId: string) {
 
 function notificationInserts() {
 	return mocks.query.mock.calls.filter(([query]) =>
-		query.startsWith("insert into `notifications`"),
+		query.startsWith('insert into "notifications"'),
 	);
 }
 

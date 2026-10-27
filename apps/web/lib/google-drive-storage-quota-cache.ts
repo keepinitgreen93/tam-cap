@@ -1,5 +1,6 @@
-import { db } from "@cap/database";
-import { storageIntegrations } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { storageIntegrations } from "@cap/database/cloudflare/schema";
+import { activeIntegration } from "@cap/web-backend/src/Storage/persistence";
 import { Storage } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 
@@ -15,6 +16,7 @@ export const invalidateGoogleDriveStorageQuotaCache = async (
 			.set({ googleDriveStorageQuotaCache: null })
 			.where(
 				and(
+					activeIntegration,
 					eq(storageIntegrations.id, storageIntegrationId),
 					eq(storageIntegrations.provider, "googleDrive"),
 				),

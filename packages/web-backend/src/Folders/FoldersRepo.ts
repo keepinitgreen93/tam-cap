@@ -1,10 +1,16 @@
+import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
 import { Folder, type Organisation, type User } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Array, Effect, Option } from "effect";
 import type { Schema } from "effect/Schema";
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
+import {
+	activeFolder,
+	createFolder,
+	deleteFolderTree,
+	updateFolder,
+} from "./persistence.ts";
 
 export type CreateFolderInput = Omit<
 	Schema.Type<typeof Folder.Folder>,
@@ -33,6 +39,7 @@ export class FoldersRepo extends Effect.Service<FoldersRepo>()("FoldersRepo", {
 						.where(
 							Dz.and(
 								Dz.eq(Db.folders.id, id),
+								activeFolder,
 								filters?.organizationId &&
 									Dz.eq(Db.folders.organizationId, filters.organizationId),
 							),
@@ -40,47 +47,31 @@ export class FoldersRepo extends Effect.Service<FoldersRepo>()("FoldersRepo", {
 				)
 				.pipe(Effect.map(Array.get(0)));
 
-		const delete_ = (id: Folder.FolderId) =>
-			db.use((db) => db.delete(Db.folders).where(Dz.eq(Db.folders.id, id)));
+		const delete_ = (id: Folder.FolderId, userId: User.UserId) =>
+			db.use((database) => deleteFolderTree(database, id, userId));
 
 		const create = (data: CreateFolderInput) =>
 			Effect.gen(function* () {
 				const id = Folder.FolderId.make(nanoId());
-
-				yield* db.use((db) =>
-					db.insert(Db.folders).values([
-						{
-							...data,
-							id,
-							parentId: Option.getOrNull(data.parentId ?? Option.none()),
-							spaceId: Option.getOrNull(data.spaceId ?? Option.none()),
-						},
-					]),
+				const now = new Date();
+				yield* db.use((database) =>
+					createFolder(database, {
+						...data,
+						id,
+						createdAt: now,
+						updatedAt: now,
+						parentId: Option.getOrNull(data.parentId ?? Option.none()),
+						spaceId: Option.getOrNull(data.spaceId ?? Option.none()),
+					}),
 				);
-
 				return id;
 			});
 
-		const update = (id: Folder.FolderId, data: Partial<CreateFolderInput>) =>
-			Effect.gen(function* () {
-				yield* db.use((db) =>
-					db
-						.update(Db.folders)
-						.set({
-							...data,
-							parentId: data.parentId
-								? Option.getOrNull(data.parentId)
-								: undefined,
-							spaceId: data.spaceId
-								? Option.getOrNull(data.spaceId)
-								: undefined,
-							updatedAt: new Date(),
-						})
-						.where(Dz.eq(Db.folders.id, id)),
-				);
-
-				return yield* getById(id);
-			});
+		const update = (
+			id: Folder.FolderId,
+			userId: User.UserId,
+			data: Parameters<typeof updateFolder>[3],
+		) => db.use((database) => updateFolder(database, id, userId, data));
 
 		return { getById, delete: delete_, create, update };
 	}),

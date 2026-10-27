@@ -8,7 +8,7 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => ({ id: "owner" }),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({
 			from: () => ({
@@ -40,6 +40,7 @@ describe("removeOrganizationDomain", () => {
 	beforeEach(() => {
 		mocks.updates = [];
 		vi.unstubAllGlobals();
+		vi.unstubAllEnvs();
 	});
 
 	it("keeps the domain when the provider rejects removal", async () => {
@@ -76,5 +77,16 @@ describe("removeOrganizationDomain", () => {
 			success: true,
 		});
 		expect(mocks.updates).toHaveLength(1);
+	});
+	it("leaves operator-managed Cloudflare domains unchanged without contacting Vercel", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		const fetchMock = vi.fn();
+		vi.stubGlobal("fetch", fetchMock);
+		await expect(removeOrganizationDomain(organizationId)).rejects.toThrow(
+			"deployment operator",
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+		expect(mocks.updates).toEqual([]);
+		vi.unstubAllEnvs();
 	});
 });

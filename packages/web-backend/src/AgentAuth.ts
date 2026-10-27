@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import { Agent } from "@cap/web-domain";
 import { HttpServerRequest } from "@effect/platform";
 import { and, eq, isNull, lte, or } from "drizzle-orm";
 import { Effect, Layer, Schema } from "effect";
-import { Database } from "./Database.ts";
+import { CloudflareDatabase as Database } from "./CloudflareDatabase.ts";
 
 const requestId = () => crypto.randomUUID();
 

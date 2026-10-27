@@ -1,18 +1,20 @@
+import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import "server-only";
 
 import { randomBytes } from "node:crypto";
-import { db } from "@cap/database";
 import { isBlockedAccountEmail } from "@cap/database/auth/domain-utils";
-import { nanoId } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	mcpOAuthClients,
 	mcpOAuthCodes,
 	mcpOAuthRegistrationQuotas,
 	mcpOAuthTokens,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import { serverEnv } from "@cap/env";
-import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, isNull } from "drizzle-orm";
 import {
 	hashAgentSecret,
 	isAgentCodeChallenge,
@@ -94,39 +96,39 @@ export const registerMcpClient = async (input: {
 	const now = new Date();
 	const windowId = now.toISOString().slice(0, 10);
 	const clientId = token("cap_mcp_client_");
-	const accepted = await db().transaction(async (tx) => {
-		await tx
-			.insert(mcpOAuthRegistrationQuotas)
-			.values({
-				windowId,
-				registrations: 0,
-				expiresAt: new Date(now.getTime() + 3 * 24 * 60 * 60_000),
-			})
-			.onDuplicateKeyUpdate({
-				set: {
-					windowId: sql`${mcpOAuthRegistrationQuotas.windowId}`,
-				},
-			});
-		const [quota] = await tx
-			.select({ registrations: mcpOAuthRegistrationQuotas.registrations })
-			.from(mcpOAuthRegistrationQuotas)
-			.where(eq(mcpOAuthRegistrationQuotas.windowId, windowId))
-			.limit(1)
-			.for("update");
-		if (!quota || quota.registrations >= dailyRegistrationLimit) return false;
-		await tx
-			.update(mcpOAuthRegistrationQuotas)
-			.set({
-				registrations: sql`${mcpOAuthRegistrationQuotas.registrations} + 1`,
-			})
-			.where(eq(mcpOAuthRegistrationQuotas.windowId, windowId));
-		await tx.insert(mcpOAuthClients).values({
-			id: nanoId(),
-			clientId,
-			clientName: input.clientName,
-			redirectUris: input.redirectUris,
-		});
-		return true;
+	const database = db();
+	const registrationId = nanoId();
+	const accepted = await atomic(database, async (snapshot) => {
+		const [quota] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(mcpOAuthRegistrationQuotas)
+				.where(eq(mcpOAuthRegistrationQuotas.windowId, windowId))
+				.limit(1),
+		);
+		if (quota && quota.registrations >= dailyRegistrationLimit)
+			return { statements: [], result: false };
+		return {
+			statements: [
+				quota
+					? database
+							.update(mcpOAuthRegistrationQuotas)
+							.set({ registrations: quota.registrations + 1 })
+							.where(eq(mcpOAuthRegistrationQuotas.windowId, windowId))
+					: database.insert(mcpOAuthRegistrationQuotas).values({
+							windowId,
+							registrations: 1,
+							expiresAt: new Date(now.getTime() + 3 * 24 * 60 * 60_000),
+						}),
+				database.insert(mcpOAuthClients).values({
+					id: registrationId,
+					clientId,
+					clientName: input.clientName,
+					redirectUris: input.redirectUris,
+				}),
+			],
+			result: true,
+		};
 	});
 	return accepted ? clientId : null;
 };
@@ -155,64 +157,81 @@ export const createMcpAuthorizationCode = async (
 	request: McpAuthorizationRequest,
 ) => {
 	const code = token("cap_mcp_code_");
-	await db().transaction(async (tx) => {
-		const activated = await tx
-			.update(mcpOAuthClients)
-			.set({ activatedAt: new Date() })
-			.where(eq(mcpOAuthClients.clientId, request.clientId));
-		if (affectedRows(activated) !== 1)
+	const database = db();
+	const id = nanoId();
+	const now = new Date();
+	await atomic(database, async (snapshot) => {
+		const [client] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(mcpOAuthClients)
+				.where(eq(mcpOAuthClients.clientId, request.clientId))
+				.limit(1),
+		);
+		if (!client || !client.redirectUris.includes(request.redirectUri))
 			throw new Error("Client registration expired");
-		await tx.insert(mcpOAuthCodes).values({
-			id: nanoId(),
-			userId,
-			clientId: request.clientId,
-			codeHash: hashAgentSecret(code),
-			codeChallenge: request.codeChallenge,
-			redirectUri: request.redirectUri,
-			resource: request.resource,
-			expiresAt: new Date(Date.now() + 5 * 60_000),
-		});
+		return {
+			statements: [
+				database
+					.update(mcpOAuthClients)
+					.set({ activatedAt: now })
+					.where(eq(mcpOAuthClients.clientId, request.clientId)),
+				database.insert(mcpOAuthCodes).values({
+					id,
+					userId,
+					clientId: request.clientId,
+					codeHash: hashAgentSecret(code),
+					codeChallenge: request.codeChallenge,
+					redirectUri: request.redirectUri,
+					resource: request.resource,
+					expiresAt: new Date(now.getTime() + 5 * 60_000),
+				}),
+			],
+			result: undefined,
+		};
 	});
 	return code;
 };
 
-const affectedRows = (result: unknown) => {
-	const value = Array.isArray(result) ? result[0] : result;
-	return (value as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
+type McpTokens = {
+	access_token: string;
+	refresh_token: string;
+	token_type: "Bearer";
+	expires_in: number;
+	scope: "caps:read";
 };
-
-const mintMcpTokens = async (
-	tx: Parameters<Parameters<ReturnType<typeof db>["transaction"]>[0]>[0],
+const tokenPair = () => ({
+	id: nanoId(),
+	access: token("cap_mcp_"),
+	refresh: token("cap_mcp_refresh_"),
+	now: Date.now(),
+});
+const mintMcpTokens = (
+	database: CloudflareDatabase,
 	input: {
 		userId: typeof mcpOAuthTokens.$inferInsert.userId;
 		clientId: string;
 		resource: string;
 		familyId: string;
 	},
-) => {
-	const accessToken = token("cap_mcp_");
-	const refreshToken = token("cap_mcp_refresh_");
-	const now = Date.now();
-	await tx.insert(mcpOAuthTokens).values({
-		id: nanoId(),
-		userId: input.userId,
-		clientId: input.clientId,
-		familyId: input.familyId,
-		resource: input.resource,
-		accessHash: hashAgentSecret(accessToken),
-		refreshHash: hashAgentSecret(refreshToken),
-		accessExpiresAt: new Date(now + accessLifetimeSeconds * 1_000),
-		refreshExpiresAt: new Date(now + refreshLifetimeSeconds * 1_000),
-	});
-	return {
-		access_token: accessToken,
-		refresh_token: refreshToken,
-		token_type: "Bearer" as const,
+	minted: ReturnType<typeof tokenPair>,
+) => ({
+	statement: database.insert(mcpOAuthTokens).values({
+		id: minted.id,
+		...input,
+		accessHash: hashAgentSecret(minted.access),
+		refreshHash: hashAgentSecret(minted.refresh),
+		accessExpiresAt: new Date(minted.now + accessLifetimeSeconds * 1_000),
+		refreshExpiresAt: new Date(minted.now + refreshLifetimeSeconds * 1_000),
+	}),
+	result: {
+		access_token: minted.access,
+		refresh_token: minted.refresh,
+		token_type: "Bearer",
 		expires_in: accessLifetimeSeconds,
-		scope: "caps:read" as const,
-	};
-};
-
+		scope: "caps:read",
+	} satisfies McpTokens,
+});
 export const exchangeMcpCode = async (params: URLSearchParams) => {
 	const code = params.get("code");
 	const clientId = params.get("client_id");
@@ -229,43 +248,51 @@ export const exchangeMcpCode = async (params: URLSearchParams) => {
 		resource !== mcpResource()
 	)
 		return null;
-	return db().transaction(async (tx) => {
-		const [grant] = await tx
-			.select()
-			.from(mcpOAuthCodes)
-			.where(eq(mcpOAuthCodes.codeHash, hashAgentSecret(code)))
-			.limit(1);
+	const database = db();
+	const minted = tokenPair();
+	const familyId = nanoId();
+	return atomic<McpTokens | null>(database, async (snapshot) => {
+		const [grant] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(mcpOAuthCodes)
+				.where(eq(mcpOAuthCodes.codeHash, hashAgentSecret(code)))
+				.limit(1),
+		);
+		const now = new Date();
 		if (
 			!grant ||
 			grant.clientId !== clientId ||
 			grant.redirectUri !== redirectUri ||
 			grant.resource !== resource ||
 			grant.consumedAt ||
-			grant.expiresAt.getTime() <= Date.now() ||
+			grant.expiresAt <= now ||
 			!verifyAgentCodeChallenge(verifier, grant.codeChallenge)
 		)
-			return null;
-		const now = new Date();
-		const consumed = await tx
-			.update(mcpOAuthCodes)
-			.set({ consumedAt: now })
-			.where(
-				and(
-					eq(mcpOAuthCodes.id, grant.id),
-					isNull(mcpOAuthCodes.consumedAt),
-					gt(mcpOAuthCodes.expiresAt, now),
-				),
-			);
-		if (affectedRows(consumed) !== 1) return null;
-		return mintMcpTokens(tx, {
-			userId: grant.userId,
-			clientId,
-			resource,
-			familyId: nanoId(),
-		});
+			return { statements: [], result: null };
+		const next = mintMcpTokens(
+			database,
+			{ userId: grant.userId, clientId, resource, familyId },
+			minted,
+		);
+		return {
+			statements: [
+				database
+					.update(mcpOAuthCodes)
+					.set({ consumedAt: now })
+					.where(
+						and(
+							eq(mcpOAuthCodes.id, grant.id),
+							isNull(mcpOAuthCodes.consumedAt),
+							gt(mcpOAuthCodes.expiresAt, now),
+						),
+					),
+				next.statement,
+			],
+			result: next.result,
+		};
 	});
 };
-
 export const refreshMcpTokens = async (params: URLSearchParams) => {
 	const refreshToken = params.get("refresh_token");
 	const clientId = params.get("client_id");
@@ -277,43 +304,53 @@ export const refreshMcpTokens = async (params: URLSearchParams) => {
 		resource !== mcpResource()
 	)
 		return null;
-	return db().transaction(async (tx) => {
-		const [row] = await tx
-			.select()
-			.from(mcpOAuthTokens)
-			.where(eq(mcpOAuthTokens.refreshHash, hashAgentSecret(refreshToken)))
-			.limit(1);
+	const database = db();
+	const minted = tokenPair();
+	return atomic<McpTokens | null>(database, async (snapshot) => {
+		const [row] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(mcpOAuthTokens)
+				.where(eq(mcpOAuthTokens.refreshHash, hashAgentSecret(refreshToken)))
+				.limit(1),
+		);
 		if (!row || row.clientId !== clientId || row.resource !== resource)
-			return null;
-		if (row.revokedAt) {
-			await tx
-				.update(mcpOAuthTokens)
-				.set({ revokedAt: new Date() })
-				.where(eq(mcpOAuthTokens.familyId, row.familyId));
-			return null;
-		}
-		if (row.refreshExpiresAt.getTime() <= Date.now()) return null;
+			return { statements: [], result: null };
 		const now = new Date();
-		const revoked = await tx
-			.update(mcpOAuthTokens)
-			.set({ revokedAt: now })
-			.where(
-				and(
-					eq(mcpOAuthTokens.id, row.id),
-					isNull(mcpOAuthTokens.revokedAt),
-					gt(mcpOAuthTokens.refreshExpiresAt, now),
-				),
-			);
-		if (affectedRows(revoked) !== 1) return null;
-		return mintMcpTokens(tx, {
-			userId: row.userId,
-			clientId,
-			resource,
-			familyId: row.familyId,
-		});
+		if (row.revokedAt)
+			return {
+				statements: [
+					database
+						.update(mcpOAuthTokens)
+						.set({ revokedAt: now })
+						.where(eq(mcpOAuthTokens.familyId, row.familyId)),
+				],
+				result: null,
+			};
+		if (row.refreshExpiresAt <= now) return { statements: [], result: null };
+		const next = mintMcpTokens(
+			database,
+			{ userId: row.userId, clientId, resource, familyId: row.familyId },
+			minted,
+		);
+		return {
+			statements: [
+				database
+					.update(mcpOAuthTokens)
+					.set({ revokedAt: now })
+					.where(
+						and(
+							eq(mcpOAuthTokens.id, row.id),
+							isNull(mcpOAuthTokens.revokedAt),
+							gt(mcpOAuthTokens.refreshExpiresAt, now),
+						),
+					),
+				next.statement,
+			],
+			result: next.result,
+		};
 	});
 };
-
 export const authenticateMcpBearer = async (authorization: string | null) => {
 	const match = authorization?.match(/^Bearer (cap_mcp_[A-Za-z0-9_-]{43})$/i);
 	if (!match?.[1]) return null;

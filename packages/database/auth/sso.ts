@@ -3,10 +3,10 @@ import { serverEnv } from "@cap/env";
 import { hasSsoAccess } from "@cap/utils";
 import { Organisation, User } from "@cap/web-domain";
 import { WorkOS } from "@workos-inc/node";
-import { and, eq, isNull } from "drizzle-orm";
-import { nanoId } from "../helpers.ts";
-import { db } from "../index.ts";
-import { enqueueLoopsSync } from "../loops/queue.ts";
+import { and, eq, gt, isNull, or } from "drizzle-orm";
+import { db } from "../cloudflare/application.ts";
+import { type AtomicStatement, atomic } from "../cloudflare/atomic.ts";
+import { loopsSyncStatements } from "../cloudflare/loops.ts";
 import {
 	accounts,
 	organizationInvites,
@@ -14,7 +14,9 @@ import {
 	organizationSso,
 	organizations,
 	users,
-} from "../schema.ts";
+} from "../cloudflare/schema.ts";
+import { nanoId } from "../helpers.ts";
+import { normalizeEmail } from "./identity.ts";
 import type { SsoLoginIntent } from "./sso-state.ts";
 
 export type ValidatedSsoIdentity = {
@@ -107,7 +109,7 @@ export async function validateSsoSignIn(
 	) {
 		throw new Error("The SSO identity does not match this organization.");
 	}
-	const email = raw.email.trim().toLowerCase();
+	const email = normalizeEmail(raw.email);
 	const domain = getSsoEmailDomain(email);
 	if (!domain || email.length > 255)
 		throw new Error("Invalid SSO email address.");
@@ -150,7 +152,7 @@ export async function validateSsoSignIn(
 	if (
 		linkedUsers.some(
 			(user) =>
-				user.email.toLowerCase() !== email ||
+				normalizeEmail(user.email) !== email ||
 				(linkedUsers[0] && user.id !== linkedUsers[0].id),
 		)
 	) {
@@ -166,7 +168,7 @@ export async function validateSsoSignIn(
 			.limit(1);
 		if (
 			!actor ||
-			actor.email.toLowerCase() !== email ||
+			normalizeEmail(actor.email) !== email ||
 			linkedUsers.some((user) => user.id !== actor.id)
 		) {
 			throw new Error(
@@ -187,97 +189,137 @@ export async function provisionSsoMembership(
 	userId: User.UserId,
 	identity: ValidatedSsoIdentity,
 ) {
-	await db().transaction(async (tx) => {
-		const [organization] = await tx
-			.select()
-			.from(organizations)
-			.where(eq(organizations.id, identity.organizationId))
-			.for("update");
-		const [billing] = await tx
-			.select()
-			.from(organizationSso)
-			.where(eq(organizationSso.organizationId, identity.organizationId))
-			.for("update");
-		const [user] = await tx
-			.select()
-			.from(users)
-			.where(eq(users.id, userId))
-			.for("update");
+	const database = db();
+	const memberId = nanoId();
+	const now = new Date();
+	await atomic(database, async (snapshot) => {
+		const [organization] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(organizations)
+				.where(eq(organizations.id, identity.organizationId)),
+		);
+		const [billing] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(organizationSso)
+				.where(eq(organizationSso.organizationId, identity.organizationId)),
+		);
+		const [user] = await snapshot.read((reader) =>
+			reader.select().from(users).where(eq(users.id, userId)),
+		);
 		if (
 			!organization ||
 			organization.tombstoneAt ||
 			organization.workosOrganizationId !== identity.workosOrganizationId ||
 			!hasSsoAccess(billing) ||
 			!user ||
-			user.email.toLowerCase() !== identity.email
-		) {
+			normalizeEmail(user.email) !== normalizeEmail(identity.email)
+		)
 			throw new Error(
 				"The SSO organization or account is no longer available.",
 			);
-		}
-		const linkedAccounts = await tx
-			.selectDistinct({ userId: accounts.userId })
-			.from(accounts)
-			.where(
-				and(
-					eq(accounts.provider, "workos"),
-					eq(accounts.providerAccountId, identity.profileId),
-				),
-			)
-			.limit(2);
+		const linkedAccounts = await snapshot.read((reader) =>
+			reader
+				.selectDistinct({ userId: accounts.userId })
+				.from(accounts)
+				.where(
+					and(
+						eq(accounts.provider, "workos"),
+						eq(accounts.providerAccountId, identity.profileId),
+					),
+				)
+				.limit(2),
+		);
 		if (linkedAccounts.length !== 1 || linkedAccounts[0]?.userId !== userId)
 			throw new Error("The SSO account is not linked to this user.");
-		const [member] = await tx
-			.select({ id: organizationMembers.id })
-			.from(organizationMembers)
-			.where(
-				and(
-					eq(organizationMembers.userId, userId),
-					eq(organizationMembers.organizationId, identity.organizationId),
-				),
-			)
-			.limit(1);
-		if (!member) {
-			await tx.insert(organizationMembers).values({
-				id: nanoId(),
-				userId,
-				organizationId: identity.organizationId,
-				role: organization.ownerId === userId ? "owner" : "member",
-				hasProSeat: false,
-			});
-		}
-		await tx
-			.update(organizationInvites)
-			.set({ status: "accepted" })
-			.where(
-				and(
-					eq(organizationInvites.organizationId, identity.organizationId),
-					eq(organizationInvites.invitedEmail, identity.email),
-					eq(organizationInvites.status, "pending"),
-				),
-			);
-		await tx
-			.update(users)
-			.set({
-				activeOrganizationId: identity.organizationId,
-				marketingOrigin: "teammate",
-				defaultOrgId: user.defaultOrgId || identity.organizationId,
-				emailVerified: user.emailVerified ?? new Date(),
-				onboarding_completed_at: user.onboarding_completed_at ?? new Date(),
-				onboardingSteps: {
-					...user.onboardingSteps,
-					welcome: true,
-					organizationSetup: true,
-					customDomain: true,
-					inviteTeam: true,
-					download: true,
-				},
-			})
-			.where(eq(users.id, userId));
-		await enqueueLoopsSync(
-			tx,
-			userId,
-			!member || !user.onboarding_completed_at,
+		const [member] = await snapshot.read((reader) =>
+			reader
+				.select({ id: organizationMembers.id })
+				.from(organizationMembers)
+				.where(
+					and(
+						eq(organizationMembers.userId, userId),
+						eq(organizationMembers.organizationId, identity.organizationId),
+					),
+				)
+				.limit(1),
 		);
+		const statements: AtomicStatement[] = [];
+		if (!member && organization.ownerId !== userId) {
+			const [invite] = await snapshot.read((reader) =>
+				reader
+					.select({ id: organizationInvites.id })
+					.from(organizationInvites)
+					.where(
+						and(
+							eq(organizationInvites.organizationId, identity.organizationId),
+							eq(
+								organizationInvites.invitedEmail,
+								normalizeEmail(identity.email),
+							),
+							eq(organizationInvites.status, "pending"),
+							or(
+								isNull(organizationInvites.expiresAt),
+								gt(organizationInvites.expiresAt, now),
+							),
+						),
+					)
+					.limit(1),
+			);
+			if (!invite)
+				throw new Error(
+					"An organization invitation is required before joining through SSO.",
+				);
+		}
+		if (!member)
+			statements.push(
+				database.insert(organizationMembers).values({
+					id: memberId,
+					userId,
+					organizationId: identity.organizationId,
+					role: organization.ownerId === userId ? "owner" : "member",
+					hasProSeat: false,
+				}),
+			);
+		statements.push(
+			database
+				.update(organizationInvites)
+				.set({ status: "accepted" })
+				.where(
+					and(
+						eq(organizationInvites.organizationId, identity.organizationId),
+						eq(
+							organizationInvites.invitedEmail,
+							normalizeEmail(identity.email),
+						),
+						eq(organizationInvites.status, "pending"),
+					),
+				),
+			database
+				.update(users)
+				.set({
+					activeOrganizationId: identity.organizationId,
+					marketingOrigin: "teammate",
+					defaultOrgId: user.defaultOrgId || identity.organizationId,
+					emailVerified: user.emailVerified ?? now,
+					onboarding_completed_at: user.onboarding_completed_at ?? now,
+					onboardingSteps: {
+						...user.onboardingSteps,
+						welcome: true,
+						organizationSetup: true,
+						customDomain: true,
+						inviteTeam: true,
+						download: true,
+					},
+				})
+				.where(eq(users.id, userId)),
+			...loopsSyncStatements(
+				database,
+				userId,
+				!member || !user.onboarding_completed_at,
+			),
+		);
+		return { statements, result: undefined };
 	});
 }

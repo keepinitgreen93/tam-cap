@@ -1,10 +1,10 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	importedVideos,
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { buildEnv } from "@cap/env";
 import type { User, Video } from "@cap/web-domain";
@@ -20,7 +20,6 @@ import {
 	or,
 	sql,
 } from "drizzle-orm";
-import { start } from "workflow/api";
 import {
 	AI_ENTITLED_SUBSCRIPTION_STATUSES,
 	isAiGenerationEnabledForUser,
@@ -33,7 +32,7 @@ import {
 	startLoomImportWorkflow,
 } from "@/lib/loom-import-start";
 import { transcribeVideo } from "@/lib/transcribe";
-import { processVideoWorkflow } from "@/workflows/process-video";
+import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 
 export const STALLED_PIPELINE_MIN_AGE_MS = 60 * 60 * 1000;
 export const STALLED_PIPELINE_MAX_AGE_MS = 48 * 60 * 60 * 1000;
@@ -75,15 +74,8 @@ export type StalledVideoPipelineRecoverySummary = {
 	ai: PipelineRecoveryGroup;
 };
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
+const getAffectedRows = (result: { meta: { changes: number } }) =>
+	result.meta.changes;
 
 const summarize = (
 	results: PipelineRecoveryResult[],
@@ -146,11 +138,31 @@ type MediaCandidate = {
 async function recoverMediaCandidate(
 	candidate: MediaCandidate,
 ): Promise<PipelineRecoveryStatus> {
+	if (!candidate.loomVideoId) {
+		try {
+			const status = await startVideoProcessingWorkflow({
+				videoId: candidate.videoId,
+				userId: candidate.userId,
+				rawFileKey: candidate.rawFileKey,
+				bucketId: candidate.bucketId,
+				forceRestart: true,
+				expectedUpdatedAt: candidate.updatedAt,
+				expectedProcessingToken:
+					candidate.metadata?.processingRun?.token ?? null,
+				processingMessage: "Restarting video processing",
+				startFailureMessage: "Processing recovery will retry automatically",
+			});
+			return status === "started" ? "started" : "already-claimed";
+		} catch {
+			return "retry-scheduled";
+		}
+	}
+
 	const receipt = candidate.metadata?.loomImportRun;
 	const receiptCondition = candidate.loomVideoId
 		? receipt
-			? sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${candidate.videoId} AND JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.loomImportRun.runId')) = ${receipt.runId})`
-			: sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${candidate.videoId} AND JSON_EXTRACT(${videos.metadata}, '$.loomImportRun') IS NULL)`
+			? sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${candidate.videoId} AND json_extract(${videos.metadata}, '$.loomImportRun.runId') = ${receipt.runId})`
+			: sql`EXISTS (SELECT 1 FROM ${videos} WHERE ${videos.id} = ${candidate.videoId} AND json_extract(${videos.metadata}, '$.loomImportRun') IS NULL)`
 		: undefined;
 	if (candidate.loomVideoId) {
 		const state = await getLoomImportRunState(receipt);
@@ -209,15 +221,6 @@ async function recoverMediaCandidate(
 				reuseExistingRawUpload: true,
 				importPriority: receipt?.importPriority,
 			});
-		} else {
-			await start(processVideoWorkflow, [
-				{
-					videoId: candidate.videoId,
-					userId: candidate.userId,
-					rawFileKey: candidate.rawFileKey,
-					bucketId: candidate.bucketId,
-				},
-			]);
 		}
 
 		return "started";
@@ -311,7 +314,7 @@ async function recoverAiCandidate(
 				and(
 					eq(videos.id, candidate.videoId),
 					eq(videos.updatedAt, candidate.updatedAt),
-					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.aiGenerationStatus')) = ${status}`,
+					sql`json_extract(${videos.metadata}, '$.aiGenerationStatus') = ${status}`,
 				),
 			);
 
@@ -373,7 +376,7 @@ export async function recoverStalledVideoPipeline({
 				isNotNull(videoUploads.rawFileKey),
 				lte(videoUploads.updatedAt, staleBefore),
 				gte(videoUploads.startedAt, recentBefore),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.source}, '$.type')) = 'webMP4'`,
+				sql`json_extract(${videos.source}, '$.type') = 'webMP4'`,
 			),
 		)
 		.orderBy(asc(videoUploads.updatedAt))
@@ -400,7 +403,7 @@ export async function recoverStalledVideoPipeline({
 				or(
 					and(
 						isNull(videos.transcriptionStatus),
-						sql`JSON_EXTRACT(${videos.metadata}, '$.transcribeOnView') IS NULL`,
+						sql`json_extract(${videos.metadata}, '$.transcribeOnView') IS NULL`,
 					),
 					eq(videos.transcriptionStatus, "PROCESSING"),
 				),
@@ -434,19 +437,19 @@ export async function recoverStalledVideoPipeline({
 						// view; recovery resumes AI a view started but never starts it.
 						and(
 							isNull(
-								sql`JSON_EXTRACT(${videos.metadata}, '$.aiGenerationStatus')`,
+								sql`json_extract(${videos.metadata}, '$.aiGenerationStatus')`,
 							),
-							sql`JSON_EXTRACT(${videos.metadata}, '$.transcribeOnView') IS NULL`,
+							sql`json_extract(${videos.metadata}, '$.transcribeOnView') IS NULL`,
 						),
 						inArray(
-							sql<string>`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.aiGenerationStatus'))`,
+							sql<string>`json_extract(${videos.metadata}, '$.aiGenerationStatus')`,
 							["QUEUED", "PROCESSING"],
 						),
 					),
-					sql`(${videos.metadata} IS NULL OR JSON_EXTRACT(${videos.metadata}, '$.summary') IS NULL OR JSON_EXTRACT(${videos.metadata}, '$.chapters') IS NULL)`,
+					sql`(${videos.metadata} IS NULL OR json_extract(${videos.metadata}, '$.summary') IS NULL OR json_extract(${videos.metadata}, '$.chapters') IS NULL)`,
 					// Filtering entitlement after LIMIT let older ineligible videos
 					// fill every batch, so eligible ones were never reached.
-					buildEnv.NEXT_PUBLIC_IS_CAP
+					buildEnv.NEXT_PUBLIC_IS_CAP === "true"
 						? or(
 								sql`COALESCE(${users.thirdPartyStripeSubscriptionId}, '') <> ''`,
 								inArray(

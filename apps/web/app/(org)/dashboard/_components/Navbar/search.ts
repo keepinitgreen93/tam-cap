@@ -1,7 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	organizationMembers,
 	organizations,
@@ -11,7 +11,7 @@ import {
 	spaceVideos,
 	users,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { Video } from "@cap/web-domain";
 import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 

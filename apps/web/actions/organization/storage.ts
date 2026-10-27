@@ -2,17 +2,23 @@
 
 import { createHmac } from "node:crypto";
 import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { decrypt, encrypt } from "@cap/database/crypto";
-import { nanoId } from "@cap/database/helpers";
+import { requireOrganizationManager } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	type AtomicStatement,
+	atomic,
+	type SnapshotReader,
+} from "@cap/database/cloudflare/atomic";
 import {
 	organizations,
 	s3Buckets,
 	storageIntegrations,
 	storageObjects,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { decrypt, encrypt } from "@cap/database/crypto";
+import { nanoId } from "@cap/database/helpers";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
@@ -214,15 +220,16 @@ const getS3ConnectionErrorMessage = (error: unknown, bucketName: string) => {
 };
 
 const driveHasStoredData = async (
+	reader: SnapshotReader,
 	drive: typeof storageIntegrations.$inferSelect,
 ) => {
 	const [object, video] = await Promise.all([
-		db()
+		reader
 			.select({ id: storageObjects.id })
 			.from(storageObjects)
 			.where(eq(storageObjects.integrationId, drive.id))
 			.limit(1),
-		db()
+		reader
 			.select({ id: videos.id })
 			.from(videos)
 			.where(eq(videos.storageIntegrationId, drive.id))
@@ -314,6 +321,7 @@ const getS3InputCredentials = async (input: S3ConfigInput) => {
 	}
 
 	return {
+		sourceBucketId: existingBucket.id,
 		accessKeyId: await decrypt(existingBucket.accessKeyId),
 		secretAccessKey: await decrypt(existingBucket.secretAccessKey),
 	};
@@ -404,16 +412,41 @@ export async function saveOrganizationS3Config(input: S3ConfigInput) {
 		organizationId: input.organizationId,
 	};
 
-	await db().transaction(async (tx) => {
-		await tx
-			.update(s3Buckets)
-			.set({ active: false })
-			.where(eq(s3Buckets.organizationId, input.organizationId));
-		await tx.insert(s3Buckets).values({
-			id: S3Bucket.S3BucketId.make(nanoId()),
-			...encryptedConfig,
-			active: true,
-		});
+	const database = db();
+	const bucketId = S3Bucket.S3BucketId.make(nanoId());
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, input.organizationId, user.id);
+		if ("sourceBucketId" in credentials) {
+			const [current] = await snapshot.read((reader) =>
+				reader
+					.select({ id: s3Buckets.id })
+					.from(s3Buckets)
+					.where(
+						and(
+							eq(s3Buckets.organizationId, input.organizationId),
+							eq(s3Buckets.active, true),
+						),
+					)
+					.orderBy(desc(s3Buckets.updatedAt))
+					.limit(1),
+			);
+			if (current?.id !== credentials.sourceBucketId)
+				throw new Error(
+					"Storage credentials changed; reload the settings before saving.",
+				);
+		}
+		return {
+			statements: [
+				database
+					.update(s3Buckets)
+					.set({ active: false })
+					.where(eq(s3Buckets.organizationId, input.organizationId)),
+				database
+					.insert(s3Buckets)
+					.values({ id: bucketId, ...encryptedConfig, active: true }),
+			],
+			result: undefined,
+		};
 	});
 
 	revalidateStorageSettings();
@@ -423,15 +456,23 @@ export async function saveOrganizationS3Config(input: S3ConfigInput) {
 export async function removeOrganizationS3Config(
 	organizationId: Organisation.OrganisationId,
 ) {
-	await requireOrganizationStorageManagerPro(organizationId);
-	await db()
-		.update(s3Buckets)
-		.set({ active: false })
-		.where(eq(s3Buckets.organizationId, organizationId));
+	const { user } = await requireOrganizationStorageManagerPro(organizationId);
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, organizationId, user.id);
+		return {
+			statements: [
+				database
+					.update(s3Buckets)
+					.set({ active: false })
+					.where(eq(s3Buckets.organizationId, organizationId)),
+			],
+			result: undefined,
+		};
+	});
 	revalidateStorageSettings();
 	return { success: true };
 }
-
 export async function testOrganizationS3Config(input: S3ConfigInput) {
 	await requireOrganizationStorageManagerPro(input.organizationId);
 	if (await isDisallowedS3Endpoint(input.endpoint)) {
@@ -469,43 +510,76 @@ export async function setOrganizationStorageProvider({
 	organizationId: Organisation.OrganisationId;
 	provider: OrganizationStorageProvider;
 }) {
-	await requireOrganizationStorageManagerPro(organizationId);
-
+	const { user } = await requireOrganizationStorageManagerPro(organizationId);
+	const database = db();
 	if (provider === "s3") {
-		const bucket = await getOrganizationBucket(organizationId);
-		if (!bucket) throw new Error("S3 is not configured");
-		await db()
-			.update(storageIntegrations)
-			.set({ active: false })
-			.where(eq(storageIntegrations.organizationId, organizationId));
-		revalidateStorageSettings();
-		return { success: true };
+		await atomic(database, async (snapshot) => {
+			await requireOrganizationManager(snapshot, organizationId, user.id);
+			const [bucket] = await snapshot.read((reader) =>
+				reader
+					.select({ id: s3Buckets.id })
+					.from(s3Buckets)
+					.where(
+						and(
+							eq(s3Buckets.organizationId, organizationId),
+							eq(s3Buckets.active, true),
+						),
+					)
+					.limit(1),
+			);
+			if (!bucket) throw new Error("S3 is not configured");
+			return {
+				statements: [
+					database
+						.update(storageIntegrations)
+						.set({ active: false })
+						.where(eq(storageIntegrations.organizationId, organizationId)),
+				],
+				result: undefined,
+			};
+		});
+	} else {
+		const drive = await getOrganizationDrive(organizationId);
+		if (!drive || drive.status !== "active")
+			throw new Error("Google Drive is not connected");
+		if (!hasDriveLocation(await parseDriveConfig(drive)))
+			throw new Error("Choose a Google Drive location before enabling it");
+		await atomic(database, async (snapshot) => {
+			await requireOrganizationManager(snapshot, organizationId, user.id);
+			const [current] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(storageIntegrations)
+					.where(eq(storageIntegrations.id, drive.id))
+					.limit(1),
+			);
+			if (
+				!current ||
+				current.status !== "active" ||
+				current.organizationId !== organizationId ||
+				current.encryptedConfig !== drive.encryptedConfig
+			)
+				throw new Error(
+					"Google Drive configuration changed; reload the settings.",
+				);
+			return {
+				statements: [
+					database
+						.update(storageIntegrations)
+						.set({ active: false })
+						.where(eq(storageIntegrations.organizationId, organizationId)),
+					database
+						.update(storageIntegrations)
+						.set({ active: true })
+						.where(eq(storageIntegrations.id, drive.id)),
+				],
+				result: undefined,
+			};
+		});
 	}
-
-	const drive = await getOrganizationDrive(organizationId);
-	if (!drive || drive.status !== "active") {
-		throw new Error("Google Drive is not connected");
-	}
-	const config = await parseDriveConfig(drive);
-	if (!hasDriveLocation(config)) {
-		throw new Error("Choose a Google Drive location before enabling it");
-	}
-
-	await db().transaction(async (tx) => {
-		await tx
-			.update(storageIntegrations)
-			.set({ active: false })
-			.where(eq(storageIntegrations.organizationId, organizationId));
-		await tx
-			.update(storageIntegrations)
-			.set({ active: true })
-			.where(eq(storageIntegrations.id, drive.id));
-	});
-
 	revalidateStorageSettings();
 	return { success: true };
 }
-
 export async function connectOrganizationGoogleDrive(
 	organizationId: Organisation.OrganisationId,
 ) {
@@ -517,29 +591,36 @@ export async function connectOrganizationGoogleDrive(
 export async function disconnectOrganizationGoogleDrive(
 	organizationId: Organisation.OrganisationId,
 ) {
-	await requireOrganizationStorageManagerPro(organizationId);
-	await db()
-		.update(storageIntegrations)
-		.set({
-			active: false,
-			status: "disconnected",
-			googleDriveAccessToken: null,
-			googleDriveAccessTokenExpiresAt: null,
-			googleDriveTokenRefreshLeaseId: null,
-			googleDriveTokenRefreshLeaseExpiresAt: null,
-			googleDriveStorageQuotaCache: null,
-		})
-		.where(
-			and(
-				eq(storageIntegrations.organizationId, organizationId),
-				eq(storageIntegrations.provider, googleDriveProvider),
-			),
-		);
-
+	const { user } = await requireOrganizationStorageManagerPro(organizationId);
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, organizationId, user.id);
+		return {
+			statements: [
+				database
+					.update(storageIntegrations)
+					.set({
+						active: false,
+						status: "disconnected",
+						googleDriveAccessToken: null,
+						googleDriveAccessTokenExpiresAt: null,
+						googleDriveTokenRefreshLeaseId: null,
+						googleDriveTokenRefreshLeaseExpiresAt: null,
+						googleDriveStorageQuotaCache: null,
+					})
+					.where(
+						and(
+							eq(storageIntegrations.organizationId, organizationId),
+							eq(storageIntegrations.provider, googleDriveProvider),
+						),
+					),
+			],
+			result: undefined,
+		};
+	});
 	revalidateStorageSettings();
 	return { success: true };
 }
-
 export async function getOrganizationGoogleDrivePickerToken(
 	organizationId: Organisation.OrganisationId,
 ) {
@@ -665,38 +746,67 @@ export async function setOrganizationGoogleDriveLocation({
 		JSON.stringify({ ...nextConfig, email: email ?? undefined }),
 	);
 
-	if (await driveHasStoredData(drive)) {
-		await db().transaction(async (tx) => {
-			if (drive.active) {
-				await tx
+	const database = db();
+	const newIntegrationId = Storage.StorageIntegrationId.make(nanoId());
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, organizationId, user.id);
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(storageIntegrations)
+				.where(eq(storageIntegrations.id, drive.id))
+				.limit(1),
+		);
+		if (
+			!current ||
+			current.status !== "active" ||
+			current.organizationId !== organizationId ||
+			current.encryptedConfig !== drive.encryptedConfig ||
+			current.active !== drive.active
+		)
+			throw new Error(
+				"Google Drive configuration changed; reload the settings.",
+			);
+		const hasData = await snapshot.read((reader) =>
+			driveHasStoredData(reader, current),
+		);
+		const statements: AtomicStatement[] = [];
+		if (hasData) {
+			if (current.active)
+				statements.push(
+					database
+						.update(storageIntegrations)
+						.set({ active: false })
+						.where(eq(storageIntegrations.organizationId, organizationId)),
+				);
+			statements.push(
+				database.insert(storageIntegrations).values({
+					id: newIntegrationId,
+					ownerId: user.id,
+					organizationId,
+					provider: googleDriveProvider,
+					displayName,
+					status: "active",
+					active: current.active,
+					encryptedConfig,
+					googleDriveStorageQuotaCache: null,
+				}),
+			);
+		} else
+			statements.push(
+				database
 					.update(storageIntegrations)
-					.set({ active: false })
-					.where(eq(storageIntegrations.organizationId, organizationId));
-			}
-			await tx.insert(storageIntegrations).values({
-				id: Storage.StorageIntegrationId.make(nanoId()),
-				ownerId: user.id,
-				organizationId,
-				provider: googleDriveProvider,
-				displayName,
-				status: "active",
-				active: drive.active,
-				encryptedConfig,
-				googleDriveStorageQuotaCache: null,
-			});
-		});
-	} else {
-		await db()
-			.update(storageIntegrations)
-			.set({
-				active: drive.active,
-				status: "active",
-				displayName,
-				encryptedConfig,
-				googleDriveStorageQuotaCache: null,
-			})
-			.where(eq(storageIntegrations.id, drive.id));
-	}
+					.set({
+						active: current.active,
+						status: "active",
+						displayName,
+						encryptedConfig,
+						googleDriveStorageQuotaCache: null,
+					})
+					.where(eq(storageIntegrations.id, current.id)),
+			);
+		return { statements, result: undefined };
+	});
 
 	revalidateStorageSettings();
 	return { success: true };

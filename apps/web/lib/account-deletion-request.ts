@@ -1,20 +1,24 @@
+import {
+	cloudflareAccessPolicy,
+	normalizeEmail,
+} from "@cap/database/auth/identity";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { serverEnv } from "@cap/env";
 import "server-only";
 
-import { db } from "@cap/database";
-import { sendEmail } from "@cap/database/emails/config";
-import { MessengerSupportEmail } from "@cap/database/emails/messenger-support-email";
-import { nanoId } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	messengerConversations,
 	messengerMessages,
 	messengerSupportEmails,
 	users,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { sendEmail } from "@cap/database/emails/config";
+import { MessengerSupportEmail } from "@cap/database/emails/messenger-support-email";
+import { nanoId } from "@cap/database/helpers";
 import type { User, Video } from "@cap/web-domain";
 import { and, eq, or } from "drizzle-orm";
 
-const ACCOUNT_DELETION_EMAIL_TO = "hello@cap.so";
-const ACCOUNT_DELETION_EMAIL_FROM = "Cap Support <richie@send.cap.so>";
 export const ACCOUNT_DELETION_PENDING_SUBJECT =
 	"[PENDING] Account deletion request";
 export const MOBILE_CONTENT_REPORT_PENDING_SUBJECT =
@@ -47,7 +51,7 @@ export const hasPendingAccountDeletion = async ({
 	const identities = [
 		userId ? eq(messengerSupportEmails.userId, userId) : undefined,
 		email
-			? eq(messengerSupportEmails.userEmail, email.trim().toLowerCase())
+			? eq(messengerSupportEmails.userEmail, normalizeEmail(email))
 			: undefined,
 	].filter((condition) => condition !== undefined);
 
@@ -77,82 +81,82 @@ export const createAccountDeletionRequest = async ({
 }) => {
 	const normalizedUser = {
 		...user,
-		email: user.email.trim().toLowerCase(),
+		email: normalizeEmail(user.email),
 	};
-	const request = await db().transaction(async (tx) => {
-		const [lockedUser] = await tx
-			.select({ id: users.id })
-			.from(users)
-			.where(eq(users.id, normalizedUser.id))
-			.for("update");
-
-		if (!lockedUser) {
-			throw new Error("Account deletion user not found");
-		}
-
-		const [existing] = await tx
-			.select({
-				id: messengerSupportEmails.id,
-				conversationId: messengerSupportEmails.conversationId,
-				message: messengerSupportEmails.message,
-			})
-			.from(messengerSupportEmails)
-			.where(
-				and(
-					eq(messengerSupportEmails.userId, normalizedUser.id),
-					eq(messengerSupportEmails.subject, ACCOUNT_DELETION_PENDING_SUBJECT),
-				),
-			)
-			.limit(1);
-
-		if (existing) {
-			return {
-				...existing,
-				status: "existing" as const,
-			};
-		}
-
-		const id = nanoId();
-		const conversationId = nanoId();
-		const messageId = nanoId();
-		const message = createRequestMessage(normalizedUser, now);
-		await tx.insert(messengerConversations).values({
-			id: conversationId,
-			agent: "Millie",
-			mode: "human",
-			userId: normalizedUser.id,
-			createdAt: now,
-			updatedAt: now,
-			lastMessageAt: now,
-		});
-		await tx.insert(messengerMessages).values({
-			id: messageId,
-			conversationId,
-			role: "user",
-			content: message,
-			userId: normalizedUser.id,
-			createdAt: now,
-		});
-		await tx.insert(messengerSupportEmails).values({
-			id,
-			conversationId,
-			userId: normalizedUser.id,
-			userEmail: normalizedUser.email,
-			subject: ACCOUNT_DELETION_PENDING_SUBJECT,
-			message,
-			createdAt: now,
-		});
-
+	const database = db();
+	const id = nanoId();
+	const conversationId = nanoId();
+	const messageId = nanoId();
+	const message = createRequestMessage(normalizedUser, now);
+	const request = await atomic<{
+		id: string;
+		conversationId: string;
+		message: string;
+		status: "existing" | "created";
+	}>(database, async (snapshot) => {
+		const [present] = await snapshot.read((reader) =>
+			reader
+				.select({ id: users.id })
+				.from(users)
+				.where(eq(users.id, normalizedUser.id)),
+		);
+		if (!present) throw new Error("Account deletion user not found");
+		const [existing] = await snapshot.read((reader) =>
+			reader
+				.select({
+					id: messengerSupportEmails.id,
+					conversationId: messengerSupportEmails.conversationId,
+					message: messengerSupportEmails.message,
+				})
+				.from(messengerSupportEmails)
+				.where(
+					and(
+						eq(messengerSupportEmails.userId, normalizedUser.id),
+						eq(
+							messengerSupportEmails.subject,
+							ACCOUNT_DELETION_PENDING_SUBJECT,
+						),
+					),
+				)
+				.limit(1),
+		);
+		if (existing)
+			return { statements: [], result: { ...existing, status: "existing" } };
 		return {
-			id,
-			conversationId,
-			message,
-			status: "created" as const,
+			statements: [
+				database.insert(messengerConversations).values({
+					id: conversationId,
+					agent: "Millie",
+					mode: "human",
+					userId: normalizedUser.id,
+					createdAt: now,
+					updatedAt: now,
+					lastMessageAt: now,
+				}),
+				database.insert(messengerMessages).values({
+					id: messageId,
+					conversationId,
+					role: "user",
+					content: message,
+					userId: normalizedUser.id,
+					createdAt: now,
+				}),
+				database.insert(messengerSupportEmails).values({
+					id,
+					conversationId,
+					userId: normalizedUser.id,
+					userEmail: normalizedUser.email,
+					subject: ACCOUNT_DELETION_PENDING_SUBJECT,
+					message,
+					createdAt: now,
+				}),
+			],
+			result: { id, conversationId, message, status: "created" },
 		};
 	});
 
 	const notificationSent = await sendEmail({
-		email: ACCOUNT_DELETION_EMAIL_TO,
+		email: cloudflareAccessPolicy().ownerEmail,
 		subject: ACCOUNT_DELETION_PENDING_SUBJECT,
 		react: MessengerSupportEmail({
 			userEmail: normalizedUser.email,
@@ -161,7 +165,7 @@ export const createAccountDeletionRequest = async ({
 			message: request.message,
 		}),
 		replyTo: normalizedUser.email,
-		fromOverride: ACCOUNT_DELETION_EMAIL_FROM,
+
 		idempotencyKey: `account-deletion-${request.id}`,
 	})
 		.then((delivery) => !delivery?.error)
@@ -191,7 +195,7 @@ export const createMobileContentReport = async ({
 }) => {
 	const normalizedReporter = {
 		...reporter,
-		email: reporter.email.trim().toLowerCase(),
+		email: normalizeEmail(reporter.email),
 	};
 	const message = [
 		"A signed-in user reported a Cap from the iOS app.",
@@ -203,56 +207,57 @@ export const createMobileContentReport = async ({
 		`Cap owner ID: ${content.ownerId}`,
 		`Reason: ${reason}`,
 		`Reported at: ${now.toISOString()}`,
-		`Cap URL: https://cap.so/s/${content.id}`,
+		`Cap URL: ${serverEnv().WEB_URL}/s/${content.id}`,
 		"",
 		"Review the content promptly, remove it if it violates Cap policies, respond to the reporter when appropriate, and change this request subject from [PENDING] to [COMPLETED].",
 	].join("\n");
-	const request = await db().transaction(async (tx) => {
-		const [lockedUser] = await tx
-			.select({ id: users.id })
-			.from(users)
-			.where(eq(users.id, normalizedReporter.id))
-			.for("update");
-
-		if (!lockedUser) {
-			throw new Error("Content report user not found");
-		}
-
-		const id = nanoId();
-		const conversationId = nanoId();
-		const messageId = nanoId();
-		await tx.insert(messengerConversations).values({
-			id: conversationId,
-			agent: "Millie",
-			mode: "human",
-			userId: normalizedReporter.id,
-			createdAt: now,
-			updatedAt: now,
-			lastMessageAt: now,
-		});
-		await tx.insert(messengerMessages).values({
-			id: messageId,
-			conversationId,
-			role: "user",
-			content: message,
-			userId: normalizedReporter.id,
-			createdAt: now,
-		});
-		await tx.insert(messengerSupportEmails).values({
-			id,
-			conversationId,
-			userId: normalizedReporter.id,
-			userEmail: normalizedReporter.email,
-			subject: MOBILE_CONTENT_REPORT_PENDING_SUBJECT,
-			message,
-			createdAt: now,
-		});
-
-		return { id, conversationId };
+	const database = db();
+	const id = nanoId();
+	const conversationId = nanoId();
+	const messageId = nanoId();
+	const request = await atomic(database, async (snapshot) => {
+		const [present] = await snapshot.read((reader) =>
+			reader
+				.select({ id: users.id })
+				.from(users)
+				.where(eq(users.id, normalizedReporter.id)),
+		);
+		if (!present) throw new Error("Content report user not found");
+		return {
+			statements: [
+				database.insert(messengerConversations).values({
+					id: conversationId,
+					agent: "Millie",
+					mode: "human",
+					userId: normalizedReporter.id,
+					createdAt: now,
+					updatedAt: now,
+					lastMessageAt: now,
+				}),
+				database.insert(messengerMessages).values({
+					id: messageId,
+					conversationId,
+					role: "user",
+					content: message,
+					userId: normalizedReporter.id,
+					createdAt: now,
+				}),
+				database.insert(messengerSupportEmails).values({
+					id,
+					conversationId,
+					userId: normalizedReporter.id,
+					userEmail: normalizedReporter.email,
+					subject: MOBILE_CONTENT_REPORT_PENDING_SUBJECT,
+					message,
+					createdAt: now,
+				}),
+			],
+			result: { id, conversationId },
+		};
 	});
 
 	const notificationSent = await sendEmail({
-		email: ACCOUNT_DELETION_EMAIL_TO,
+		email: cloudflareAccessPolicy().ownerEmail,
 		subject: MOBILE_CONTENT_REPORT_PENDING_SUBJECT,
 		react: MessengerSupportEmail({
 			userEmail: normalizedReporter.email,
@@ -261,7 +266,7 @@ export const createMobileContentReport = async ({
 			message,
 		}),
 		replyTo: normalizedReporter.email,
-		fromOverride: ACCOUNT_DELETION_EMAIL_FROM,
+
 		idempotencyKey: `mobile-content-report-${request.id}`,
 	})
 		.then((delivery) => !delivery?.error)

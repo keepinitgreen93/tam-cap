@@ -1,10 +1,11 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { type User, Video } from "@cap/web-domain";
 import {
 	and,
@@ -107,6 +108,7 @@ async function loadDesktopSegmentsManifest({
 		.from(videos)
 		.where(
 			and(
+				writableVideo,
 				eq(videos.id, videoId),
 				userId ? eq(videos.ownerId, userId) : undefined,
 			),
@@ -266,6 +268,7 @@ export async function recoverStaleDesktopSegments({
 			)
 			.where(
 				and(
+					writableVideo,
 					inArray(videoUploads.phase, RECOVERABLE_UPLOAD_PHASES),
 					lte(videoUploads.updatedAt, staleBefore),
 					gte(
@@ -282,7 +285,7 @@ export async function recoverStaleDesktopSegments({
 							`${DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED}:%`,
 						),
 					),
-					sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.source}, '$.type')) = 'desktopSegments'`,
+					sql`JSON_EXTRACT(${videos.source}, '$.type') = 'desktopSegments'`,
 				),
 			)
 			.orderBy(order(videoUploads.updatedAt), order(videoUploads.videoId))

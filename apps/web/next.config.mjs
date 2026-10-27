@@ -27,7 +27,11 @@ const ffmpegTracingIncludes = ffmpegStaticPath
 const nextConfig = {
 	outputFileTracingRoot: path.resolve(appDirectory, "../.."),
 	reactStrictMode: true,
-	serverExternalPackages: ["ffmpeg-static", "prettier"],
+	serverExternalPackages: [
+		"ffmpeg-static",
+		"prettier",
+		"@cap/workflow-cloudflare",
+	],
 	outputFileTracingIncludes: {
 		"/.well-known/workflow/v1/step": ffmpegTracingIncludes,
 		"/api/tools/loom-download": ffmpegTracingIncludes,

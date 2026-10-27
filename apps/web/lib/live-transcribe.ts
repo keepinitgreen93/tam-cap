@@ -1,30 +1,17 @@
-import { db } from "@cap/database";
-import { organizations, videos } from "@cap/database/schema";
+import { randomUUID } from "node:crypto";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import type { Organisation, User, Video } from "@cap/web-domain";
-import { and, eq, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { start } from "workflow/api";
 import { liveTranscribeWorkflow } from "@/workflows/live-transcribe";
 import { isTranscriptionConfigured } from "./transcription-config";
 
-const getAffectedRows = (result: unknown) => {
-	if (Array.isArray(result)) {
-		return (
-			(result[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0
-		);
-	}
-
-	return (result as { affectedRows?: number } | undefined)?.affectedRows ?? 0;
-};
-
 export type LiveTranscriptionStart = "started" | "skipped";
 
-/**
- * Kick off provisional live transcription for a just-created instant-mode
- * recording. Idempotent (an atomic metadata claim allows exactly one live
- * workflow per video) and never throws: any failure means the video simply
- * behaves exactly as it does today.
- */
 export async function maybeStartLiveTranscription({
 	videoId,
 	ownerId,
@@ -35,50 +22,43 @@ export async function maybeStartLiveTranscription({
 	orgId: Organisation.OrganisationId;
 }): Promise<LiveTranscriptionStart> {
 	try {
-		if (!isTranscriptionConfigured(serverEnv())) {
-			return "skipped";
-		}
-
-		const [org] = await db()
-			.select({ settings: organizations.settings })
-			.from(organizations)
-			.where(eq(organizations.id, orgId));
-		if (org?.settings?.disableTranscript) {
-			return "skipped";
-		}
-
-		const claim = await db()
-			.update(videos)
-			.set({
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.liveTranscript', JSON_OBJECT('status', 'active', 'updatedAt', ${new Date().toISOString()}))`,
-				updatedAt: sql`${videos.updatedAt}`,
-			})
-			.where(
-				and(
-					eq(videos.id, videoId),
-					eq(videos.ownerId, ownerId),
-					sql`JSON_EXTRACT(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.liveTranscript') IS NULL`,
-				),
+		if (!isTranscriptionConfigured(serverEnv())) return "skipped";
+		const runId = randomUUID();
+		const updatedAt = new Date().toISOString();
+		const database = db();
+		const claimed = await atomic(database, async (snapshot) => {
+			const organization = await requireActiveOrganization(snapshot, orgId);
+			const [video] = await snapshot.read((reader) =>
+				reader.select().from(videos).where(eq(videos.id, videoId)).limit(1),
 			);
-
-		if (getAffectedRows(claim) === 0) {
-			return "skipped";
-		}
-
-		try {
-			await start(liveTranscribeWorkflow, [{ videoId, userId: ownerId }]);
-		} catch (error) {
-			// Release the claim so a retried create can start the workflow.
-			await db()
-				.update(videos)
-				.set({
-					metadata: sql`JSON_REMOVE(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.liveTranscript')`,
-					updatedAt: sql`${videos.updatedAt}`,
-				})
-				.where(eq(videos.id, videoId));
-			throw error;
-		}
-
+			if (
+				!video ||
+				video.ownerId !== ownerId ||
+				video.orgId !== orgId ||
+				video.metadata?.liveTranscript ||
+				video.transcriptionStatus === "COMPLETE" ||
+				(video.settings?.disableTranscript ??
+					organization.settings?.disableTranscript)
+			)
+				return { statements: [], result: false };
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({
+							metadata: {
+								...video.metadata,
+								liveTranscript: { id: runId, status: "active", updatedAt },
+							},
+							updatedAt: video.updatedAt,
+						})
+						.where(eq(videos.id, videoId)),
+				],
+				result: true,
+			};
+		});
+		if (!claimed) return "skipped";
+		await start(liveTranscribeWorkflow, [{ videoId, userId: ownerId, runId }]);
 		return "started";
 	} catch (error) {
 		console.warn(`[maybeStartLiveTranscription] Failed for ${videoId}`, error);

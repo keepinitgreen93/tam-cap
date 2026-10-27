@@ -9,7 +9,7 @@ const selectMock = vi.fn(() => ({
 }));
 const insertMock = vi.fn();
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: selectMock,
 		insert: insertMock,

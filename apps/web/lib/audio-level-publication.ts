@@ -1,14 +1,16 @@
 import { createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend/src/Storage/index";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { z } from "zod";
 import { reserveMediaProcessingBudget } from "@/lib/media-processing-budget";
@@ -108,7 +110,10 @@ export async function handleAudioLevelPublication(payload: unknown) {
 		if (prepare.success) {
 			const request = prepare.data;
 			const id = Video.VideoId.make(request.videoId);
-			const [video] = await db().select().from(videos).where(eq(videos.id, id));
+			const [video] = await db()
+				.select()
+				.from(videos)
+				.where(and(writableVideo, eq(videos.id, id)));
 			if (
 				!video ||
 				video.ownerId !== request.userId ||
@@ -158,6 +163,7 @@ export async function handleAudioLevelPublication(payload: unknown) {
 				generation: `audio-${identity}`,
 				attemptId: attempt,
 				sourceBytes: request.sourceSize,
+				purpose: "audio-level",
 			});
 			const outputKey = `${video.ownerId}/${video.id}/.recording/outputs/audio-quality-v3/${attempt}.mp4`;
 			const [outputUrl, verificationUrl] = await Promise.all([
@@ -210,12 +216,44 @@ export async function handleAudioLevelPublication(payload: unknown) {
 		if (result.outputSize * 2 > context.transferBudgetBytes)
 			return unchanged("transfer-budget");
 		const id = Video.VideoId.make(context.videoId);
-		const published = await db().transaction(async (tx) => {
-			const [video] = await tx
-				.select()
-				.from(videos)
-				.where(eq(videos.id, id))
-				.for("update");
+
+		const [verificationVideo] = await db()
+			.select()
+			.from(videos)
+			.where(and(writableVideo, eq(videos.id, id)));
+		if (!verificationVideo) return { status: "unchanged" as const };
+
+		const [bucket] = await Storage.getAccessForVideo(
+			decodeStorageVideo(verificationVideo),
+			{
+				resolvePublishedOutput: false,
+			},
+		).pipe(runWorkflowPromise);
+		const [source, output] = await Promise.all([
+			bucket
+				.headObject(context.sourceKey)
+				.pipe(Effect.timeout("10 seconds"), runWorkflowPromise),
+			bucket
+				.headObject(context.outputKey)
+				.pipe(Effect.timeout("10 seconds"), runWorkflowPromise),
+		]);
+		// The authenticated worker hashes stored bytes with If-Match; retain that verified identity without another download.
+		if (
+			source.ETag !== context.sourceIdentity ||
+			source.ContentLength !== context.sourceSize ||
+			output.ETag !== result.outputIdentity ||
+			output.ContentLength !== result.outputSize
+		)
+			return { status: "unchanged" as const };
+		const database = db();
+		const published = await atomic(database, async (snapshot) => {
+			const statements: AtomicStatement[] = [];
+			const [video] = await snapshot.read((reader) =>
+				reader
+					.select()
+					.from(videos)
+					.where(and(writableVideo, eq(videos.id, id))),
+			);
 			if (
 				!video ||
 				video.ownerId !== context.userId ||
@@ -225,49 +263,28 @@ export async function handleAudioLevelPublication(payload: unknown) {
 				JSON.stringify(video.source) !== context.source ||
 				originalKey(video) !== context.sourceKey
 			)
-				return false;
-			const [upload] = await tx
-				.select()
-				.from(videoUploads)
-				.where(eq(videoUploads.videoId, id));
+				return { statements, result: false };
+			const [upload] = await snapshot.read((reader) =>
+				reader.select().from(videoUploads).where(eq(videoUploads.videoId, id)),
+			);
 			if (
 				upload ||
 				(video.source.type !== "desktopMP4" && video.source.type !== "webMP4")
 			)
-				return false;
-			const [bucket] = await Storage.getAccessForVideo(
-				decodeStorageVideo(video),
-				{
-					resolvePublishedOutput: false,
-				},
-			).pipe(runWorkflowPromise);
-			const [source, output] = await Promise.all([
-				bucket
-					.headObject(context.sourceKey)
-					.pipe(Effect.timeout("10 seconds"), runWorkflowPromise),
-				bucket
-					.headObject(context.outputKey)
-					.pipe(Effect.timeout("10 seconds"), runWorkflowPromise),
-			]);
-			// The authenticated worker hashes stored bytes with If-Match; retain that verified identity without another download.
-			if (
-				source.ETag !== context.sourceIdentity ||
-				source.ContentLength !== context.sourceSize ||
-				output.ETag !== result.outputIdentity ||
-				output.ContentLength !== result.outputSize
-			)
-				return false;
-			await tx
-				.update(videos)
-				.set({
-					source: {
-						...video.source,
-						audioLevelSourceKey: context.sourceKey,
-						audioLevelOutputKey: context.outputKey,
-					},
-				})
-				.where(eq(videos.id, id));
-			return true;
+				return { statements, result: false };
+			statements.push(
+				database
+					.update(videos)
+					.set({
+						source: {
+							...video.source,
+							audioLevelSourceKey: context.sourceKey,
+							audioLevelOutputKey: context.outputKey,
+						},
+					})
+					.where(eq(videos.id, id)),
+			);
+			return { statements, result: true };
 		});
 		console.info("[audio-levels] Publication", {
 			videoId: context.videoId,

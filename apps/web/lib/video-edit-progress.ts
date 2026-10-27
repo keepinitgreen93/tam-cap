@@ -1,7 +1,9 @@
-import { db } from "@cap/database";
-import { videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
 	getEditProcessingState,
 	matchesEditOperation,
@@ -22,12 +24,18 @@ export async function applyEditProgress(
 	token: string | null,
 	startedAt: string | null,
 ) {
-	return db().transaction(async (tx) => {
-		const [video] = await tx
-			.select()
-			.from(videos)
-			.where(eq(videos.id, payload.videoId as Video.VideoId))
-			.for("update");
+	const database = db();
+	const mutationTime = new Date();
+	return atomic(database, async (snapshot) => {
+		const statements: AtomicStatement[] = [];
+		const [video] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(
+					and(writableVideo, eq(videos.id, payload.videoId as Video.VideoId)),
+				),
+		);
 		const state = getEditProcessingState(video?.metadata ?? null);
 		if (!token && !state) {
 			if (
@@ -37,26 +45,29 @@ export async function applyEditProgress(
 					`${video.ownerId}/${video.id}/.recording/outputs/edit-`,
 				)
 			) {
-				const [currentUpload] = await tx
-					.select()
-					.from(videoUploads)
-					.where(eq(videoUploads.videoId, video.id))
-					.for("update");
+				const [currentUpload] = await snapshot.read((reader) =>
+					reader
+						.select()
+						.from(videoUploads)
+						.where(eq(videoUploads.videoId, video.id)),
+				);
 				if (
 					!currentUpload ||
 					currentUpload.rawFileKey ===
 						`${video.ownerId}/${video.id}/source/original.mp4`
 				)
-					return true;
+					return { statements, result: true };
 			}
-			return false;
+			return { statements, result: false };
 		}
-		if (!video || !state || !token || !startedAt) return true;
-		const [upload] = await tx
-			.select()
-			.from(videoUploads)
-			.where(eq(videoUploads.videoId, video.id))
-			.for("update");
+		if (!video || !state || !token || !startedAt)
+			return { statements, result: true };
+		const [upload] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, video.id)),
+		);
 		if (
 			!upload ||
 			!matchesEditOperation(video, upload, state.sourceKey, {
@@ -66,8 +77,9 @@ export async function applyEditProgress(
 			state.dispatch === "pending" ||
 			(state.jobId && state.jobId !== payload.jobId)
 		)
-			return true;
-		if (upload.phase === "complete" || upload.phase === "error") return true;
+			return { statements, result: true };
+		if (upload.phase === "complete" || upload.phase === "error")
+			return { statements, result: true };
 		const complete = payload.phase === "complete";
 		const failed = payload.phase === "error" || payload.phase === "cancelled";
 		if (
@@ -82,46 +94,50 @@ export async function applyEditProgress(
 		) {
 			throw new Error("Edit completion is missing valid media metadata");
 		}
-		await tx
-			.update(videos)
-			.set({
-				metadata: {
-					...video.metadata,
-					editProcessing: {
-						...state,
-						dispatch: "accepted",
-						jobId: payload.jobId,
-						...(complete && payload.metadata
-							? {
-									renderedMetadata: {
-										duration: payload.metadata.duration,
-										width: payload.metadata.width,
-										height: payload.metadata.height,
-										fps: payload.metadata.fps,
-									},
-								}
-							: {}),
+		statements.push(
+			database
+				.update(videos)
+				.set({
+					metadata: {
+						...video.metadata,
+						editProcessing: {
+							...state,
+							dispatch: "accepted",
+							jobId: payload.jobId,
+							...(complete && payload.metadata
+								? {
+										renderedMetadata: {
+											duration: payload.metadata.duration,
+											width: payload.metadata.width,
+											height: payload.metadata.height,
+											fps: payload.metadata.fps,
+										},
+									}
+								: {}),
+						},
 					},
-				},
-			})
-			.where(eq(videos.id, video.id));
+				})
+				.where(eq(videos.id, video.id)),
+		);
 
-		await tx
-			.update(videoUploads)
-			.set({
-				phase: complete ? "complete" : failed ? "error" : "processing",
-				processingProgress: complete
-					? 100
-					: Number.isFinite(payload.progress)
-						? Math.round(Math.max(0, Math.min(100, payload.progress)))
-						: 0,
-				processingMessage: payload.message,
-				processingError: failed
-					? payload.error || payload.message || "Video edit failed"
-					: null,
-				updatedAt: new Date(),
-			})
-			.where(eq(videoUploads.videoId, video.id));
-		return true;
+		statements.push(
+			database
+				.update(videoUploads)
+				.set({
+					phase: complete ? "complete" : failed ? "error" : "processing",
+					processingProgress: complete
+						? 100
+						: Number.isFinite(payload.progress)
+							? Math.round(Math.max(0, Math.min(100, payload.progress)))
+							: 0,
+					processingMessage: payload.message,
+					processingError: failed
+						? payload.error || payload.message || "Video edit failed"
+						: null,
+					updatedAt: mutationTime,
+				})
+				.where(eq(videoUploads.videoId, video.id)),
+		);
+		return { statements, result: true };
 	});
 }

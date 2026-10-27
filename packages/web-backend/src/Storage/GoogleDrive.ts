@@ -85,6 +85,7 @@ export type GoogleDriveTokenStore = {
 };
 
 export type CreateGoogleDriveUploadInput = {
+	copySourceVideoId?: Video.VideoId;
 	integrationId: Storage.StorageIntegrationId;
 	ownerId: User.UserId;
 	videoId: Video.VideoId | null;
@@ -980,6 +981,7 @@ const getOrCreateGoogleDriveFolder = ({
 			contentType: GOOGLE_DRIVE_FOLDER_MIME_TYPE,
 			metadata: {
 				videoId: input.videoId ?? undefined,
+				copySourceVideoId: input.copySourceVideoId,
 				fileName: name,
 				contentType: GOOGLE_DRIVE_FOLDER_MIME_TYPE,
 			},
@@ -1060,6 +1062,7 @@ const ensureGoogleDriveWarningFile = ({
 			contentLength: DRIVE_WARNING_TEXT.length,
 			metadata: {
 				videoId: input.videoId ?? undefined,
+				copySourceVideoId: input.copySourceVideoId,
 				fileName: DRIVE_WARNING_FILE_NAME,
 				contentType: "text/plain",
 			},
@@ -1252,6 +1255,7 @@ export const createGoogleDriveResumableUpload = (
 				contentLength: input.contentLength ?? null,
 				metadata: {
 					videoId: input.videoId ?? undefined,
+					copySourceVideoId: input.copySourceVideoId,
 					fileName: getDriveFileName(input.key),
 					contentType,
 				},
@@ -1348,6 +1352,7 @@ export const createGoogleDriveResumableUpload = (
 			metadata: {
 				...(object.metadata ?? {}),
 				videoId: input.videoId ?? undefined,
+				copySourceVideoId: input.copySourceVideoId,
 				fileName,
 				contentType,
 			},
@@ -1746,21 +1751,47 @@ export const copyGoogleDriveFile = ({
 				}),
 			);
 		}
-		yield* repo.upsertObject({
-			integrationId: input.integrationId,
-			ownerId: input.ownerId,
-			videoId: input.videoId,
-			objectKey: input.key,
-			providerObjectId: copied.id,
-			uploadStatus: "complete",
-			contentType: copied.mimeType ?? input.contentType,
-			contentLength: copied.size ? Number(copied.size) : null,
-			metadata: {
-				videoId: input.videoId ?? undefined,
-				fileName: copied.name ?? fileName,
+		yield* repo
+			.upsertObject({
+				integrationId: input.integrationId,
+				ownerId: input.ownerId,
+				videoId: input.videoId,
+				objectKey: input.key,
+				providerObjectId: copied.id,
+				uploadStatus: "complete",
 				contentType: copied.mimeType ?? input.contentType,
-			},
-		});
+				contentLength: copied.size ? Number(copied.size) : null,
+				metadata: {
+					videoId: input.videoId ?? undefined,
+					copySourceVideoId: input.copySourceVideoId,
+					fileName: copied.name ?? fileName,
+					contentType: copied.mimeType ?? input.contentType,
+				},
+			})
+			.pipe(
+				Effect.catchAll((error) =>
+					Effect.gen(function* () {
+						const current = yield* repo
+							.getObjectByKey(input.integrationId, input.key)
+							.pipe(Effect.either);
+						if (
+							Either.isRight(current) &&
+							(Option.isNone(current.right) ||
+								current.right.value.providerObjectId !== copied.id)
+						) {
+							yield* deleteGoogleDriveFile(config, copied.id, tokenStore).pipe(
+								Effect.catchAll((cause) =>
+									Effect.logWarning(
+										"Unpublished Google Drive copy cleanup failed",
+										{ cause },
+									),
+								),
+							);
+						}
+						return yield* Effect.fail(error);
+					}),
+				),
+			);
 	});
 
 export const syncGoogleDriveVideoNames = (

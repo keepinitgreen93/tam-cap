@@ -1,10 +1,10 @@
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
 import { CurrentUser, Organisation } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect, Option } from "effect";
-
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { ImageUploads } from "../ImageUploads/index.ts";
 
 export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
@@ -27,6 +27,7 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 							.from(Db.users)
 							.where(Dz.eq(Db.users.id, currentUser.id)),
 					);
+					if (!user) throw new Error("User not found");
 
 					const firstName = data.firstName.trim();
 					const lastName = data.lastName?.trim() ?? "";
@@ -74,87 +75,94 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 					}) {
 						const currentUser = yield* CurrentUser;
 
-						const [user] = yield* db.use((db) =>
-							db
-								.select()
-								.from(Db.users)
-								.where(Dz.eq(Db.users.id, currentUser.id)),
-						);
-
 						const organizationName =
 							data.organizationName.trim() || data.organizationName;
-						const preferredOrganizationId =
-							user.activeOrganizationId || user.defaultOrgId;
-
+						const candidateOrganizationId = Organisation.OrganisationId.make(
+							nanoId(),
+						);
+						const candidateMemberId = nanoId();
 						const { organizationId, canEditOrganization } = yield* db.use(
-							(db) =>
-								db.transaction(async (tx) => {
+							(database) =>
+								atomic(database, async (snapshot) => {
+									const [current] = await snapshot.read((reader) =>
+										reader
+											.select()
+											.from(Db.users)
+											.where(Dz.eq(Db.users.id, currentUser.id)),
+									);
+									if (!current) throw new Error("User not found");
+									const preferredOrganizationId =
+										current.activeOrganizationId || current.defaultOrgId;
 									const [existingOrg] = preferredOrganizationId
-										? await tx
-												.select({
-													id: Db.organizations.id,
-													ownerId: Db.organizations.ownerId,
-													tombstoneAt: Db.organizations.tombstoneAt,
-												})
-												.from(Db.organizations)
-												.where(
-													Dz.eq(Db.organizations.id, preferredOrganizationId),
-												)
+										? await snapshot.read((reader) =>
+												reader
+													.select()
+													.from(Db.organizations)
+													.where(
+														Dz.eq(Db.organizations.id, preferredOrganizationId),
+													),
+											)
 										: [];
 									const resolvedOrgId =
-										existingOrg?.id ??
-										Organisation.OrganisationId.make(nanoId());
+										existingOrg?.id ?? candidateOrganizationId;
 									const canEditOrganization =
 										!existingOrg ||
 										(existingOrg.ownerId === currentUser.id &&
 											existingOrg.tombstoneAt === null);
-
-									if (!existingOrg) {
-										await tx.insert(Db.organizations).values({
-											id: resolvedOrgId,
-											ownerId: currentUser.id,
-											name: organizationName,
-										});
-
-										await tx.insert(Db.organizationMembers).values({
-											id: nanoId(),
-											organizationId: resolvedOrgId,
-											userId: currentUser.id,
-											role: "owner",
-										});
-									} else if (canEditOrganization) {
-										await tx
-											.update(Db.organizations)
-											.set({ name: organizationName })
-											.where(
-												Dz.and(
-													Dz.eq(Db.organizations.id, resolvedOrgId),
-													Dz.eq(Db.organizations.ownerId, currentUser.id),
-													Dz.isNull(Db.organizations.tombstoneAt),
+									const statements: AtomicStatement[] = [];
+									if (!existingOrg)
+										statements.push(
+											database.insert(Db.organizations).values({
+												id: resolvedOrgId,
+												ownerId: currentUser.id,
+												name: organizationName,
+											}),
+											database.insert(Db.organizationMembers).values({
+												id: candidateMemberId,
+												organizationId: resolvedOrgId,
+												userId: currentUser.id,
+												role: "owner",
+											}),
+										);
+									else if (canEditOrganization)
+										statements.push(
+											database
+												.update(Db.organizations)
+												.set({ name: organizationName })
+												.where(
+													Dz.and(
+														Dz.eq(Db.organizations.id, resolvedOrgId),
+														Dz.eq(Db.organizations.ownerId, currentUser.id),
+														Dz.isNull(Db.organizations.tombstoneAt),
+													),
 												),
-											);
-									}
-
-									await tx
-										.update(Db.users)
-										.set({
-											...(!existingOrg?.tombstoneAt && {
-												activeOrganizationId: resolvedOrgId,
-											}),
-											...(canEditOrganization && {
-												defaultOrgId: resolvedOrgId,
-											}),
-											onboardingSteps: {
-												...user.onboardingSteps,
-												organizationSetup: true,
-											},
-										})
-										.where(Dz.eq(Db.users.id, currentUser.id));
-
-									return { organizationId: resolvedOrgId, canEditOrganization };
+										);
+									statements.push(
+										database
+											.update(Db.users)
+											.set({
+												...(!existingOrg?.tombstoneAt
+													? { activeOrganizationId: resolvedOrgId }
+													: {}),
+												...(canEditOrganization
+													? { defaultOrgId: resolvedOrgId }
+													: {}),
+												onboardingSteps: {
+													...current.onboardingSteps,
+													organizationSetup: true,
+												},
+											})
+											.where(Dz.eq(Db.users.id, currentUser.id)),
+									);
+									return {
+										statements,
+										result: {
+											organizationId: resolvedOrgId,
+											canEditOrganization,
+										},
+									};
 								}),
 						);
-
 						const finalOrganizationId = organizationId;
 
 						if (canEditOrganization && data.organizationIcon) {
@@ -232,6 +240,7 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 							.from(Db.users)
 							.where(Dz.eq(Db.users.id, currentUser.id)),
 					);
+					if (!user) throw new Error("User not found");
 
 					yield* db.use((db) =>
 						db
@@ -255,6 +264,7 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 							.from(Db.users)
 							.where(Dz.eq(Db.users.id, currentUser.id)),
 					);
+					if (!user) throw new Error("User not found");
 
 					yield* db.use((db) =>
 						db
@@ -271,66 +281,66 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 				}),
 				skipToDashboard: Effect.fn("Onboarding.skipToDashboard")(function* () {
 					const currentUser = yield* CurrentUser;
-
-					const [user] = yield* db.use((db) =>
-						db
-							.select()
-							.from(Db.users)
-							.where(Dz.eq(Db.users.id, currentUser.id)),
-					);
-
-					const shouldUsePlaceholder = !user.onboardingSteps?.welcome;
-					const userName = shouldUsePlaceholder ? "Your name" : user.name;
-					const orgName = shouldUsePlaceholder
-						? "Your Organization"
-						: `${user.name}'s organization`;
-
-					yield* db.use((db) =>
-						db.transaction(async (tx) => {
-							await tx
-								.update(Db.users)
-								.set({
-									name: userName,
-									onboardingSteps: {
-										welcome: true,
-										organizationSetup: true,
-										customDomain: true,
-										inviteTeam: true,
-										download: true,
-									},
-								})
-								.where(Dz.eq(Db.users.id, currentUser.id));
-
+					const candidateOrgId = Organisation.OrganisationId.make(nanoId());
+					const candidateMemberId = nanoId();
+					yield* db.use((database) =>
+						atomic(database, async (snapshot) => {
+							const [user] = await snapshot.read((reader) =>
+								reader
+									.select()
+									.from(Db.users)
+									.where(Dz.eq(Db.users.id, currentUser.id)),
+							);
+							if (!user) throw new Error("User not found");
+							const placeholder = !user.onboardingSteps?.welcome;
 							const organizationId =
 								user.activeOrganizationId || user.defaultOrgId;
 							const [existingOrg] = organizationId
-								? await tx
-										.select()
-										.from(Db.organizations)
-										.where(Dz.eq(Db.organizations.id, organizationId))
+								? await snapshot.read((reader) =>
+										reader
+											.select()
+											.from(Db.organizations)
+											.where(Dz.eq(Db.organizations.id, organizationId)),
+									)
 								: [];
-
-							if (!existingOrg) {
-								const newOrgId = Organisation.OrganisationId.make(nanoId());
-								await tx.insert(Db.organizations).values({
-									id: newOrgId,
-									name: orgName,
-									ownerId: currentUser.id,
-								});
-								await tx.insert(Db.organizationMembers).values({
-									id: nanoId(),
-									organizationId: newOrgId,
-									userId: currentUser.id,
-									role: "owner",
-								});
-								await tx
+							const statements: AtomicStatement[] = [
+								database
 									.update(Db.users)
 									.set({
-										activeOrganizationId: newOrgId,
-										defaultOrgId: newOrgId,
+										name: placeholder ? "Your name" : user.name,
+										onboardingSteps: {
+											welcome: true,
+											organizationSetup: true,
+											customDomain: true,
+											inviteTeam: true,
+											download: true,
+										},
+										...(!existingOrg
+											? {
+													activeOrganizationId: candidateOrgId,
+													defaultOrgId: candidateOrgId,
+												}
+											: {}),
 									})
-									.where(Dz.eq(Db.users.id, currentUser.id));
-							}
+									.where(Dz.eq(Db.users.id, currentUser.id)),
+							];
+							if (!existingOrg)
+								statements.push(
+									database.insert(Db.organizations).values({
+										id: candidateOrgId,
+										name: placeholder
+											? "Your Organization"
+											: `${user.name}'s organization`,
+										ownerId: currentUser.id,
+									}),
+									database.insert(Db.organizationMembers).values({
+										id: candidateMemberId,
+										organizationId: candidateOrgId,
+										userId: currentUser.id,
+										role: "owner",
+									}),
+								);
+							return { statements, result: undefined };
 						}),
 					);
 				}),

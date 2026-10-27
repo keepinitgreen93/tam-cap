@@ -2,14 +2,22 @@ import { randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { db } from "@cap/database";
+import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
-	organizations,
 	videoEdits,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
-import type { VideoEditSpec, VideoMetadata } from "@cap/database/types";
+} from "@cap/database/cloudflare/schema";
+import {
+	claimTranscriptionRun,
+	releaseTranscriptionRun,
+	setTranscriptionRunStatus,
+	transcriptionAudioFilename,
+	validateTranscriptionRun,
+} from "@cap/database/cloudflare/transcription-state";
+import type { VideoEditSpec } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { Storage } from "@cap/web-backend/src/Storage/index";
 import {
@@ -17,10 +25,9 @@ import {
 	parseAiGenerationLanguage,
 	Video,
 } from "@cap/web-domain";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { Either, Option, Schema } from "effect";
 import { FatalError } from "workflow";
-import { start } from "workflow/api";
 import {
 	ENHANCED_AUDIO_CONTENT_TYPE,
 	ENHANCED_AUDIO_EXTENSION,
@@ -31,12 +38,9 @@ import {
 	createEditTranscript,
 	editTranscriptWordsToCaptionVtt,
 	getEditTranscriptBackfillStatus,
-	getEditTranscriptObjectKey,
 	serializeEditTranscript,
 } from "@/lib/edit-transcript";
-import { encryptEditTranscriptObject } from "@/lib/edit-transcript-storage";
 import { startAiGeneration } from "@/lib/generate-ai";
-import { getLiveTranscriptObjectKey } from "@/lib/live-transcribe-core";
 import {
 	checkHasAudioTrackViaMediaServer,
 	extractAudioViaMediaServer,
@@ -45,12 +49,24 @@ import {
 } from "@/lib/media-client";
 import { planSegmentsAudioExtraction } from "@/lib/segments-audio";
 import { downloadConcatenatedSegments } from "@/lib/segments-audio-download";
+import {
+	getTranscriptPublication,
+	metadataWithTranscriptPublication,
+	prepareTranscriptPublication,
+	readOriginalEditTranscript,
+	readTranscriptPublicationOutcome,
+	readTranscriptVtt,
+	TranscriptPublicationConflictError,
+	transcriptMediaRevision,
+} from "@/lib/transcript-publication";
 import { isTranscriptionConfigured } from "@/lib/transcription-config";
+import { dispatchTranscriptionRun } from "@/lib/transcription-dispatch";
 import { transcribeAudio } from "@/lib/transcription-provider";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
 interface TranscribeWorkflowPayload {
+	runId: string;
 	videoId: string;
 	userId: string;
 	aiGenerationEnabled: boolean;
@@ -74,7 +90,15 @@ interface BackfillEditTranscriptPayload {
 	requestId: string;
 }
 
-const EDIT_TRANSCRIPT_TEMP_AUDIO_FILENAME = "audio-edit-transcript-v3-temp.mp3";
+const editTranscriptTempAudioFilename = (requestId: string) => {
+	if (
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+			requestId,
+		)
+	)
+		throw new FatalError("Invalid transcript request identity");
+	return `.recording/transcription/${requestId}/edit-audio.mp3`;
+};
 
 interface TranscriptionArtifacts {
 	vtt: string;
@@ -99,16 +123,22 @@ export async function transcribeVideoWorkflow(
 
 	const { videoId, userId, aiGenerationEnabled } = payload;
 
-	let videoData: VideoData;
-	try {
-		videoData = await validateVideo(videoId);
-	} catch (error) {
-		await markError(videoId);
-		throw error;
+	const validation = await validateVideo(videoId, userId, payload.runId);
+	if (validation.state !== "ready") {
+		if (
+			validation.state === "source-changed" &&
+			(await releaseSupersededTranscription(videoId, userId, payload.runId))
+		)
+			await requeueAfterEarlyDefer(videoId, userId, aiGenerationEnabled);
+		return {
+			success: true,
+			message: "Transcription superseded; current media will be processed",
+		};
 	}
+	const videoData = validation.data;
 
 	if (videoData.transcriptionDisabled) {
-		await markSkipped(videoId);
+		await markSkipped(videoData.video);
 		return { success: true, message: "Transcription disabled - skipped" };
 	}
 
@@ -124,7 +154,7 @@ export async function transcribeVideoWorkflow(
 			);
 
 			if (segments.status === "no-audio") {
-				await markNoAudio(videoId);
+				await markNoAudio(videoData.video);
 				return {
 					success: true,
 					message: "Video has no audio track - skipped transcription",
@@ -138,7 +168,7 @@ export async function transcribeVideoWorkflow(
 				// run and been rejected by our claim, so we cannot rely on it firing
 				// again.
 				await cleanupTempAudio(videoId, userId, videoData.video);
-				await deferEarlyTranscription(videoId);
+				await deferEarlyTranscription(videoData.video);
 				await requeueAfterEarlyDefer(videoId, userId, aiGenerationEnabled);
 				return {
 					success: true,
@@ -159,7 +189,7 @@ export async function transcribeVideoWorkflow(
 		}
 
 		if (!audioUrl) {
-			await markNoAudio(videoId);
+			await markNoAudio(videoData.video);
 			return {
 				success: true,
 				message: "Video has no audio track - skipped transcription",
@@ -172,8 +202,36 @@ export async function transcribeVideoWorkflow(
 			videoDurationMs,
 		);
 
-		await saveTranscription(videoId, userId, videoData.video, transcription);
+		const published = await saveTranscription(
+			videoId,
+			userId,
+			videoData.video,
+			transcription,
+		);
+		if (!published)
+			return {
+				success: true,
+				message: "Transcription disabled before publication",
+			};
 	} catch (error) {
+		if (
+			error instanceof Error &&
+			error.name === "TranscriptPublicationConflictError"
+		) {
+			const released = await releaseSupersededTranscription(
+				videoData.video.id,
+				videoData.video.ownerId,
+				payload.runId,
+			);
+			await cleanupTempAudio(videoId, userId, videoData.video);
+			if (released)
+				await requeueAfterEarlyDefer(videoId, userId, aiGenerationEnabled);
+			return {
+				success: true,
+				message: "Recording changed; transcription requeued",
+			};
+		}
+
 		if (
 			typeof error === "object" &&
 			error !== null &&
@@ -181,7 +239,7 @@ export async function transcribeVideoWorkflow(
 			typeof error.message === "string" &&
 			error.message.toLowerCase().includes("no spoken audio")
 		) {
-			await markNoAudio(videoId);
+			await markNoAudio(videoData.video);
 			await cleanupTempAudio(videoId, userId, videoData.video);
 			return {
 				success: true,
@@ -189,7 +247,7 @@ export async function transcribeVideoWorkflow(
 			};
 		}
 
-		await markError(videoId);
+		await markError(videoData.video);
 		await cleanupTempAudio(videoId, userId, videoData.video);
 		throw error;
 	}
@@ -209,7 +267,7 @@ export async function backfillEditTranscriptWorkflow(
 	"use workflow";
 
 	const { videoId, userId, requestId } = payload;
-	let video: typeof videos.$inferSelect;
+	let video: typeof videos.$inferSelect | undefined;
 
 	try {
 		video = await validateEditTranscriptBackfill(videoId, userId, requestId);
@@ -220,7 +278,7 @@ export async function backfillEditTranscriptWorkflow(
 			videoId,
 			userId,
 			video,
-			EDIT_TRANSCRIPT_TEMP_AUDIO_FILENAME,
+			editTranscriptTempAudioFilename(requestId),
 			videoEdit?.sourceKey,
 		);
 		if (!audio) {
@@ -247,7 +305,7 @@ export async function backfillEditTranscriptWorkflow(
 			videoId,
 			userId,
 			video,
-			EDIT_TRANSCRIPT_TEMP_AUDIO_FILENAME,
+			editTranscriptTempAudioFilename(requestId),
 		);
 		return { success: true };
 	} catch (error) {
@@ -255,65 +313,58 @@ export async function backfillEditTranscriptWorkflow(
 			`[transcribe] Editable transcript backfill failed for ${videoId}`,
 			error,
 		);
-		const loadedVideo = await loadVideoForEditTranscriptBackfill(videoId);
+		const loadedVideo =
+			video ?? (await loadVideoForEditTranscriptBackfill(videoId));
 		if (loadedVideo?.ownerId === userId) {
 			await saveEditTranscriptBackfillError(videoId, requestId, loadedVideo);
 			await cleanupTempAudio(
 				videoId,
 				userId,
 				loadedVideo,
-				EDIT_TRANSCRIPT_TEMP_AUDIO_FILENAME,
+				editTranscriptTempAudioFilename(requestId),
 			);
 		}
 		return { success: false };
 	}
 }
 
-async function validateVideo(videoId: string): Promise<VideoData> {
+async function releaseSupersededTranscription(
+	videoId: string,
+	ownerId: string,
+	runId: string,
+) {
 	"use step";
-
-	if (!isTranscriptionConfigured(serverEnv())) {
+	return releaseTranscriptionRun(db(), {
+		videoId: videoId as Video.VideoId,
+		ownerId: ownerId as typeof videos.$inferSelect.ownerId,
+		runId,
+	});
+}
+async function validateVideo(videoId: string, userId: string, runId: string) {
+	"use step";
+	if (!isTranscriptionConfigured(serverEnv()))
 		throw new FatalError("Missing transcription provider credentials");
-	}
-
-	const query = await db()
-		.select({
-			video: videos,
-			settings: videos.settings,
-			orgSettings: organizations.settings,
-		})
-		.from(videos)
-		.leftJoin(organizations, eq(videos.orgId, organizations.id))
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	if (query.length === 0) {
-		throw new FatalError("Video does not exist");
-	}
-
-	const result = query[0];
-	if (!result?.video) {
-		throw new FatalError("Video information is missing");
-	}
-
-	const transcriptionDisabled =
-		result.video.settings?.disableTranscript ??
-		result.orgSettings?.disableTranscript ??
-		false;
-
-	await db()
-		.update(videos)
-		.set({ transcriptionStatus: "PROCESSING" })
-		.where(eq(videos.id, videoId as Video.VideoId));
-
+	const result = await validateTranscriptionRun(
+		db(),
+		videoId as Video.VideoId,
+		userId as typeof videos.$inferSelect.ownerId,
+		runId,
+	);
+	if (result.state !== "ready") return result;
 	return {
-		video: result.video,
-		transcriptionDisabled,
-		aiGenerationLanguage: parseAiGenerationLanguage(
-			result.orgSettings?.aiGenerationLanguage,
-		),
+		state: "ready" as const,
+		data: {
+			video: result.video,
+			transcriptionDisabled:
+				result.video.settings?.disableTranscript ??
+				result.organizationSettings?.disableTranscript ??
+				false,
+			aiGenerationLanguage: parseAiGenerationLanguage(
+				result.organizationSettings?.aiGenerationLanguage,
+			),
+		} satisfies VideoData,
 	};
 }
-
 async function loadVideoForEditTranscriptBackfill(videoId: string) {
 	"use step";
 
@@ -375,82 +426,30 @@ async function validateEditTranscriptBackfill(
 	return video;
 }
 
-/**
- * Every terminal transcription outcome must clear the live-transcription
- * metadata flag, or share pages keep polling for a live transcript that can
- * never resolve. Guarded so videos without the flag see a 0-row update.
- */
-async function clearLiveTranscriptFlag(videoId: string): Promise<void> {
-	try {
-		await db()
-			.update(videos)
-			.set({
-				metadata: sql`JSON_REMOVE(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.liveTranscript')`,
-				updatedAt: sql`${videos.updatedAt}`,
-			})
-			.where(
-				and(
-					eq(videos.id, videoId as Video.VideoId),
-					sql`JSON_EXTRACT(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.liveTranscript') IS NOT NULL`,
-				),
-			);
-	} catch (error) {
-		console.warn(
-			`[transcribe] Failed to clear live transcript flag for ${videoId}`,
-			error,
-		);
-	}
-}
-
-async function markSkipped(videoId: string): Promise<void> {
+async function markSkipped(video: typeof videos.$inferSelect): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({ transcriptionStatus: "SKIPPED" })
-		.where(eq(videos.id, videoId as Video.VideoId));
-	await clearLiveTranscriptFlag(videoId);
+	await setTranscriptionRunStatus(db(), video, "SKIPPED");
 }
-
-async function markNoAudio(videoId: string): Promise<void> {
+async function markNoAudio(video: typeof videos.$inferSelect): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({ transcriptionStatus: "NO_AUDIO" })
-		.where(eq(videos.id, videoId as Video.VideoId));
-	await clearLiveTranscriptFlag(videoId);
+	await setTranscriptionRunStatus(db(), video, "NO_AUDIO");
 }
-
-async function markError(videoId: string): Promise<void> {
+async function markError(video: typeof videos.$inferSelect): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({ transcriptionStatus: "ERROR" })
-		.where(
-			and(
-				eq(videos.id, videoId as Video.VideoId),
-				eq(videos.transcriptionStatus, "PROCESSING"),
-			),
-		);
-	await clearLiveTranscriptFlag(videoId);
+	await setTranscriptionRunStatus(db(), video, "ERROR");
 }
-
-async function deferEarlyTranscription(videoId: string): Promise<void> {
+async function deferEarlyTranscription(
+	video: typeof videos.$inferSelect,
+): Promise<void> {
 	"use step";
-
-	await db()
-		.update(videos)
-		.set({ transcriptionStatus: null })
-		.where(
-			and(
-				eq(videos.id, videoId as Video.VideoId),
-				eq(videos.transcriptionStatus, "PROCESSING"),
-			),
-		);
+	const runId = video.metadata?.transcriptionRun?.id;
+	if (runId)
+		await releaseTranscriptionRun(db(), {
+			videoId: video.id,
+			ownerId: video.ownerId,
+			runId,
+		});
 }
-
 /**
  * After an early-path deferral, put the video back on the normal
  * transcription path. Mirrors lib/transcribe.ts semantics without importing
@@ -479,41 +478,27 @@ async function requeueAfterEarlyDefer(
 		return;
 	}
 
-	const claim = await db()
-		.update(videos)
-		.set({ transcriptionStatus: "PROCESSING" })
-		.where(
-			and(
-				eq(videos.id, videoId as Video.VideoId),
-				isNull(videos.transcriptionStatus),
-			),
-		);
-	const affectedRows = Array.isArray(claim)
-		? ((claim[0] as { affectedRows?: number } | undefined)?.affectedRows ?? 0)
-		: ((claim as { affectedRows?: number } | undefined)?.affectedRows ?? 0);
-	if (affectedRows === 0) return;
-
-	try {
-		await start(transcribeVideoWorkflow, [
-			{ videoId, userId, aiGenerationEnabled },
-		]);
-	} catch (error) {
-		await db()
-			.update(videos)
-			.set({ transcriptionStatus: null })
-			.where(eq(videos.id, videoId as Video.VideoId));
-		throw error;
-	}
+	const claimed = await claimTranscriptionRun(
+		db(),
+		videoId as Video.VideoId,
+		userId as typeof videos.$inferSelect.ownerId,
+	);
+	if (!claimed) return;
+	await dispatchTranscriptionRun(
+		transcribeVideoWorkflow,
+		claimed.video,
+		aiGenerationEnabled,
+	);
 }
-
 async function extractAudio(
 	videoId: string,
 	userId: string,
 	video: typeof videos.$inferSelect,
-	tempAudioFilename = "audio-temp.mp3",
+	tempAudioFilename?: string,
 	sourceKeyOverride?: string,
 ): Promise<ExtractedAudio | null> {
 	"use step";
+	tempAudioFilename ??= transcriptionAudioFilename(video);
 
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),
@@ -693,7 +678,7 @@ async function extractAudioFromSegmentsImpl(
 	videoId: string,
 	userId: string,
 	video: typeof videos.$inferSelect,
-	tempAudioFilename = "audio-temp.mp3",
+	tempAudioFilename = transcriptionAudioFilename(video),
 ): Promise<SegmentsAudioExtraction> {
 	try {
 		const [bucket] = await Storage.getAccessForVideo(
@@ -881,68 +866,96 @@ async function saveTranscription(
 	userId: string,
 	video: typeof videos.$inferSelect,
 	transcription: TranscriptionArtifacts,
-): Promise<void> {
+): Promise<boolean> {
 	"use step";
-
+	if (video.id !== videoId || video.ownerId !== userId)
+		throw new FatalError("Transcription owner changed");
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),
 	).pipe(runWorkflowPromise);
-
-	await bucket
-		.putObject(`${userId}/${videoId}/transcription.vtt`, transcription.vtt, {
-			contentType: "text/vtt",
-		})
-		.pipe(runWorkflowPromise);
-
-	// The word transcript must always describe the ORIGINAL media. This pass ran
-	// against whatever media is current, so it may only be persisted while the
-	// video is un-edited; edited videos keep (or backfill) their own transcript.
+	const store = {
+		getText: async (key: string) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runWorkflowPromise)),
+		put: (key: string, value: string, contentType: string) =>
+			bucket.putObject(key, value, { contentType }).pipe(runWorkflowPromise),
+		delete: (key: string) => bucket.deleteObject(key).pipe(runWorkflowPromise),
+	};
 	const [edit] = await db()
-		.select({ videoId: videoEdits.videoId })
+		.select({ sourceKey: videoEdits.sourceKey, editSpec: videoEdits.editSpec })
 		.from(videoEdits)
-		.where(eq(videoEdits.videoId, videoId as Video.VideoId));
-
-	if (edit) {
-		console.log(
-			`[transcribe] Skipping edit transcript write for edited video ${videoId}`,
-		);
-	} else {
-		await bucket
-			.putObject(
-				getEditTranscriptObjectKey(userId, videoId),
-				encryptEditTranscriptObject(
-					transcription.editTranscript,
-					userId,
-					videoId,
-				),
-				{ contentType: "application/octet-stream" },
-			)
-			.pipe(runWorkflowPromise);
-	}
-
-	await db()
-		.update(videos)
-		.set({ transcriptionStatus: "COMPLETE" })
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	// The canonical transcript supersedes the provisional live transcript, so
-	// drop the artifact and its metadata flag. Never fatal: a leftover live
-	// artifact is unused once transcriptionStatus is COMPLETE.
-	if (
-		video.source.type === "desktopSegments" ||
-		video.source.type === "desktopMP4"
-	) {
-		try {
-			await bucket
-				.deleteObject(getLiveTranscriptObjectKey(userId, videoId))
-				.pipe(runWorkflowPromise);
-		} catch (error) {
-			console.warn(
-				`[transcribe] Failed to clean up live transcript for ${videoId}`,
-				error,
+		.where(eq(videoEdits.videoId, video.id));
+	const original = edit
+		? await readOriginalEditTranscript(video, store)
+		: transcription.editTranscript;
+	const prepared = await prepareTranscriptPublication({
+		video,
+		store,
+		vtt: transcription.vtt,
+		editTranscript: original,
+	});
+	const database = db();
+	try {
+		return await atomic(database, async (snapshot) => {
+			const [current] = await snapshot.read((reader) =>
+				reader.select().from(videos).where(eq(videos.id, video.id)).limit(1),
 			);
-		}
-		await clearLiveTranscriptFlag(videoId);
+			if (!current || current.ownerId !== video.ownerId)
+				throw new TranscriptPublicationConflictError();
+			const organization = current.orgId
+				? await requireActiveOrganization(snapshot, current.orgId)
+				: null;
+			if (
+				transcriptMediaRevision(current) === transcriptMediaRevision(video) &&
+				current.transcriptionStatus === "COMPLETE" &&
+				getTranscriptPublication(current)?.revision ===
+					prepared.pointer.revision
+			)
+				return { statements: [], result: true };
+			const [currentEdit] = await snapshot.read((reader) =>
+				reader
+					.select({
+						sourceKey: videoEdits.sourceKey,
+						editSpec: videoEdits.editSpec,
+					})
+					.from(videoEdits)
+					.where(eq(videoEdits.videoId, video.id)),
+			);
+			if (JSON.stringify(currentEdit ?? null) !== JSON.stringify(edit ?? null))
+				throw new TranscriptPublicationConflictError();
+			const { liveTranscript: _liveTranscript, ...nextMetadata } =
+				current.metadata ?? {};
+			const metadata = metadataWithTranscriptPublication(
+				current,
+				prepared,
+				nextMetadata,
+			);
+			if (
+				current.settings?.disableTranscript ??
+				organization?.settings?.disableTranscript
+			)
+				return {
+					statements: [
+						database
+							.update(videos)
+							.set({ metadata: nextMetadata, transcriptionStatus: "SKIPPED" })
+							.where(eq(videos.id, video.id)),
+					],
+					result: false,
+				};
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({ metadata, transcriptionStatus: "COMPLETE" })
+						.where(eq(videos.id, video.id)),
+				],
+				result: true,
+			};
+		});
+	} catch (error) {
+		const outcome = await readTranscriptPublicationOutcome(database, prepared);
+		if (outcome.state === "published") return true;
+		throw error;
 	}
 }
 
@@ -954,50 +967,129 @@ async function saveEditTranscriptBackfill(
 	editTranscript: string,
 ) {
 	"use step";
-
-	const [bucket] = await Storage.getAccessForVideo(
-		decodeStorageVideo(video),
-	).pipe(runWorkflowPromise);
-
 	if (!(await canPersistEditTranscriptBackfill(videoId, requestId, video)))
 		return;
-
-	await bucket
-		.putObject(
-			getEditTranscriptObjectKey(userId, videoId),
-			encryptEditTranscriptObject(editTranscript, userId, videoId),
-			{
-				contentType: "application/octet-stream",
-			},
+	const [base] = await db()
+		.select()
+		.from(videos)
+		.where(eq(videos.id, video.id))
+		.limit(1);
+	if (
+		!base ||
+		base.ownerId !== userId ||
+		transcriptMediaRevision(base) !== transcriptMediaRevision(video)
+	)
+		return;
+	const [bucket] = await Storage.getAccessForVideo(
+		decodeStorageVideo(base),
+	).pipe(runWorkflowPromise);
+	const store = {
+		getText: async (key: string) =>
+			Option.getOrNull(await bucket.getObject(key).pipe(runWorkflowPromise)),
+		put: (key: string, value: string, contentType: string) =>
+			bucket.putObject(key, value, { contentType }).pipe(runWorkflowPromise),
+		delete: (key: string) => bucket.deleteObject(key).pipe(runWorkflowPromise),
+	};
+	const vtt = await readTranscriptVtt(base, store);
+	const prepared = await prepareTranscriptPublication({
+		video: base,
+		store,
+		vtt,
+		editTranscript,
+	});
+	const database = db();
+	try {
+		await atomic(database, async (snapshot) => {
+			const [current] = await snapshot.read((reader) =>
+				reader.select().from(videos).where(eq(videos.id, video.id)).limit(1),
+			);
+			const [upload] = await snapshot.read((reader) =>
+				reader
+					.select({ videoId: videoUploads.videoId })
+					.from(videoUploads)
+					.where(eq(videoUploads.videoId, video.id))
+					.limit(1),
+			);
+			if (
+				!current ||
+				current.ownerId !== userId ||
+				current.transcriptionStatus !== "COMPLETE" ||
+				upload ||
+				getEditTranscriptBackfillStatus(current.metadata)?.requestId !==
+					requestId ||
+				transcriptMediaRevision(current) !== transcriptMediaRevision(video)
+			)
+				throw new TranscriptPublicationConflictError();
+			if (current.orgId)
+				await requireActiveOrganization(snapshot, current.orgId);
+			const { editTranscriptBackfill: _backfill, ...nextMetadata } =
+				current.metadata ?? {};
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({
+							metadata: metadataWithTranscriptPublication(
+								current,
+								prepared,
+								nextMetadata,
+							),
+							updatedAt: current.updatedAt,
+						})
+						.where(eq(videos.id, current.id)),
+				],
+				result: undefined,
+			};
+		});
+	} catch (error) {
+		if (
+			(await readTranscriptPublicationOutcome(database, prepared)).state ===
+			"published"
 		)
-		.pipe(runWorkflowPromise);
-	await clearEditTranscriptBackfill(videoId, requestId);
+			return;
+		throw error;
+	}
 }
-
 async function saveEditTranscriptBackfillError(
 	videoId: string,
 	requestId: string,
 	video: typeof videos.$inferSelect,
 ) {
 	"use step";
-
-	if (!(await canPersistEditTranscriptBackfill(videoId, requestId, video)))
-		return;
-
-	await db()
-		.update(videos)
-		.set({
-			metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.editTranscriptBackfill.status', 'error')`,
-			updatedAt: sql`${videos.updatedAt}`,
-		})
-		.where(
-			and(
-				eq(videos.id, videoId as Video.VideoId),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.editTranscriptBackfill.requestId')) = ${requestId}`,
-			),
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const [current] = await snapshot.read((reader) =>
+			reader
+				.select()
+				.from(videos)
+				.where(eq(videos.id, videoId as Video.VideoId))
+				.limit(1),
 		);
+		const status = getEditTranscriptBackfillStatus(current?.metadata);
+		if (
+			!current ||
+			current.ownerId !== video.ownerId ||
+			status?.requestId !== requestId ||
+			transcriptMediaRevision(current) !== transcriptMediaRevision(video)
+		)
+			return { statements: [], result: undefined };
+		return {
+			statements: [
+				database
+					.update(videos)
+					.set({
+						metadata: {
+							...current.metadata,
+							editTranscriptBackfill: { ...status, status: "error" },
+						},
+						updatedAt: current.updatedAt,
+					})
+					.where(eq(videos.id, current.id)),
+			],
+			result: undefined,
+		};
+	});
 }
-
 async function canPersistEditTranscriptBackfill(
 	videoId: string,
 	requestId: string,
@@ -1005,12 +1097,7 @@ async function canPersistEditTranscriptBackfill(
 ) {
 	const [[currentVideo], [activeUpload]] = await Promise.all([
 		db()
-			.select({
-				duration: videos.duration,
-				metadata: videos.metadata,
-				transcriptionStatus: videos.transcriptionStatus,
-				updatedAt: videos.updatedAt,
-			})
+			.select()
 			.from(videos)
 			.where(eq(videos.id, videoId as Video.VideoId)),
 		db()
@@ -1023,35 +1110,21 @@ async function canPersistEditTranscriptBackfill(
 	return (
 		currentVideo?.transcriptionStatus === "COMPLETE" &&
 		currentVideo.duration === video.duration &&
-		currentVideo.updatedAt.getTime() === video.updatedAt.getTime() &&
+		transcriptMediaRevision(currentVideo) === transcriptMediaRevision(video) &&
 		getEditTranscriptBackfillStatus(currentVideo.metadata)?.requestId ===
 			requestId &&
 		!activeUpload
 	);
 }
 
-async function clearEditTranscriptBackfill(videoId: string, requestId: string) {
-	await db()
-		.update(videos)
-		.set({
-			metadata: sql`JSON_REMOVE(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.editTranscriptBackfill')`,
-			updatedAt: sql`${videos.updatedAt}`,
-		})
-		.where(
-			and(
-				eq(videos.id, videoId as Video.VideoId),
-				sql`JSON_UNQUOTE(JSON_EXTRACT(${videos.metadata}, '$.editTranscriptBackfill.requestId')) = ${requestId}`,
-			),
-		);
-}
-
 async function cleanupTempAudio(
 	videoId: string,
 	userId: string,
 	video: typeof videos.$inferSelect,
-	tempAudioFilename = "audio-temp.mp3",
+	tempAudioFilename?: string,
 ): Promise<void> {
 	"use step";
+	tempAudioFilename ??= transcriptionAudioFilename(video);
 
 	const audioKey = `${userId}/${videoId}/${tempAudioFilename}`;
 
@@ -1081,20 +1154,10 @@ async function queueAiGeneration(
 async function _markEnhancedAudioProcessing(videoId: string): Promise<void> {
 	"use step";
 
-	const [video] = await db()
-		.select({ metadata: videos.metadata })
-		.from(videos)
-		.where(eq(videos.id, videoId as Video.VideoId));
-
-	const currentMetadata = (video?.metadata as VideoMetadata) || {};
-
 	await db()
 		.update(videos)
 		.set({
-			metadata: {
-				...currentMetadata,
-				enhancedAudioStatus: "PROCESSING",
-			},
+			metadata: sql`json_set(coalesce(${videos.metadata}, json_object()), '$.enhancedAudioStatus', 'PROCESSING')`,
 		})
 		.where(eq(videos.id, videoId as Video.VideoId));
 }
@@ -1127,20 +1190,10 @@ async function _enhanceAndSaveAudio(
 			})
 			.pipe(runWorkflowPromise);
 
-		const [videoRecord] = await db()
-			.select({ metadata: videos.metadata })
-			.from(videos)
-			.where(eq(videos.id, videoId as Video.VideoId));
-
-		const currentMetadata = (videoRecord?.metadata as VideoMetadata) || {};
-
 		await db()
 			.update(videos)
 			.set({
-				metadata: {
-					...currentMetadata,
-					enhancedAudioStatus: "COMPLETE",
-				},
+				metadata: sql`json_set(coalesce(${videos.metadata}, json_object()), '$.enhancedAudioStatus', 'COMPLETE')`,
 			})
 			.where(eq(videos.id, videoId as Video.VideoId));
 	} catch (error) {
@@ -1149,20 +1202,10 @@ async function _enhanceAndSaveAudio(
 			error,
 		);
 
-		const [video] = await db()
-			.select({ metadata: videos.metadata })
-			.from(videos)
-			.where(eq(videos.id, videoId as Video.VideoId));
-
-		const currentMetadata = (video?.metadata as VideoMetadata) || {};
-
 		await db()
 			.update(videos)
 			.set({
-				metadata: {
-					...currentMetadata,
-					enhancedAudioStatus: "ERROR",
-				},
+				metadata: sql`json_set(coalesce(${videos.metadata}, json_object()), '$.enhancedAudioStatus', 'ERROR')`,
 			})
 			.where(eq(videos.id, videoId as Video.VideoId));
 	}

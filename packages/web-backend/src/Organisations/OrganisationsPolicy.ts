@@ -1,7 +1,7 @@
 import { type Organisation, Policy } from "@cap/web-domain";
 import { Effect, Option } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { OrganisationsRepo } from "../Organisations/OrganisationsRepo.ts";
 import { SpacesRepo } from "../Spaces/SpacesRepo.ts";
 
@@ -13,7 +13,14 @@ export class OrganisationsPolicy extends Effect.Service<OrganisationsPolicy>()(
 
 			const isMember = (orgId: Organisation.OrganisationId) =>
 				Policy.policy((user) =>
-					repo.membership(user.id, orgId).pipe(Effect.map(Option.isSome)),
+					repo
+						.membership(user.id, orgId)
+						.pipe(
+							Effect.map(
+								Option.filter((member) => member.tombstoneAt === null),
+							),
+							Effect.map(Option.isSome),
+						),
 				);
 
 			const isOwner = (orgId: Organisation.OrganisationId) =>
@@ -35,7 +42,10 @@ export class OrganisationsPolicy extends Effect.Service<OrganisationsPolicy>()(
 							v.pipe(
 								Option.filter((v) => {
 									const role = String(v.role).toLowerCase();
-									return role === "owner" || role === "admin";
+									return (
+										v.tombstoneAt === null &&
+										(role === "owner" || role === "admin")
+									);
 								}),
 								Option.isSome,
 							),

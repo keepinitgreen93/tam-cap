@@ -8,8 +8,8 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const client = drizzle(mocks.query);
 	return { db: () => client };
 });
@@ -24,17 +24,17 @@ vi.mock("@cap/web-backend", async () => {
 });
 vi.mock("@/lib/server", async () => {
 	const { Effect } = await import("effect");
-	const { Database } = await import(
-		"../../../../packages/web-backend/src/Database"
+	const { CloudflareDatabase } = await import(
+		"../../../../packages/web-backend/src/CloudflareDatabase"
 	);
 	return {
 		runPromise: <A, E>(
 			effect: import("effect").Effect.Effect<
 				A,
 				E,
-				InstanceType<typeof Database>
+				InstanceType<typeof CloudflareDatabase>
 			>,
-		) => Effect.runPromise(Effect.provide(effect, Database.Default)),
+		) => Effect.runPromise(Effect.provide(effect, CloudflareDatabase.Default)),
 	};
 });
 vi.mock("@/app/(org)/dashboard/analytics/data", () => ({

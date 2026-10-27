@@ -1,7 +1,7 @@
 import { InternalError, User } from "@cap/web-domain";
 import { Effect, Layer } from "effect";
 
-import { Database } from "../Database";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase";
 import { Users } from ".";
 import { UsersOnboarding } from "./UsersOnboarding";
 

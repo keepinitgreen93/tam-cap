@@ -6,7 +6,7 @@ import {
 import { Effect, Layer, Option } from "effect";
 
 import { getCurrentUser, makeCurrentUser } from "./Auth.ts";
-import { Database } from "./Database.ts";
+import { CloudflareDatabase as Database } from "./CloudflareDatabase.ts";
 import { FolderRpcsLive } from "./Folders/FoldersRpcs.ts";
 import { OrganisationsRpcsLive } from "./Organisations/OrganisationsRpcs.ts";
 import { UsersRpcsLive } from "./Users/UsersRpcs.ts";

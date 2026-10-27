@@ -1,6 +1,6 @@
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	getCurrentUser,
 	HttpAuthMiddlewareLive,
 	RpcAuthMiddlewareLive,
@@ -66,6 +66,9 @@ vi.mock("@cap/env", () => ({
 }));
 
 vi.mock("@cap/database", () => ({ db: () => mocks.client }));
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => mocks.client,
+}));
 
 vi.mock("@cap/database/auth/auth-options", () => ({
 	authOptions: () => ({}),

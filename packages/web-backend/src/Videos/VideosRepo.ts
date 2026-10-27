@@ -1,11 +1,18 @@
-import { randomUUID } from "node:crypto";
+import { normalizeEmail } from "@cap/database/auth/identity";
+import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
 import { type User, Video } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect, Option } from "effect";
 import type { Schema } from "effect/Schema";
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
+import {
+	activeVideo,
+	createVideo,
+	deleteVideo,
+	prepareVideoDeletion,
+	type VideoCopySource,
+} from "./persistence.ts";
 
 export type CreateVideoInput = Omit<
 	Schema.Type<typeof Video.Video>,
@@ -24,7 +31,10 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 		const getById = (id: Video.VideoId) =>
 			Effect.gen(function* () {
 				const [video] = yield* db.use((db) =>
-					db.select().from(Db.videos).where(Dz.eq(Db.videos.id, id)),
+					db
+						.select()
+						.from(Db.videos)
+						.where(Dz.and(Dz.eq(Db.videos.id, id), activeVideo)),
 				);
 
 				return Option.fromNullable(video).pipe(
@@ -37,7 +47,7 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 									storageIntegrationId: v.storageIntegrationId,
 									createdAt: v.createdAt.toISOString(),
 									updatedAt: v.updatedAt.toISOString(),
-									metadata: v.metadata as any,
+									metadata: v.metadata,
 								}),
 								Option.fromNullable(video?.password),
 							] as const,
@@ -53,8 +63,9 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 					.where(
 						Dz.and(
 							Dz.eq(Db.videoViewerGrants.videoId, id),
-							Dz.eq(Db.videoViewerGrants.email, email.trim().toLowerCase()),
+							Dz.eq(Db.videoViewerGrants.email, normalizeEmail(email)),
 							Dz.isNull(Db.videoViewerGrants.revokedAt),
+							Dz.sql`exists (select 1 from ${Db.videos} where ${Db.videos.id} = ${Db.videoViewerGrants.videoId} and ${activeVideo})`,
 						),
 					)
 					.limit(1);
@@ -62,124 +73,57 @@ export class VideosRepo extends Effect.Service<VideosRepo>()("VideosRepo", {
 			});
 
 		const prepareDelete = (id: Video.VideoId, ownerId: User.UserId) =>
-			db.use((database) =>
-				database.transaction(async (tx) => {
-					const now = new Date();
-					const retired = {
-						generation: randomUUID(),
-						state: "source-blocked" as const,
-						attemptId: null,
-						leaseExpiresAt: null,
-						nextRetryAt: now,
-						workflowRunId: null,
-						remoteJobId: null,
-						errorCode: "video-deleting",
-						errorMessage: "Recording deletion is in progress.",
-						updatedAt: now,
-					};
-					await tx
-						.insert(Db.videoProcessingJobs)
-						.values({ videoId: id, ownerId, createdAt: now, ...retired })
-						.onDuplicateKeyUpdate({ set: retired });
-					const [video] = await tx
-						.select({ ownerId: Db.videos.ownerId })
-						.from(Db.videos)
-						.where(Dz.eq(Db.videos.id, id))
-						.for("update");
-					if (!video || video.ownerId !== ownerId) {
-						throw new Error("Video owner changed before deletion");
-					}
-				}),
-			);
+			db.use((database) => prepareVideoDeletion(database, id, ownerId));
 
 		const delete_ = (id: Video.VideoId, ownerId?: User.UserId) =>
-			db.use(async (db) => {
-				await db.transaction(async (db) => {
-					await db
-						.delete(Db.videoProcessingJobs)
-						.where(Dz.eq(Db.videoProcessingJobs.videoId, id));
-					if (ownerId) {
-						const [video] = await db
-							.select({ ownerId: Db.videos.ownerId })
-							.from(Db.videos)
-							.where(Dz.eq(Db.videos.id, id))
-							.for("update");
-						if (!video || video.ownerId !== ownerId) {
-							throw new Error("Video owner changed during deletion");
-						}
-					}
-					await Promise.all([
-						db
-							.delete(Db.sharedVideos)
-							.where(Dz.eq(Db.sharedVideos.videoId, id)),
-						db.delete(Db.spaceVideos).where(Dz.eq(Db.spaceVideos.videoId, id)),
-						db.delete(Db.importedVideos).where(Dz.eq(Db.importedVideos.id, id)),
-						db.delete(Db.videos).where(Dz.eq(Db.videos.id, id)),
-						db
-							.delete(Db.videoUploads)
-							.where(Dz.eq(Db.videoUploads.videoId, id)),
-					]);
-				});
-			});
+			db.use((database) => deleteVideo(database, id, ownerId));
 
 		const create = (
 			data: CreateVideoInput,
 			options?: {
 				id?: Video.VideoId;
 				initialUpload?: Omit<typeof Db.videoUploads.$inferInsert, "videoId">;
+				initialEdit?: Omit<typeof Db.videoEdits.$inferInsert, "videoId">;
+				copySource?: VideoCopySource;
 			},
 		) =>
 			Effect.gen(function* () {
 				const id = options?.id ?? Video.VideoId.make(nanoId());
 
-				yield* db.use((db) =>
-					db.transaction(async (db) => {
-						const {
-							createdAt: _createdAt,
-							updatedAt: _updatedAt,
-							id: _id,
-							...insertData
-						} = data as CreateVideoInput & {
-							createdAt?: unknown;
-							updatedAt?: unknown;
-							id?: unknown;
-						};
-						await db.insert(Db.videos).values([
-							{
-								...insertData,
-								id,
-								orgId: data.orgId,
-								bucket: Option.getOrNull(data.bucketId ?? Option.none()),
-								storageIntegrationId: Option.getOrNull(
-									data.storageIntegrationId ?? Option.none(),
-								),
-								metadata: Option.getOrNull(data.metadata ?? Option.none()),
-								transcriptionStatus: Option.getOrNull(
-									data.transcriptionStatus ?? Option.none(),
-								),
-								folderId: Option.getOrNull(data.folderId ?? Option.none()),
-								width: Option.getOrNull(data.width ?? Option.none()),
-								height: Option.getOrNull(data.height ?? Option.none()),
-								duration: Option.getOrNull(data.duration ?? Option.none()),
-							},
-						]);
-
-						if (data.importSource)
-							await db.insert(Db.importedVideos).values([
-								{
-									id,
-									orgId: data.orgId,
-									source: data.importSource.source,
-									sourceId: data.importSource.id,
-								},
-							]);
-
-						if (options?.initialUpload)
-							await db.insert(Db.videoUploads).values({
-								videoId: id,
-								...options.initialUpload,
-							});
-					}),
+				const now = new Date();
+				yield* db.use((database) =>
+					createVideo(
+						database,
+						{
+							id,
+							createdAt: now,
+							updatedAt: now,
+							ownerId: data.ownerId,
+							orgId: data.orgId,
+							name: data.name,
+							public: data.public,
+							source: data.source,
+							password: data.password,
+							bucket: Option.getOrNull(data.bucketId ?? Option.none()),
+							storageIntegrationId: Option.getOrNull(
+								data.storageIntegrationId ?? Option.none(),
+							),
+							metadata: Option.getOrNull(data.metadata ?? Option.none()),
+							transcriptionStatus: Option.getOrNull(
+								data.transcriptionStatus ?? Option.none(),
+							),
+							folderId: Option.getOrNull(data.folderId ?? Option.none()),
+							width: Option.getOrNull(data.width ?? Option.none()),
+							height: Option.getOrNull(data.height ?? Option.none()),
+							duration: Option.getOrNull(data.duration ?? Option.none()),
+						},
+						{
+							initialUpload: options?.initialUpload,
+							initialEdit: options?.initialEdit,
+							copySource: options?.copySource,
+							importSource: data.importSource,
+						},
+					),
 				);
 
 				return id;
