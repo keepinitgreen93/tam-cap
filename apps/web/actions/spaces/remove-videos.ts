@@ -1,14 +1,9 @@
 "use server";
-
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { sharedVideos, spaceVideos, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
 import type { Space, Video } from "@cap/web-domain";
-import { and, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-import { requireOrganizationSettingsManager } from "@/actions/organization/authorization";
-import { getSpaceAccess } from "@/actions/organization/space-authorization";
-
+import { mutateSharedVideos } from "@/lib/sharing-persistence";
 export async function removeVideosFromSpace(
 	spaceId: Space.SpaceIdOrOrganisationId,
 	videoIds: Video.VideoId[],
@@ -25,55 +20,21 @@ export async function removeVideosFromSpace(
 		}
 
 		const isAllSpacesEntry = user.activeOrganizationId === spaceId;
-
-		if (isAllSpacesEntry) {
-			await requireOrganizationSettingsManager(user.id, spaceId);
-		} else {
-			const access = await getSpaceAccess(user.id, spaceId);
-			if (!access?.canManage) {
-				throw new Error(
-					"You don't have permission to remove videos from this space",
-				);
-			}
-		}
-
-		const userVideos = await db()
-			.select({ id: videos.id })
-			.from(videos)
-			.where(and(eq(videos.ownerId, user.id), inArray(videos.id, videoIds)));
-
-		const validVideoIds = userVideos.map((v) => v.id);
-
-		if (validVideoIds.length === 0) {
-			throw new Error("No valid videos found");
-		}
-
-		if (isAllSpacesEntry) {
-			await db()
-				.delete(sharedVideos)
-				.where(
-					and(
-						eq(sharedVideos.organizationId, spaceId),
-						inArray(sharedVideos.videoId, validVideoIds),
-					),
-				);
-		} else {
-			await db()
-				.delete(spaceVideos)
-				.where(
-					and(
-						eq(spaceVideos.spaceId, spaceId),
-						inArray(spaceVideos.videoId, validVideoIds),
-					),
-				);
-		}
-
+		const { count } = await mutateSharedVideos(db(), {
+			userId: user.id,
+			destination: isAllSpacesEntry
+				? { type: "organization", id: user.activeOrganizationId }
+				: { type: "space", id: spaceId },
+			videoIds,
+			action: "remove",
+			mode: "manager",
+		});
 		revalidatePath(`/dashboard/spaces/${spaceId}`);
 
 		return {
 			success: true,
-			message: `Removed ${validVideoIds.length} video(s) from ${isAllSpacesEntry ? "organization" : "space"} and folders`,
-			deletedCount: validVideoIds.length,
+			message: `Removed ${count} video(s) from ${isAllSpacesEntry ? "organization" : "space"} and folders`,
+			deletedCount: count,
 		};
 	} catch (error) {
 		return {

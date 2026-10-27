@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizations, users } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations, users } from "@cap/database/cloudflare/schema";
 import { isProSubscription, stripe } from "@cap/utils";
 import type { Organisation } from "@cap/web-domain";
 import { eq } from "drizzle-orm";

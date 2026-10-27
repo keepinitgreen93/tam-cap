@@ -1,20 +1,23 @@
 # TAM Cap Cloudflare infrastructure
 
-This is the isolated platform foundation for the Cap fork. It is not the Cap web application. The health endpoint explicitly returns `applicationReady: false`. No production hostname is attached and no video serving or admin endpoint exists here.
+This directory contains the platform foundation and the separate guarded application runtime for the Cap fork. The platform health endpoint explicitly returns `applicationReady: false`; it is not application acceptance. The application is under private staging verification. No production hostname is attached yet.
 
 Resources are dedicated to this project:
 
 | Resource | Name |
 | --- | --- |
 | Worker | tam-cap-platform |
+| Application Worker | tam-cap-app |
 | D1 database | tam-cap-metadata |
+| Analytics D1 database | tam-cap-analytics |
 | Private R2 bucket | tam-cap-videos |
+| Workflow/maintenance queues | tam-cap-workflows, tam-cap-workflows-failed |
 
 The Cloudflare account and D1 identifiers in Wrangler configuration are identifiers, not credentials. R2 public access must remain disabled. Resend is the approved transactional email provider; configure its credentials through protected deployment secrets when the application is ready, never in this directory.
 
 `cap.env.example` records intended application configuration with blank secrets. It is not a bootable application configuration: the upstream app still requires MySQL until the D1 caller port is complete. Do not invent a MySQL URL or expose a half-configured deployment. The `CAP_AWS_*` variable names belong to upstream's S3-compatible interface; their destination here is Cloudflare R2, not AWS. The S3 endpoint is an authenticated API endpoint, not a public bucket URL. Omit other AI provider keys in the Cloudflare deployment to prevent external fallback. Model selection is provisional until real generation tests pass.
 
-Resend's `updates.trulyauthenticmarketing.com` sending domain was verified through the connected account on 2026-10-27. This keeps the application owner at `hello@trulyauthenticmarketing.com`; Cap login messages use its existing `auth@RESEND_FROM_DOMAIN` convention. No email has been sent by this setup.
+Resend's `updates.trulyauthenticmarketing.com` sending domain was verified through the connected account on 2026-10-27. This keeps the application owner at `hello@trulyauthenticmarketing.com`; Cap login messages use its existing `auth@RESEND_FROM_DOMAIN` convention. A restricted sending key is deployed. The user-approved verification email was delivered and the real owner sign-in succeeded; dashboard/recording acceptance remains separate.
 
 Apply the browser-origin policy with `wrangler r2 bucket cors set tam-cap-videos --file infra/cloudflare/r2-cors.json`. CORS does not grant access: the bucket remains private and needs signed requests. Keep allowed origins explicit.
 
@@ -55,7 +58,9 @@ Set `CAP_WEB_ENV` as a Worker secret containing a JSON object of string applicat
 
 For guarded staging verification, optionally set the `CAP_PREVIEW_KEY` Worker secret. While readiness is false, a matching nonempty `x-cap-preview-key` header permits forwarding to the application; missing, empty and incorrect keys remain denied. This key does not authenticate an application user or replace NextAuth. The Worker strips the key before forwarding and makes preview responses non-cacheable. Inject it only for the exact staging origin in browser test tooling, never globally across third-party requests. Internal workflow and database control paths stay blocked even with the correct key. Startup executes `SELECT 1 AS ok` through the private D1 bridge and checks the durable workflow deployment ID before logging `[cloudflare-runtime] D1 and durable workflow ready`.
 
-Database, workflow and media calls use private container outbound handlers at `cap.database`, `cap.workflow`, and `cap.media`. Media can call `cap.web` for callbacks. Public workflow execution and database RPC paths are rejected, including percent-encoded variants. The underlying application still validates media webhook secrets and resource ownership.
+Database, analytics, workflow and media calls use private container outbound handlers at `cap.database`, `cap.analytics`, `cap.workflow`, and `cap.media`. Media can call `cap.web` for callbacks. Public workflow execution, database RPC and cron paths are rejected, including percent-encoded variants. The underlying application still validates media webhook secrets and resource ownership. Geography headers are replaced with URI-encoded values from trusted Cloudflare request metadata.
+
+Cloudflare cron enqueues maintenance every fifteen minutes when `CAP_MAINTENANCE_ENABLED=true`. Recovery runs for stale desktop segments and failed processing; daily03:00UTC also runs agent credential cleanup, developer storage accounting and90-day analytics cleanup. Deliveries use the durable queue and authenticated internal requests with `CRON_SECRET` from the protected environment. Maintenance remains disabled until the coherent staging image is verified. It can wake the web container even without user traffic; account for that in costs.
 
 ## Durable workflow contract
 

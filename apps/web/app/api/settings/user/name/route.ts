@@ -1,7 +1,7 @@
-import { db } from "@cap/database";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { users } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users } from "@cap/database/cloudflare/schema";
 import { eq } from "drizzle-orm";
 import type { NextRequest } from "next/server";
 

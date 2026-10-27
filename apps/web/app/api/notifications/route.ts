@@ -1,6 +1,6 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { notifications, users } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { notifications, users } from "@cap/database/cloudflare/schema";
 import { Notification as APINotification } from "@cap/web-api-contract";
 import { ImageUploads } from "@cap/web-backend";
 import { and, desc, eq, isNull, ne, sql } from "drizzle-orm";

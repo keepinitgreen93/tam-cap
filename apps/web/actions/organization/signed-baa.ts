@@ -117,6 +117,15 @@ async function getOwnerContext(organizationId: Organisation.OrganisationId) {
 export async function getSignedBaaStatus(
 	organizationId: Organisation.OrganisationId,
 ): Promise<SignedBaaStatus> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return {
+			status: "none",
+			signedAt: null,
+			entityName: null,
+			emailSentAt: null,
+			canPurchase: false,
+			details: null,
+		};
 	const { user } = await getOwnerContext(organizationId);
 
 	const [record] = await db()
@@ -170,6 +179,10 @@ export async function confirmSignedBaaPayment(
 	organizationId: Organisation.OrganisationId,
 	sessionId: string,
 ): Promise<SignedBaaStatus> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new SignedBaaError(
+			"Cap Cloud BAA contracts are unavailable on this self-hosted server",
+		);
 	const { user } = await getOwnerContext(organizationId);
 	if (!sessionId.startsWith("cs_") || sessionId.length > 255) {
 		throw new SignedBaaError(
@@ -392,6 +405,12 @@ export async function purchaseSignedBaa(
 	organizationId: Organisation.OrganisationId,
 	input: SignedBaaInput,
 ): Promise<SignedBaaResult> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return {
+			success: false,
+			error:
+				"Cap Cloud BAA contracts are unavailable on this self-hosted server",
+		};
 	return toSignedBaaResult(completeSignedBaa(organizationId, input, false));
 }
 
@@ -399,6 +418,12 @@ export async function signPaidBaa(
 	organizationId: Organisation.OrganisationId,
 	input: SignedBaaInput,
 ): Promise<SignedBaaResult> {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		return {
+			success: false,
+			error:
+				"Cap Cloud BAA contracts are unavailable on this self-hosted server",
+		};
 	return toSignedBaaResult(completeSignedBaa(organizationId, input, true));
 }
 

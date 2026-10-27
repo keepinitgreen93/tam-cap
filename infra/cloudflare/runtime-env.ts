@@ -28,6 +28,7 @@ export function webEnvironment(serialized: string, mediaSecret: string) {
 		CAP_RUNTIME: "cloudflare",
 		DATABASE_PROVIDER: "d1",
 		D1_BRIDGE_URL: "http://cap.database/query",
+		ANALYTICS_D1_BRIDGE_URL: "http://cap.analytics/query",
 		WORKFLOW_TARGET_WORLD: "@cap/workflow-cloudflare",
 		CAP_WORKFLOW_URL: "http://cap.workflow/rpc",
 		MEDIA_SERVER_URL: "http://cap.media",

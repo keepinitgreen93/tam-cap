@@ -1,4 +1,5 @@
 import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
 import { db } from "@cap/database/cloudflare/application";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import { s3Buckets, users } from "@cap/database/cloudflare/schema";
@@ -106,6 +107,7 @@ app.post(
 			const database = db();
 			await atomic(database, async (snapshot) => {
 				const statements: AtomicStatement[] = [];
+				await requireWorkspaceAccount(snapshot, user.id);
 				const [currentUser] = await snapshot.read((reader) =>
 					reader
 						.select({ id: users.id })
@@ -147,12 +149,24 @@ app.delete("/delete", async (c) => {
 	const user = c.get("user");
 
 	try {
-		await db()
-			.update(s3Buckets)
-			.set({ active: false })
-			.where(
-				and(eq(s3Buckets.ownerId, user.id), isNull(s3Buckets.organizationId)),
-			);
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			await requireWorkspaceAccount(snapshot, user.id);
+			return {
+				statements: [
+					database
+						.update(s3Buckets)
+						.set({ active: false })
+						.where(
+							and(
+								eq(s3Buckets.ownerId, user.id),
+								isNull(s3Buckets.organizationId),
+							),
+						),
+				],
+				result: undefined,
+			};
+		});
 
 		return c.json({ success: true });
 	} catch (error) {

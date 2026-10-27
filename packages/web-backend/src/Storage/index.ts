@@ -44,6 +44,7 @@ type UploadTargetInput = {
 	contentLength?: number;
 	fields?: Record<string, string>;
 	method?: "post" | "put";
+	ifNoneMatch?: "*";
 	videoTitle?: string;
 };
 
@@ -113,11 +114,13 @@ const toS3UploadTarget = (data: {
 const toPutUploadTarget = (
 	url: string,
 	contentType: string,
+	headers: Record<string, string> = {},
 ): StorageDomain.UploadTarget => ({
 	type: "put",
 	url,
 	headers: {
 		"Content-Type": contentType,
+		...headers,
 	},
 });
 
@@ -416,7 +419,7 @@ const copyS3ObjectForRecording = (
 		}
 	}).pipe(mapStorageError);
 
-const makeS3Access = (s3: S3BucketAccess) => ({
+const makeS3Access = (s3: S3BucketAccess, defaultBucket = false) => ({
 	provider: "s3" as const,
 	bucketName: s3.bucketName,
 	isPathStyle: s3.isPathStyle,
@@ -505,15 +508,47 @@ const makeS3Access = (s3: S3BucketAccess) => ({
 	multipart: makeS3MultipartAccess(s3),
 	createUploadTarget: (key: string, input: UploadTargetInput) =>
 		Effect.gen(function* () {
-			if (input.method === "put") {
+			if (
+				input.method === "put" ||
+				(defaultBucket && process.env.CAP_RUNTIME === "cloudflare")
+			) {
+				const metadataHeaders = Object.fromEntries(
+					Object.entries(input.fields ?? {})
+						.filter(
+							([key]) =>
+								key.toLowerCase().startsWith("x-amz-meta-") && key.length > 11,
+						)
+						.map(([key, value]) => [key.toLowerCase(), value]),
+				);
+				const metadata = Object.fromEntries(
+					Object.entries(metadataHeaders).map(([key, value]) => [
+						key.slice(11),
+						value,
+					]),
+				);
+				const headers = {
+					...metadataHeaders,
+					...(input.ifNoneMatch ? { "If-None-Match": input.ifNoneMatch } : {}),
+				};
 				const url = yield* s3
 					.getPresignedPutUrl(
 						key,
-						{ ContentType: input.contentType },
-						{ expiresIn: 1800 },
+						{
+							ContentType: input.contentType,
+							Metadata: metadata,
+							IfNoneMatch: input.ifNoneMatch,
+						},
+						{
+							expiresIn: 1800,
+							unhoistableHeaders: new Set(Object.keys(metadataHeaders)),
+							signableHeaders: new Set([
+								"content-type",
+								...Object.keys(headers).map((name) => name.toLowerCase()),
+							]),
+						},
 					)
 					.pipe(mapStorageError);
-				return toPutUploadTarget(url, input.contentType);
+				return toPutUploadTarget(url, input.contentType, headers);
 			}
 
 			const data = yield* s3
@@ -1197,7 +1232,7 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 				if (Option.isSome(organizationBucket)) {
 					const [s3, customBucket] = organizationBucket.value;
 					return {
-						access: makeS3Access(s3),
+						access: makeS3Access(s3, Option.isNone(customBucket)),
 						bucketId: Option.map(customBucket, (bucket) => bucket.id),
 						storageIntegrationId: Option.none(),
 					};
@@ -1208,7 +1243,7 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 				s3Buckets.getBucketAccessForUser(userId),
 			);
 			return {
-				access: makeS3Access(s3),
+				access: makeS3Access(s3, Option.isNone(customBucket)),
 				bucketId: Option.map(customBucket, (bucket) => bucket.id),
 				storageIntegrationId: Option.none(),
 			};
@@ -1265,7 +1300,7 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 			if (Option.isSome(organizationBucket)) {
 				const [s3, customBucket] = organizationBucket.value;
 				return Option.some<WritableStorageAccess>({
-					access: makeS3Access(s3),
+					access: makeS3Access(s3, Option.isNone(customBucket)),
 					bucketId: Option.map(customBucket, (bucket) => bucket.id),
 					storageIntegrationId: Option.none(),
 				});
@@ -1337,7 +1372,13 @@ export class Storage extends Effect.Service<Storage>()("Storage", {
 			const [s3, customBucket] = yield* mapStorageError(
 				s3Buckets.getBucketAccess(video.bucketId),
 			);
-			const access = makeS3Access(s3);
+			if (Option.isSome(video.bucketId) && Option.isNone(customBucket))
+				return yield* Effect.fail(
+					new StorageDomain.StorageError({
+						cause: new Error("Recording bucket is unavailable"),
+					}),
+				);
+			const access = makeS3Access(s3, Option.isNone(customBucket));
 			return [
 				options?.resolvePublishedOutput === false
 					? access

@@ -39,7 +39,7 @@ async function requireFolderAccess(
 				.limit(1),
 		);
 		if (!space) throw new Error("Folder space is unavailable");
-		if (role === "member") {
+		if (role === "member" && space.createdById !== userId) {
 			const [member] = await snapshot.read((reader) =>
 				reader
 					.select()

@@ -127,10 +127,12 @@ vi.mock("next/navigation", () => ({
 import CapsPage from "@/app/(org)/dashboard/caps/page";
 import { getDashboardData } from "@/app/(org)/dashboard/dashboard-data";
 import SharedCapsPage from "@/app/(org)/dashboard/spaces/[spaceId]/page";
+import { getVideosByFolderId } from "@/lib/folder";
 import {
 	getInviteDetails,
 	getPendingInviteIdForUser,
 } from "@/lib/organization-invite-read";
+import { runPromise } from "@/lib/server";
 
 let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
 let owner: Awaited<ReturnType<typeof createTestOwner>>;
@@ -285,19 +287,83 @@ describe("dashboard boot reads on D1", () => {
 			sharedRoot.id,
 		]);
 	});
+	it("decodes folder sharing aggregates and supports more than100 video IDs", async () => {
+		const folderId = nanoId() as typeof folders.$inferInsert.id;
+		await fixture.database
+			.insert(folders)
+			.values({
+				id: folderId,
+				name: "Many recordings",
+				organizationId: owner.activeOrganizationId,
+				createdById: owner.id,
+			});
+		const ids = Array.from(
+			{ length: 101 },
+			() => nanoId() as typeof videos.$inferInsert.id,
+		);
+		for (let offset = 0; offset < ids.length; offset += 30) {
+			const batch = ids
+				.slice(offset, offset + 30)
+				.map((id) =>
+					fixture.database
+						.insert(videos)
+						.values({
+							id,
+							ownerId: owner.id,
+							orgId: owner.activeOrganizationId,
+							name: "Folder recording",
+							source: { type: "webMP4" },
+							folderId,
+						}),
+				);
+			const first = batch[0];
+			if (first) await fixture.database.batch([first, ...batch.slice(1)]);
+		}
+		const firstId = ids[0];
+		if (!firstId) throw new Error("Missing video");
+		await fixture.database
+			.insert(sharedVideos)
+			.values({
+				id: nanoId(),
+				videoId: firstId,
+				organizationId: owner.activeOrganizationId,
+				sharedByUserId: owner.id,
+			});
+		await fixture.database.insert(comments).values([
+			{
+				id: nanoId() as typeof comments.$inferInsert.id,
+				type: "text",
+				content: "One",
+				authorId: owner.id,
+				videoId: firstId,
+			},
+			{
+				id: nanoId() as typeof comments.$inferInsert.id,
+				type: "text",
+				content: "Two",
+				authorId: owner.id,
+				videoId: firstId,
+			},
+		]);
+		const result = await runPromise(
+			getVideosByFolderId(folderId, { variant: "user" }),
+		);
+		expect(result).toHaveLength(101);
+		expect(
+			result.find((row) => row.id === firstId)?.sharedOrganizations,
+		).toEqual([expect.objectContaining({ id: owner.activeOrganizationId })]);
+	});
 	it("omits shared recordings whose source organization is being deleted", async () => {
 		const recording = await addVideo({
 			ownerId: other.id,
 			orgId: other.activeOrganizationId,
 		});
-		await fixture.database
-			.insert(sharedVideos)
-			.values({
-				id: nanoId(),
-				videoId: recording.id,
-				organizationId: owner.activeOrganizationId,
-				sharedByUserId: other.id,
-			});
+		await fixture.database.insert(sharedVideos).values({
+			id: nanoId(),
+			videoId: recording.id,
+			organizationId: owner.activeOrganizationId,
+			sharedByUserId: other.id,
+		});
 		await fixture.database
 			.update(organizations)
 			.set({ tombstoneAt: new Date() })

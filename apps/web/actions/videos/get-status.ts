@@ -1,7 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
-import { users, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users, videos, videoUploads } from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { provideOptionalAuth, VideosPolicy } from "@cap/web-backend";

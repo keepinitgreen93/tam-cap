@@ -45,6 +45,7 @@ const getCreatedAtTime = (value: unknown) => {
 export async function checkAndMarkUserSignedUpTracked(): Promise<{
 	shouldTrack: boolean;
 }> {
+	if (process.env.CAP_RUNTIME === "cloudflare") return { shouldTrack: false };
 	const currentUser = await getCurrentUser();
 	if (!currentUser) {
 		return { shouldTrack: false };

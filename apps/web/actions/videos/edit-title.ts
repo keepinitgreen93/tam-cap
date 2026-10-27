@@ -1,8 +1,10 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
+import { requireWritableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
 import { eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
@@ -32,13 +34,22 @@ export async function editTitle(videoId: Video.VideoId, title: string) {
 	}
 
 	try {
-		await db()
-			.update(videos)
-			.set({
-				name: title,
-				metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.titleManuallyEdited', true)`,
-			})
-			.where(eq(videos.id, videoId));
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			await requireWritableVideo(snapshot, videoId, userId);
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({
+							name: title,
+							metadata: sql`json_set(coalesce(${videos.metadata}, json_object()), '$.titleManuallyEdited', json('true'))`,
+						})
+						.where(eq(videos.id, videoId)),
+				],
+				result: undefined,
+			};
+		});
 		await enqueueVideoStorageNameSync(videoId);
 
 		revalidatePath("/dashboard/caps");

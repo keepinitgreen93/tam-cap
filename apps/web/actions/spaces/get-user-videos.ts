@@ -1,7 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	comments,
 	folders,
@@ -12,7 +12,7 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { Space } from "@cap/web-domain";
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 

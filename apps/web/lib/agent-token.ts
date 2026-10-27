@@ -1,3 +1,4 @@
+import { getAccountCapability } from "@cap/database/cloudflare/access";
 import { atomic } from "@cap/database/cloudflare/atomic";
 import "server-only";
 
@@ -87,6 +88,11 @@ export const exchangeAgentAuthorizationCode = Effect.fn(
 				return { statements: [], result: { state: "invalid" } };
 			if (grant.consumedAt || grant.expiresAt <= now)
 				return { statements: [], result: { state: "expired" } };
+			if (
+				(await getAccountCapability(snapshot, grant.userId)).kind !==
+				"workspace"
+			)
+				return { statements: [], result: { state: "invalid" as const } };
 			const expiresAt = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
 			return {
 				statements: [

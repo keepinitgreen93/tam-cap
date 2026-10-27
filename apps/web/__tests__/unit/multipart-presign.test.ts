@@ -11,6 +11,9 @@ const mocks = vi.hoisted(() => ({
 	sign: vi.fn(),
 	database: vi.fn(),
 	prepareReplacement: vi.fn(),
+	actualPublish: undefined as
+		| typeof import("@/lib/desktop-reupload").publishDesktopReupload
+		| undefined,
 	invalidate: vi.fn(),
 	head: vi.fn(),
 	queueTranscription: vi.fn(),
@@ -23,10 +26,16 @@ vi.mock("@cap/env", () => ({
 	serverEnv: () => ({ NEXTAUTH_SECRET: "test-reupload-secret" }),
 	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" },
 }));
-vi.mock("@/lib/desktop-reupload", () => ({
-	prepareDesktopReupload: mocks.prepareReplacement,
-	invalidateReuploadedVideo: mocks.invalidate,
-}));
+vi.mock("@/lib/desktop-reupload", async (importOriginal) => {
+	const actual =
+		await importOriginal<typeof import("@/lib/desktop-reupload")>();
+	mocks.actualPublish = actual.publishDesktopReupload;
+	return {
+		...actual,
+		publishDesktopReupload: mocks.prepareReplacement,
+		invalidateReuploadedVideo: mocks.invalidate,
+	};
+});
 vi.mock("@cap/web-backend", async () => {
 	const { Context, Layer } = await import("effect");
 	return {
@@ -82,10 +91,8 @@ vi.mock("@/lib/video-processing", () => ({
 
 import { app } from "@/app/api/upload/[...route]/multipart";
 import {
-	assertDesktopReuploadTarget,
 	createDesktopReuploadKey,
 	createDesktopReuploadToken,
-	type DesktopReuploadToken,
 	decodeDesktopReuploadToken,
 } from "@/lib/desktop-reupload-token";
 
@@ -307,27 +314,9 @@ describe("desktop reupload completion", () => {
 			]),
 		);
 		mocks.sign.mockReturnValue(Effect.succeed("https://uploads.example/part"));
-		mocks.prepareReplacement.mockImplementation(
-			async (
-				_tx: unknown,
-				_snapshot: unknown,
-				replacement: DesktopReuploadToken,
-			) => {
-				assertDesktopReuploadTarget(
-					replacement,
-					video,
-					"owner/video/result.mp4",
-					provider,
-				);
-				if (video.source.outputKey === replacement.outputKey) return null;
-				if (uploadKey !== replacement.outputKey)
-					throw new Error("Replacement upload was canceled or superseded");
-				return {
-					source: { type: "desktopMP4", outputKey: replacement.outputKey },
-					transcriptionStatus: null,
-				};
-			},
-		);
+		if (!mocks.actualPublish)
+			throw new Error("Missing replacement publisher fixture");
+		mocks.prepareReplacement.mockImplementation(mocks.actualPublish);
 		mocks.invalidate.mockImplementation(async () => {
 			events.push("invalidate");
 		});

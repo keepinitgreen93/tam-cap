@@ -1,8 +1,13 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoId } from "@cap/database/helpers";
+import { requireOrganizationMember } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	type AtomicSnapshot,
+	type AtomicStatement,
+	atomic,
+} from "@cap/database/cloudflare/atomic";
 import {
 	folders,
 	sharedVideos,
@@ -10,28 +15,31 @@ import {
 	spaces,
 	spaceVideos,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
+import { activeFolder } from "@cap/web-backend/src/Folders/persistence";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Folder, Organisation, Video } from "@cap/web-domain";
-import { and, asc, eq, inArray, isNull, or } from "drizzle-orm";
+import { and, asc, eq, isNull, or } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import {
 	requireOrganizationAccess,
 	requireOrganizationSettingsManager,
 } from "@/actions/organization/authorization";
-import {
-	getSpaceAccess,
-	requireSpaceManager,
-} from "@/actions/organization/space-authorization";
+import { requireSpaceManager } from "@/actions/organization/space-authorization";
 import {
 	MAX_MOVE_ITEMS,
 	type MoveDestinationGroup,
 	type MoveFolderDestination,
 	type MoveLocation,
 } from "@/lib/move-items";
+import { canManageOrganizationSettings } from "@/lib/permissions/roles";
 import {
-	canManageOrganizationSettings,
-	getEffectiveSpaceRole,
-} from "@/lib/permissions/roles";
+	idsIn,
+	requireShareDestination,
+	type ShareDestination,
+	shareInsert,
+} from "@/lib/sharing-persistence";
 
 function requireValidLocation(location: MoveLocation) {
 	if (
@@ -77,6 +85,7 @@ function getFolderScope(
 ) {
 	if (location.type === "personal") {
 		return and(
+			activeFolder,
 			eq(folders.organizationId, organizationId),
 			eq(folders.createdById, user.id),
 			isNull(folders.spaceId),
@@ -84,6 +93,7 @@ function getFolderScope(
 	}
 
 	return and(
+		activeFolder,
 		eq(folders.organizationId, organizationId),
 		eq(
 			folders.spaceId,
@@ -168,7 +178,7 @@ export async function getOwnedVideoMoveDestinations(
 				eq(folders.organizationId, organizationId),
 				or(
 					and(eq(folders.createdById, user.id), isNull(folders.spaceId)),
-					inArray(folders.spaceId, [
+					idsIn(folders.spaceId, [
 						organizationId,
 						...availableSpaces.map((space) => space.id),
 					]),
@@ -201,6 +211,30 @@ export async function getOwnedVideoMoveDestinations(
 	];
 }
 
+async function requireMoveSnapshot(
+	snapshot: AtomicSnapshot,
+	user: NonNullable<Awaited<ReturnType<typeof getCurrentUser>>>,
+	location: MoveLocation,
+	organizationId: Organisation.OrganisationId,
+	mode: "member" | "manager",
+) {
+	requireValidLocation(location);
+	await requireOrganizationMember(snapshot, organizationId, user.id);
+	if (location.type !== "personal") {
+		const destination: ShareDestination =
+			location.type === "organization"
+				? { type: "organization", id: organizationId }
+				: { type: "space", id: location.spaceId };
+		const access = await requireShareDestination(
+			snapshot,
+			user.id,
+			destination,
+			mode,
+		);
+		if (access.organizationId !== organizationId)
+			throw new Error("Space not found");
+	}
+}
 export async function placeOwnedVideos({
 	videoIds,
 	folderId,
@@ -212,160 +246,103 @@ export async function placeOwnedVideos({
 	location: MoveLocation;
 	organizationId?: Organisation.OrganisationId;
 }) {
-	const user = await getCurrentUser();
-	const organizationId = requestedOrganizationId ?? user?.activeOrganizationId;
+	const user = await getCurrentUser(),
+		organizationId = requestedOrganizationId ?? user?.activeOrganizationId;
 	if (!user || !organizationId) throw new Error("Unauthorized");
 	requireValidLocation(location);
-	const ids = normalizeVideoIds(videoIds).sort();
-	const organizationAccess = await requireOrganizationAccess(
-		user.id,
-		organizationId,
-	);
-	if (location.type === "space") {
-		const access = await getSpaceAccess(user.id, location.spaceId);
-		if (
-			!access ||
-			access.organizationId !== organizationId ||
-			!access.organizationRole ||
-			(!access.canManage && !access.spaceRole)
-		) {
-			throw new Error("Space not found");
-		}
-	}
-	await db().transaction(async (tx) => {
-		if (location.type === "space") {
-			const [space] = await tx
-				.select({
-					createdById: spaces.createdById,
-					memberRole: spaceMembers.role,
-				})
-				.from(spaces)
-				.leftJoin(
-					spaceMembers,
-					and(
-						eq(spaceMembers.spaceId, spaces.id),
-						eq(spaceMembers.userId, user.id),
-					),
-				)
+	const ids = normalizeVideoIds(videoIds).sort(),
+		newIds = new Map(ids.map((id) => [id, nanoId()])),
+		now = Date.now(),
+		database = db();
+	await atomic(database, async (snapshot) => {
+		await requireMoveSnapshot(
+			snapshot,
+			user,
+			location,
+			organizationId,
+			"member",
+		);
+		const owned = await snapshot.read((reader) =>
+			reader
+				.select({ id: videos.id })
+				.from(videos)
 				.where(
 					and(
-						eq(spaces.id, location.spaceId),
-						eq(spaces.organizationId, organizationId),
+						writableVideo,
+						idsIn(videos.id, ids),
+						eq(videos.ownerId, user.id),
+						eq(videos.orgId, organizationId),
 					),
-				)
-				.limit(1)
-				.for("update");
-			if (
-				!space ||
-				(!canManageOrganizationSettings(organizationAccess.role) &&
-					!getEffectiveSpaceRole({
-						userId: user.id,
-						createdById: space.createdById,
-						memberRole: space.memberRole,
-					}))
-			) {
-				throw new Error("Space not found");
-			}
-		}
-		const ownedVideos = await tx
-			.select({ id: videos.id })
-			.from(videos)
-			.where(
-				and(
-					inArray(videos.id, ids),
-					eq(videos.ownerId, user.id),
-					eq(videos.orgId, organizationId),
 				),
-			)
-			.orderBy(asc(videos.id))
-			.for("update");
-		if (ownedVideos.length !== ids.length)
+		);
+		if (owned.length !== ids.length)
 			throw new Error("One or more Caps cannot be moved");
 		if (folderId) {
-			const [folder] = await tx
-				.select({ id: folders.id })
-				.from(folders)
-				.where(
-					and(
-						eq(folders.id, folderId),
-						getFolderScope(user, location, organizationId),
-					),
-				)
-				.limit(1)
-				.for("update");
+			const [folder] = await snapshot.read((reader) =>
+				reader
+					.select({ id: folders.id })
+					.from(folders)
+					.where(
+						and(
+							eq(folders.id, folderId),
+							getFolderScope(user, location, organizationId),
+						),
+					)
+					.limit(1),
+			);
 			if (!folder) throw new Error("Destination folder not found");
 		}
-		if (location.type === "personal") {
-			await tx.update(videos).set({ folderId }).where(inArray(videos.id, ids));
-		} else if (location.type === "organization") {
-			const existing = await tx
-				.select({ videoId: sharedVideos.videoId })
-				.from(sharedVideos)
-				.where(
-					and(
-						inArray(sharedVideos.videoId, ids),
-						eq(sharedVideos.organizationId, organizationId),
-					),
-				);
-			const shared = new Set(existing.map((row) => row.videoId));
-			const missing = ids.filter((id) => !shared.has(id));
+		const statements: AtomicStatement[] = [];
+		if (location.type === "personal")
+			statements.push(
+				database.update(videos).set({ folderId }).where(idsIn(videos.id, ids)),
+			);
+		else {
+			const destination: ShareDestination =
+				location.type === "organization"
+					? { type: "organization", id: organizationId }
+					: { type: "space", id: location.spaceId };
+			const table =
+					location.type === "organization" ? sharedVideos : spaceVideos,
+				target =
+					location.type === "organization"
+						? eq(sharedVideos.organizationId, organizationId)
+						: eq(spaceVideos.spaceId, location.spaceId);
+			const existing = await snapshot.read((reader) =>
+				reader
+					.select({ videoId: table.videoId })
+					.from(table)
+					.where(and(target, idsIn(table.videoId, ids))),
+			);
+			const shared = new Set(existing.map((row) => row.videoId)),
+				missing = ids.filter((id) => !shared.has(id));
 			if (missing.length)
-				await tx.insert(sharedVideos).values(
-					missing.map((videoId) => ({
-						id: nanoId(),
-						videoId,
-						folderId,
-						organizationId,
-						sharedByUserId: user.id,
-					})),
-				);
-			await tx
-				.update(sharedVideos)
-				.set({ folderId })
-				.where(
-					and(
-						inArray(sharedVideos.videoId, ids),
-						eq(sharedVideos.organizationId, organizationId),
+				statements.push(
+					shareInsert(
+						database,
+						destination,
+						missing.map((videoId) => {
+							const id = newIds.get(videoId);
+							if (!id) throw new Error("Sharing identifier missing");
+							return { id, videoId, folderId, userId: user.id };
+						}),
+						now,
 					),
 				);
-		} else {
-			const existing = await tx
-				.select({ videoId: spaceVideos.videoId })
-				.from(spaceVideos)
-				.where(
-					and(
-						inArray(spaceVideos.videoId, ids),
-						eq(spaceVideos.spaceId, location.spaceId),
-					),
-				);
-			const shared = new Set(existing.map((row) => row.videoId));
-			const missing = ids.filter((id) => !shared.has(id));
-			if (missing.length)
-				await tx.insert(spaceVideos).values(
-					missing.map((videoId) => ({
-						id: nanoId(),
-						videoId,
-						folderId,
-						spaceId: location.spaceId,
-						addedById: user.id,
-					})),
-				);
-			await tx
-				.update(spaceVideos)
-				.set({ folderId })
-				.where(
-					and(
-						inArray(spaceVideos.videoId, ids),
-						eq(spaceVideos.spaceId, location.spaceId),
-					),
+			if (existing.length)
+				statements.push(
+					database
+						.update(table)
+						.set({ folderId })
+						.where(and(target, idsIn(table.videoId, ids))),
 				);
 		}
+		return { statements, result: undefined };
 	});
 	revalidateMoveLocation(location);
 	revalidatePath("/s/[videoId]", "page");
 	return { moved: ids.length };
 }
-
 export async function moveVideos({
 	videoIds,
 	folderId,
@@ -377,106 +354,66 @@ export async function moveVideos({
 }) {
 	const user = await getCurrentUser();
 	if (!user?.activeOrganizationId) throw new Error("Unauthorized");
-
-	const ids = normalizeVideoIds(videoIds);
-	await requireMoveAccess(user, location);
-
-	await db().transaction(async (tx) => {
+	const ids = normalizeVideoIds(videoIds),
+		database = db();
+	await atomic(database, async (snapshot) => {
+		await requireMoveSnapshot(
+			snapshot,
+			user,
+			location,
+			user.activeOrganizationId,
+			"manager",
+		);
 		if (folderId) {
-			const [targetFolder] = await tx
-				.select({ id: folders.id })
-				.from(folders)
-				.where(and(eq(folders.id, folderId), getFolderScope(user, location)))
-				.limit(1);
-
-			if (!targetFolder) throw new Error("Destination folder not found");
+			const [folder] = await snapshot.read((reader) =>
+				reader
+					.select({ id: folders.id })
+					.from(folders)
+					.where(and(eq(folders.id, folderId), getFolderScope(user, location)))
+					.limit(1),
+			);
+			if (!folder) throw new Error("Destination folder not found");
 		}
-
 		if (location.type === "personal") {
-			const movableVideos = await tx
-				.select({ id: videos.id })
-				.from(videos)
-				.where(
-					and(
-						inArray(videos.id, ids),
-						eq(videos.ownerId, user.id),
-						eq(videos.orgId, user.activeOrganizationId),
-					),
-				);
-
-			if (new Set(movableVideos.map((video) => video.id)).size !== ids.length) {
-				throw new Error("One or more Caps cannot be moved");
-			}
-
-			await tx
-				.update(videos)
-				.set({ folderId })
-				.where(
-					and(
-						inArray(videos.id, ids),
-						eq(videos.ownerId, user.id),
-						eq(videos.orgId, user.activeOrganizationId),
-					),
-				);
-			return;
-		}
-
-		if (location.type === "organization") {
-			const movableVideos = await tx
-				.selectDistinct({ id: sharedVideos.videoId })
-				.from(sharedVideos)
-				.where(
-					and(
-						inArray(sharedVideos.videoId, ids),
-						eq(sharedVideos.organizationId, user.activeOrganizationId),
-					),
-				);
-
-			if (movableVideos.length !== ids.length) {
-				throw new Error("One or more Caps cannot be moved");
-			}
-
-			await tx
-				.update(sharedVideos)
-				.set({ folderId })
-				.where(
-					and(
-						inArray(sharedVideos.videoId, ids),
-						eq(sharedVideos.organizationId, user.activeOrganizationId),
-					),
-				);
-			return;
-		}
-
-		const movableVideos = await tx
-			.selectDistinct({ id: spaceVideos.videoId })
-			.from(spaceVideos)
-			.where(
-				and(
-					inArray(spaceVideos.videoId, ids),
-					eq(spaceVideos.spaceId, location.spaceId),
-				),
+			const where = and(
+				writableVideo,
+				idsIn(videos.id, ids),
+				eq(videos.ownerId, user.id),
+				eq(videos.orgId, user.activeOrganizationId),
 			);
-
-		if (movableVideos.length !== ids.length) {
+			const rows = await snapshot.read((reader) =>
+				reader.select({ id: videos.id }).from(videos).where(where),
+			);
+			if (rows.length !== ids.length)
+				throw new Error("One or more Caps cannot be moved");
+			return {
+				statements: [database.update(videos).set({ folderId }).where(where)],
+				result: undefined,
+			};
+		}
+		const table = location.type === "organization" ? sharedVideos : spaceVideos,
+			target =
+				location.type === "organization"
+					? eq(sharedVideos.organizationId, user.activeOrganizationId)
+					: eq(spaceVideos.spaceId, location.spaceId);
+		const where = and(target, idsIn(table.videoId, ids));
+		const rows = await snapshot.read((reader) =>
+			reader
+				.selectDistinct({ id: table.videoId })
+				.from(table)
+				.innerJoin(videos, eq(videos.id, table.videoId))
+				.where(and(where, writableVideo)),
+		);
+		if (rows.length !== ids.length)
 			throw new Error("One or more Caps cannot be moved");
-		}
-
-		await tx
-			.update(spaceVideos)
-			.set({ folderId })
-			.where(
-				and(
-					inArray(spaceVideos.videoId, ids),
-					eq(spaceVideos.spaceId, location.spaceId),
-				),
-			);
+		return {
+			statements: [database.update(table).set({ folderId }).where(where)],
+			result: undefined,
+		};
 	});
-
 	revalidateMoveLocation(location);
 	return { moved: ids.length };
 }
-
 export async function moveFolder({
 	folderId,
 	parentId,
@@ -488,41 +425,43 @@ export async function moveFolder({
 }) {
 	const user = await getCurrentUser();
 	if (!user?.activeOrganizationId) throw new Error("Unauthorized");
-
-	await requireMoveAccess(user, location);
-
-	await db().transaction(async (tx) => {
-		const scopedFolders = await tx
-			.select({ id: folders.id, parentId: folders.parentId })
-			.from(folders)
-			.where(getFolderScope(user, location));
-		const foldersById = new Map(
-			scopedFolders.map((folder) => [folder.id, folder]),
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireMoveSnapshot(
+			snapshot,
+			user,
+			location,
+			user.activeOrganizationId,
+			"manager",
 		);
-
-		if (!foldersById.has(folderId)) throw new Error("Folder not found");
-		if (parentId && !foldersById.has(parentId)) {
+		const scoped = await snapshot.read((reader) =>
+			reader
+				.select({ id: folders.id, parentId: folders.parentId })
+				.from(folders)
+				.where(getFolderScope(user, location)),
+		);
+		const byId = new Map(scoped.map((folder) => [folder.id, folder]));
+		if (!byId.has(folderId)) throw new Error("Folder not found");
+		if (parentId && !byId.has(parentId))
 			throw new Error("Destination folder not found");
-		}
-
 		const visited = new Set<Folder.FolderId>();
-		let currentParentId = parentId;
-		while (currentParentId) {
-			if (currentParentId === folderId) {
+		let current = parentId;
+		while (current) {
+			if (current === folderId)
 				throw new Error("A folder cannot be moved into itself");
-			}
-			if (visited.has(currentParentId)) {
-				throw new Error("Invalid folder hierarchy");
-			}
-			visited.add(currentParentId);
-			currentParentId = foldersById.get(currentParentId)?.parentId ?? null;
+			if (visited.has(current)) throw new Error("Invalid folder hierarchy");
+			visited.add(current);
+			current = byId.get(current)?.parentId ?? null;
 		}
-
-		await tx
-			.update(folders)
-			.set({ parentId })
-			.where(and(eq(folders.id, folderId), getFolderScope(user, location)));
+		return {
+			statements: [
+				database
+					.update(folders)
+					.set({ parentId })
+					.where(and(eq(folders.id, folderId), getFolderScope(user, location))),
+			],
+			result: undefined,
+		};
 	});
-
 	revalidateMoveLocation(location);
 }

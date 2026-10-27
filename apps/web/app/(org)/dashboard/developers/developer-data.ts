@@ -1,6 +1,5 @@
-import { db } from "@cap/database";
 import type { userSelectProps } from "@cap/database/auth/session";
-import { decrypt } from "@cap/database/crypto";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	developerApiKeys,
 	developerAppDomains,
@@ -8,7 +7,8 @@ import {
 	developerCreditAccounts,
 	developerCreditTransactions,
 	developerVideos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { decrypt } from "@cap/database/crypto";
 import { and, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 
 export type DeveloperApiKey = Pick<

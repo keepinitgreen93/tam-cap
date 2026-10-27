@@ -19,7 +19,7 @@ import {
 import * as Dz from "drizzle-orm";
 import { Array as Arr, Effect, Exit, Option } from "effect";
 import type { Schema } from "effect/Schema";
-
+import { Analytics } from "../Analytics/index.ts";
 import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 import { Storage as StorageService } from "../Storage/index.ts";
 import {
@@ -27,17 +27,12 @@ import {
 	getPublishedRecordingThumbnailKey,
 	isInternalRecordingKey,
 } from "../Storage/recording-output.ts";
-import { Tinybird } from "../Tinybird/index.ts";
 import { activeVideo, updateVideoUploadProgress } from "./persistence.ts";
 import { VideosPolicy } from "./VideosPolicy.ts";
 import type { CreateVideoInput as RepoCreateVideoInput } from "./VideosRepo.ts";
 import { VideosRepo } from "./VideosRepo.ts";
 
 const DEFAULT_ANALYTICS_RANGE_DAYS = 90;
-const escapeSqlLiteral = (value: string) => value.replace(/'/g, "''");
-const formatDate = (date: Date) => date.toISOString().slice(0, 10);
-const formatDateTime = (date: Date) =>
-	date.toISOString().slice(0, 19).replace("T", " ");
 const buildPathname = (videoId: Video.VideoId) => `/s/${videoId}`;
 const SCREENSHOT_OBJECT_KEY_SUFFIXES = [
 	"screenshot/screen-capture.png",
@@ -136,112 +131,45 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 		const repo = yield* VideosRepo;
 		const policy = yield* VideosPolicy;
 		const storage = yield* StorageService;
-		const tinybird = yield* Tinybird;
+		const analytics = yield* Analytics;
 
 		const getByIdForViewing = (id: Video.VideoId) =>
 			policy.getViewableById(id).pipe(Effect.withSpan("Videos.getById"));
 
 		const getAnalyticsCounts = Effect.fn("Videos.getAnalyticsCounts")(
 			function* (
-				analyticsVideos: ReadonlyArray<{
-					id: Video.VideoId;
-					orgId: string;
-				}>,
+				analyticsVideos: ReadonlyArray<{ id: Video.VideoId; orgId: string }>,
 			) {
-				const now = new Date();
+				const to = new Date();
 				const from = new Date(
-					now.getTime() - DEFAULT_ANALYTICS_RANGE_DAYS * 24 * 60 * 60 * 1000,
+					to.getTime() - DEFAULT_ANALYTICS_RANGE_DAYS * 24 * 60 * 60 * 1000,
 				);
-				const countsByPathname = new Map<string, number>();
-
-				const videosByOrg = new Map<
-					string,
-					Array<{ videoId: Video.VideoId; pathname: string }>
-				>();
+				const grouped = new Map<string, Video.VideoId[]>();
 				for (const video of analyticsVideos) {
-					const key = video.orgId;
-					if (!videosByOrg.has(key)) {
-						videosByOrg.set(key, []);
-					}
-					const entries = videosByOrg.get(key);
-					if (entries) {
-						entries.push({
-							videoId: video.id,
-							pathname: buildPathname(video.id),
-						});
-					}
+					const ids = grouped.get(video.orgId) ?? [];
+					ids.push(video.id);
+					grouped.set(video.orgId, ids);
 				}
-
-				const runTinybirdQuery = <
-					Row extends { pathname?: string | null; views?: number },
-				>(
-					sql: string,
-				) =>
-					tinybird.querySql<Row>(sql).pipe(
-						Effect.catchAll((error) => {
-							console.error("tinybird analytics query failed", {
-								sql,
-								error,
-							});
-							return Effect.succeed<{ data: Row[] }>({ data: [] });
-						}),
-						Effect.map((response) => response.data ?? []),
-					);
-
-				for (const [orgKey, entries] of videosByOrg) {
-					const pathnames = entries.map((entry) => entry.pathname);
-					if (pathnames.length === 0) continue;
-
-					const escapedPathnames = pathnames
-						.map((pathname) => `'${escapeSqlLiteral(pathname)}'`)
-						.join(", ");
-					const tenantCondition =
-						orgKey.length > 0
-							? `tenant_id = '${escapeSqlLiteral(orgKey)}' AND `
-							: "";
-
-					const aggregateSql = `
-						SELECT pathname, coalesce(uniqMerge(visits), 0) AS views
-						FROM analytics_pages_mv
-						WHERE ${tenantCondition}pathname IN (${escapedPathnames})
-							AND date BETWEEN toDate('${formatDate(from)}') AND toDate('${formatDate(now)}')
-						GROUP BY pathname
-					`;
-
-					const rawSql = `
-						SELECT coalesce(pathname, '') AS pathname, coalesce(uniq(session_id), 0) AS views
-						FROM analytics_events
-						WHERE ${tenantCondition}pathname IN (${escapedPathnames})
-							AND action = 'page_hit'
-							AND timestamp BETWEEN toDateTime('${formatDateTime(from)}') AND toDateTime('${formatDateTime(now)}')
-						GROUP BY pathname
-					`;
-
-					const aggregateRows = yield* runTinybirdQuery(aggregateSql);
-					const rows =
-						aggregateRows.length > 0
-							? aggregateRows
-							: yield* runTinybirdQuery(rawSql);
-
-					for (const row of rows) {
-						const pathname = row.pathname ?? "";
-						const value = Number(row.views ?? 0);
-						if (!pathname) continue;
-						countsByPathname.set(pathname, Number.isFinite(value) ? value : 0);
-					}
+				const counts = new Map<string, number>();
+				for (const [organizationId, videoIds] of grouped) {
+					const rows = yield* analytics.countViews({
+						organizationId,
+						videoIds,
+						from,
+						to,
+					});
+					for (const row of rows)
+						counts.set(
+							buildPathname(Video.VideoId.make(row.videoId)),
+							row.views,
+						);
 				}
-
-				for (const video of analyticsVideos) {
-					const pathname = buildPathname(video.id);
-					if (!countsByPathname.has(pathname)) {
-						countsByPathname.set(pathname, 0);
-					}
-				}
-
-				return countsByPathname;
+				for (const video of analyticsVideos)
+					if (!counts.has(buildPathname(video.id)))
+						counts.set(buildPathname(video.id), 0);
+				return counts;
 			},
 		);
-
 		const getAnalyticsBulkInternal = Effect.fn("Videos.getAnalyticsBulk")(
 			function* (videoIds: ReadonlyArray<Video.VideoId>) {
 				if (videoIds.length === 0)
@@ -640,7 +568,12 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 								Db.videoProcessingJobs,
 								Dz.eq(Db.videoProcessingJobs.videoId, Db.videoUploads.videoId),
 							)
-							.where(Dz.eq(Db.videoUploads.videoId, videoId)),
+							.where(
+								Dz.and(
+									Dz.eq(Db.videoUploads.videoId, videoId),
+									Dz.sql`exists (select 1 from ${Db.videos} where ${Db.videos.id} = ${Db.videoUploads.videoId} and ${activeVideo})`,
+								),
+							),
 					)
 					.pipe(Policy.withPublicPolicy(policy.canView(videoId)));
 
@@ -945,6 +878,6 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 		VideosRepo.Default,
 		Database.Default,
 		StorageService.Default,
-		Tinybird.Default,
+		Analytics.Default,
 	],
 }) {}

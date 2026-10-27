@@ -1,13 +1,16 @@
 "use server";
 
-import { db } from "@cap/database";
+import { randomUUID } from "node:crypto";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { spaces } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { spaces } from "@cap/database/cloudflare/schema";
 import { S3Buckets } from "@cap/web-backend";
 import { ImageUpload, type Space } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
 import { revalidatePath } from "next/cache";
+import { requireManagedSpace } from "@/lib/organization-settings-persistence";
 import { sanitizeFile } from "@/lib/sanitizeFile";
 import { runPromise } from "@/lib/server";
 import { requireSpaceManager } from "./space-authorization";
@@ -53,7 +56,7 @@ export async function uploadSpaceIcon(
 	const fileKey = ImageUpload.ImageKey.make(
 		`organizations/${
 			space.organizationId
-		}/spaces/${spaceId}/icon-${Date.now()}.${fileExtension}`,
+		}/spaces/${spaceId}/icon-${randomUUID()}.${fileExtension}`,
 	);
 
 	const [bucket] = await S3Buckets.getBucketAccess(Option.none()).pipe(
@@ -61,19 +64,6 @@ export async function uploadSpaceIcon(
 	);
 
 	try {
-		if (space.iconUrl) {
-			const key = space.iconUrl.startsWith("organizations/")
-				? space.iconUrl
-				: space.iconUrl.match(/organizations\/.+/)?.[0];
-			if (key) {
-				try {
-					await bucket.deleteObject(key).pipe(runPromise);
-				} catch (e) {
-					console.warn("Failed to delete old space icon from S3", e);
-				}
-			}
-		}
-
 		const sanitizedFile = await sanitizeFile(file);
 		const arrayBuffer = await sanitizedFile.arrayBuffer();
 
@@ -83,10 +73,33 @@ export async function uploadSpaceIcon(
 			})
 			.pipe(runPromise);
 
-		await db()
-			.update(spaces)
-			.set({ iconUrl: fileKey })
-			.where(eq(spaces.id, spaceId));
+		const database = db();
+		const oldIcon = await atomic(database, async (snapshot) => {
+			const current = await requireManagedSpace(snapshot, user.id, spaceId);
+			if (current.organizationId !== space.organizationId)
+				throw new Error("Space organization changed");
+			return {
+				statements: [
+					database
+						.update(spaces)
+						.set({ iconUrl: fileKey })
+						.where(eq(spaces.id, spaceId)),
+				],
+				result: current.iconUrl,
+			};
+		});
+		if (oldIcon) {
+			const key = oldIcon.startsWith("organizations/")
+				? oldIcon
+				: oldIcon.match(/organizations\/.+/)?.[0];
+			if (key) {
+				try {
+					await bucket.deleteObject(key).pipe(runPromise);
+				} catch (e) {
+					console.warn("Failed to delete old space icon from S3", e);
+				}
+			}
+		}
 
 		revalidatePath("/dashboard");
 		return { success: true, iconUrl: fileKey };

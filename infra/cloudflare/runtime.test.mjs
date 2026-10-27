@@ -72,6 +72,7 @@ test("runtime staging remains closed and never exposes workflow or database cont
 		for (const path of [
 			"/query",
 			"/rpc",
+			"/api/cron/analytics-cleanup",
 			"/.well-known/workflow/v1/step",
 			"/%2ewell-known/workflow/v1/flow",
 			"/.well-known%2fworkflow/v1/step",
@@ -218,6 +219,8 @@ export default runtime;`,
 			for (const path of [
 				"/query",
 				"/rpc",
+				"/api/cron/recover-failed-video-processing",
+				"/api%2fcron%2fanalytics-cleanup",
 				"/%72pc",
 				"/%2ewell-known/workflow/v1/flow",
 				"/.well-known%2fworkflow/v1/step",

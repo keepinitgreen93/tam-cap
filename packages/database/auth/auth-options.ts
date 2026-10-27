@@ -400,6 +400,7 @@ export const authOptions = (ssoContext?: SsoAuthContext): NextAuthOptions => {
 					return "/login?error=SignupBlocked";
 				}
 
+				if (process.env.CAP_RUNTIME === "cloudflare") return true;
 				const allowedDomains = serverEnv().CAP_ALLOWED_SIGNUP_DOMAINS;
 				if (!allowedDomains) return true;
 

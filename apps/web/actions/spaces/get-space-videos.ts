@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { sharedVideos, spaceVideos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { sharedVideos, spaceVideos } from "@cap/database/cloudflare/schema";
 import type { Space } from "@cap/web-domain";
 import { and, eq, isNull } from "drizzle-orm";
 import { getOrganizationAccess } from "@/actions/organization/authorization";

@@ -1,14 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import {
-	organizationMembers,
-	organizations,
-	users,
-} from "@cap/database/schema";
+import { requireOrganizationMember } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { users } from "@cap/database/cloudflare/schema";
 import type { Organisation } from "@cap/web-domain";
-import { and, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { createSpace as createSpaceAction } from "@/actions/organization/create-space";
 import { updateSpace as updateSpaceAction } from "@/actions/organization/update-space";
@@ -19,24 +17,19 @@ export async function updateActiveOrganization(
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 
-	const [organization] = await db()
-		.select({ organization: organizations })
-		.from(organizations)
-		.innerJoin(
-			organizationMembers,
-			and(
-				eq(organizationMembers.organizationId, organizations.id),
-				eq(organizationMembers.userId, user.id),
-			),
-		)
-		.where(eq(organizations.id, organizationId));
-
-	if (!organization) throw new Error("Organization not found");
-
-	await db()
-		.update(users)
-		.set({ activeOrganizationId: organization.organization.id })
-		.where(eq(users.id, user.id));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationMember(snapshot, organizationId, user.id);
+		return {
+			statements: [
+				database
+					.update(users)
+					.set({ activeOrganizationId: organizationId })
+					.where(eq(users.id, user.id)),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidatePath("/dashboard");
 }

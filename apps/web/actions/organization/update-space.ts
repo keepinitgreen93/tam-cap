@@ -1,22 +1,23 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { spaceMembers, spaces } from "@cap/database/cloudflare/schema";
 import { hashPassword } from "@cap/database/crypto";
 import { nanoId } from "@cap/database/helpers";
-import { spaceMembers, spaces } from "@cap/database/schema";
 import { userIsPro } from "@cap/utils";
 import { S3Buckets } from "@cap/web-backend";
-import {
-	Space,
-	SpaceMemberId,
-	type SpaceMemberRole,
-	type User,
-} from "@cap/web-domain";
+import { Space, type User } from "@cap/web-domain";
 import { eq, type SQL, sql } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { revalidatePath } from "next/cache";
 import { isOrganizationOwnerPro } from "@/lib/org-pro";
+import {
+	insertSpaceMembers,
+	requireManagedSpace,
+	requireSpaceRoster,
+} from "@/lib/organization-settings-persistence";
 import { normalizeSpaceRole } from "@/lib/permissions/roles";
 import { runPromise } from "@/lib/server";
 import { getSpaceAccess } from "./space-authorization";
@@ -96,9 +97,9 @@ export async function updateSpace(formData: FormData) {
 		password?: string | null;
 	} = {
 		name,
-		settings: sql`JSON_MERGE_PATCH(COALESCE(${spaces.settings}, '{}'), CAST(${JSON.stringify(
+		settings: sql`json_patch(coalesce(${spaces.settings}, '{}'), ${JSON.stringify(
 			viewerSettings,
-		)} AS JSON))`,
+		)})`,
 	};
 	if (publicField !== null) spaceUpdate.public = publicEnabled;
 
@@ -117,45 +118,59 @@ export async function updateSpace(formData: FormData) {
 		spaceUpdate.password = null;
 	}
 
-	await db().update(spaces).set(spaceUpdate).where(eq(spaces.id, id));
-
-	const memberIds = Array.from(new Set([...members, space.createdById]));
-	const existingMembers = await db()
-		.select({ userId: spaceMembers.userId, role: spaceMembers.role })
-		.from(spaceMembers)
-		.where(eq(spaceMembers.spaceId, id));
-	const existingRoleByUserId = new Map(
-		existingMembers.map((member) => [
-			member.userId,
-			normalizeSpaceRole(member.role) ?? "member",
-		]),
-	);
-
-	await db().delete(spaceMembers).where(eq(spaceMembers.spaceId, id));
-	await db()
-		.insert(spaceMembers)
-		.values(
-			memberIds.map((userId) => {
-				const role: SpaceMemberRole =
-					userId === space.createdById
-						? "admin"
-						: (existingRoleByUserId.get(userId) ?? "member");
-				return {
-					id: SpaceMemberId.make(nanoId()),
-					spaceId: id,
-					userId,
-					role,
-				};
-			}),
+	const database = db();
+	const operationId = nanoId();
+	const now = new Date();
+	const oldIcon = await atomic(database, async (snapshot) => {
+		const current = await requireManagedSpace(snapshot, user.id, id);
+		const memberIds = Array.from(new Set([...members, current.createdById]));
+		await requireSpaceRoster(snapshot, current, memberIds);
+		const existing = await snapshot.read((reader) =>
+			reader.select().from(spaceMembers).where(eq(spaceMembers.spaceId, id)),
 		);
+		const roles = new Map(
+			existing.map((member) => [
+				member.userId,
+				normalizeSpaceRole(member.role) ?? "member",
+			]),
+		);
+		const settings = canUseProFeatures
+			? submittedSettings
+			: preserveProSpaceSettings(submittedSettings, current.settings);
+		return {
+			statements: [
+				database
+					.update(spaces)
+					.set({
+						...spaceUpdate,
+						settings: sql`json_patch(coalesce(${spaces.settings}, '{}'), ${JSON.stringify(settings)})`,
+						...(formData.get("removeIcon") === "true" ? { iconUrl: null } : {}),
+					})
+					.where(eq(spaces.id, id)),
+				database.delete(spaceMembers).where(eq(spaceMembers.spaceId, id)),
+				insertSpaceMembers(
+					database,
+					id,
+					memberIds.map((userId) => ({
+						userId,
+						role:
+							userId === current.createdById
+								? "admin"
+								: (roles.get(userId) ?? "member"),
+					})),
+					operationId,
+					now,
+				),
+			],
+			result: current.iconUrl,
+		};
+	});
 
 	if (formData.get("removeIcon") === "true") {
-		const spaceArr = await db().select().from(spaces).where(eq(spaces.id, id));
-		const spaceData = spaceArr[0];
-		if (spaceData?.iconUrl) {
-			const key = spaceData.iconUrl.startsWith("organizations/")
-				? spaceData.iconUrl
-				: spaceData.iconUrl.match(/organizations\/.+/)?.[0];
+		if (oldIcon) {
+			const key = oldIcon.startsWith("organizations/")
+				? oldIcon
+				: oldIcon.match(/organizations\/.+/)?.[0];
 
 			if (key) {
 				try {
@@ -168,7 +183,6 @@ export async function updateSpace(formData: FormData) {
 				}
 			}
 		}
-		await db().update(spaces).set({ iconUrl: null }).where(eq(spaces.id, id));
 	} else if (iconFile && iconFile.size > 0) {
 		await uploadSpaceIcon(formData, id);
 	}

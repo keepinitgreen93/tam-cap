@@ -1,3 +1,4 @@
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
@@ -21,6 +22,12 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 				}) {
 					const currentUser = yield* CurrentUser;
 
+					yield* db.use((database) =>
+						atomic(database, async (snapshot) => ({
+							statements: [],
+							result: await requireWorkspaceAccount(snapshot, currentUser.id),
+						})),
+					);
 					const [user] = yield* db.use((db) =>
 						db
 							.select()
@@ -84,6 +91,7 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 						const { organizationId, canEditOrganization } = yield* db.use(
 							(database) =>
 								atomic(database, async (snapshot) => {
+									await requireWorkspaceAccount(snapshot, currentUser.id);
 									const [current] = await snapshot.read((reader) =>
 										reader
 											.select()
@@ -234,6 +242,12 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 				customDomain: Effect.fn("Onboarding.customDomain")(function* () {
 					const currentUser = yield* CurrentUser;
 
+					yield* db.use((database) =>
+						atomic(database, async (snapshot) => ({
+							statements: [],
+							result: await requireWorkspaceAccount(snapshot, currentUser.id),
+						})),
+					);
 					const [user] = yield* db.use((db) =>
 						db
 							.select()
@@ -258,6 +272,12 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 				inviteTeam: Effect.fn("Onboarding.inviteTeam")(function* () {
 					const currentUser = yield* CurrentUser;
 
+					yield* db.use((database) =>
+						atomic(database, async (snapshot) => ({
+							statements: [],
+							result: await requireWorkspaceAccount(snapshot, currentUser.id),
+						})),
+					);
 					const [user] = yield* db.use((db) =>
 						db
 							.select()
@@ -285,6 +305,7 @@ export class UsersOnboarding extends Effect.Service<UsersOnboarding>()(
 					const candidateMemberId = nanoId();
 					yield* db.use((database) =>
 						atomic(database, async (snapshot) => {
+							await requireWorkspaceAccount(snapshot, currentUser.id);
 							const [user] = await snapshot.read((reader) =>
 								reader
 									.select()

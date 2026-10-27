@@ -1,8 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { folders, sharedVideos, spaceVideos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	folders,
+	sharedVideos,
+	spaceVideos,
+} from "@cap/database/cloudflare/schema";
 import type { Folder, Space, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { canViewFolder } from "@/actions/folders/folder-access";

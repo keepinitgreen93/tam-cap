@@ -1,17 +1,19 @@
 "use server";
-
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { requireOrganizationMember } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	folders,
 	sharedVideos,
 	spaceVideos,
 	videos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Folder, Space, Video } from "@cap/web-domain";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-
+import { idsIn, requireShareDestination } from "@/lib/sharing-persistence";
 export async function removeVideosFromFolder(
 	folderId: Folder.FolderId,
 	videoIds: Video.VideoId[],
@@ -19,85 +21,97 @@ export async function removeVideosFromFolder(
 ) {
 	try {
 		const user = await getCurrentUser();
-
-		if (!user || !user.id) {
-			throw new Error("Unauthorized");
-		}
-
-		const isAllSpacesEntry = user.activeOrganizationId === spaceId;
-
-		if (!folderId || !videoIds || videoIds.length === 0) {
-			throw new Error("Missing required data");
-		}
-
-		// Verify folder exists and is accessible
-		const [folder] = await db()
-			.select({ id: folders.id, spaceId: folders.spaceId })
-			.from(folders)
-			.where(eq(folders.id, folderId));
-
-		if (!folder) {
-			throw new Error("Folder not found");
-		}
-
-		// Only allow updating videos the user owns
-		const userVideos = await db()
-			.select({ id: videos.id })
-			.from(videos)
-			.where(and(eq(videos.ownerId, user.id), inArray(videos.id, videoIds)));
-
-		const validVideoIds = userVideos.map((v) => v.id);
-
-		if (validVideoIds.length === 0) {
-			throw new Error("No valid videos found");
-		}
-
-		// Clear the folderId on the videos
-		await db()
-			.update(videos)
-			.set({ folderId: null, updatedAt: new Date() })
-			.where(
-				and(inArray(videos.id, validVideoIds), eq(videos.folderId, folderId)),
+		if (!user) throw new Error("Unauthorized");
+		if (!folderId || !videoIds.length) throw new Error("Missing required data");
+		const database = db();
+		const result = await atomic(database, async (snapshot) => {
+			const [folder] = await snapshot.read((reader) =>
+				reader.select().from(folders).where(eq(folders.id, folderId)).limit(1),
 			);
-
-		// Clear the folderId in the appropriate table based on context
-		if (isAllSpacesEntry || !folder.spaceId) {
-			// Organization-level folder - clear folderId in sharedVideos
-			await db()
-				.update(sharedVideos)
-				.set({ folderId: null })
-				.where(
-					and(
-						eq(sharedVideos.organizationId, user.activeOrganizationId),
-						inArray(sharedVideos.videoId, validVideoIds),
-						eq(sharedVideos.folderId, folderId),
-					),
+			if (!folder) throw new Error("Folder not found");
+			if (!folder.spaceId) {
+				await requireOrganizationMember(
+					snapshot,
+					folder.organizationId,
+					user.id,
 				);
-		} else if (folder.spaceId) {
-			// Space-level folder - clear folderId in spaceVideos
-			await db()
-				.update(spaceVideos)
-				.set({ folderId: null })
-				.where(
-					and(
-						sql`${spaceVideos.spaceId} = ${folder.spaceId}`,
-						inArray(spaceVideos.videoId, validVideoIds),
-						eq(spaceVideos.folderId, folderId),
-					),
+				if (
+					folder.createdById !== user.id ||
+					folder.organizationId !== user.activeOrganizationId
+				)
+					throw new Error("Folder not found");
+			} else {
+				if (folder.spaceId !== spaceId) throw new Error("Folder not found");
+				const access = await requireShareDestination(
+					snapshot,
+					user.id,
+					folder.spaceId === folder.organizationId
+						? { type: "organization", id: folder.organizationId }
+						: { type: "space", id: folder.spaceId },
+					"member",
 				);
-		}
-
-		// Revalidate relevant paths
-		revalidatePath(`/dashboard/caps`);
+				if (access.organizationId !== folder.organizationId)
+					throw new Error("Folder not found");
+			}
+			const owned = await snapshot.read((reader) =>
+				reader
+					.select({ id: videos.id })
+					.from(videos)
+					.where(
+						and(
+							writableVideo,
+							eq(videos.ownerId, user.id),
+							idsIn(videos.id, videoIds),
+						),
+					),
+			);
+			const valid = owned.map((row) => row.id);
+			if (!valid.length) throw new Error("No valid videos found");
+			const statements: AtomicStatement[] = [
+				database
+					.update(videos)
+					.set({ folderId: null })
+					.where(and(idsIn(videos.id, valid), eq(videos.folderId, folderId))),
+			];
+			if (!folder.spaceId || folder.spaceId === folder.organizationId)
+				statements.push(
+					database
+						.update(sharedVideos)
+						.set({ folderId: null })
+						.where(
+							and(
+								eq(sharedVideos.organizationId, folder.organizationId),
+								idsIn(sharedVideos.videoId, valid),
+								eq(sharedVideos.folderId, folderId),
+							),
+						),
+				);
+			else
+				statements.push(
+					database
+						.update(spaceVideos)
+						.set({ folderId: null })
+						.where(
+							and(
+								eq(spaceVideos.spaceId, folder.spaceId),
+								idsIn(spaceVideos.videoId, valid),
+								eq(spaceVideos.folderId, folderId),
+							),
+						),
+				);
+			return {
+				statements,
+				result: { count: valid.length, spaceId: folder.spaceId },
+			};
+		});
+		revalidatePath("/dashboard/caps");
 		revalidatePath(`/dashboard/folder/${folderId}`);
-		if (folder.spaceId) {
-			revalidatePath(`/dashboard/spaces/${folder.spaceId}/folder/${folderId}`);
-		}
-
+		if (result.spaceId)
+			revalidatePath(`/dashboard/spaces/${result.spaceId}/folder/${folderId}`);
 		return {
 			success: true,
-			message: `${validVideoIds.length} video${validVideoIds.length === 1 ? "" : "s"} removed from folder`,
-			removedCount: validVideoIds.length,
+			message: `${result.count} video${result.count === 1 ? "" : "s"} removed from folder`,
+			removedCount: result.count,
 		};
 	} catch (error) {
 		console.error("Error removing videos from folder:", error);

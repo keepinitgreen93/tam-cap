@@ -1,7 +1,7 @@
-import * as Db from "@cap/database/schema";
+import * as Db from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	provideOptionalAuth,
 	Storage,
 	Videos,
@@ -28,6 +28,10 @@ import {
 	totalSegmentDuration,
 } from "@/lib/segment-playback";
 import { apiToHandler } from "@/lib/server";
+import {
+	getTranscriptObjectKey,
+	validateTranscriptVtt,
+} from "@/lib/transcript-publication";
 import { CACHE_CONTROL_HEADERS } from "@/utils/helpers";
 import {
 	generateM3U8Playlist,
@@ -422,6 +426,34 @@ const getPlaylistResponse = (
 			});
 		}
 
+		if (
+			Option.isSome(urlParams.fileType) &&
+			urlParams.fileType.value === "transcription"
+		) {
+			const reference = {
+				id: video.id,
+				ownerId: video.ownerId,
+				metadata: Option.getOrNull(video.metadata),
+			};
+			const key = yield* Effect.try({
+				try: () => getTranscriptObjectKey(reference, "vtt"),
+				catch: () => new HttpApiError.InternalServerError(),
+			});
+			if (!key) return yield* new HttpApiError.NotFound();
+			const object = yield* bucket.getObject(key);
+			const content = yield* Effect.try({
+				try: () => validateTranscriptVtt(reference, Option.getOrNull(object)),
+				catch: () => new HttpApiError.InternalServerError(),
+			});
+			if (content === null) return yield* new HttpApiError.NotFound();
+			return HttpServerResponse.text(content).pipe(
+				HttpServerResponse.setHeaders({
+					...CACHE_CONTROL_HEADERS,
+					"Content-Type": "text/vtt",
+				}),
+			);
+		}
+
 		if (bucket.provider === "s3" && Option.isNone(customBucket)) {
 			let redirect = `${video.ownerId}/${video.id}/combined-source/stream.m3u8`;
 
@@ -432,29 +464,6 @@ const getPlaylistResponse = (
 			return HttpServerResponse.redirect(
 				yield* bucket.getSignedObjectUrl(redirect),
 			);
-		}
-
-		if (
-			Option.isSome(urlParams.fileType) &&
-			urlParams.fileType.value === "transcription"
-		) {
-			return yield* bucket
-				.getObject(`${video.ownerId}/${video.id}/transcription.vtt`)
-				.pipe(
-					Effect.andThen(
-						Option.match({
-							onNone: () => Effect.fail(new HttpApiError.NotFound()),
-							onSome: (c) =>
-								HttpServerResponse.text(c).pipe(
-									HttpServerResponse.setHeaders({
-										...CACHE_CONTROL_HEADERS,
-										"Content-Type": "text/vtt",
-									}),
-								),
-						}),
-					),
-					Effect.withSpan("fetchTranscription"),
-				);
 		}
 
 		if (

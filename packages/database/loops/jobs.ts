@@ -101,7 +101,8 @@ export async function completeUnchangedJobs(
 	token: string,
 	jobs: { job: Pick<Job, "userId" | "revision">; nextAttemptAt: Date }[],
 ) {
-	const groups = new Map<number, typeof jobs>();
+	type Entry = (typeof jobs)[number];
+	const groups = new Map<number, [Entry, ...Entry[]]>();
 	for (const entry of jobs) {
 		const key = entry.nextAttemptAt.getTime();
 		const group = groups.get(key);

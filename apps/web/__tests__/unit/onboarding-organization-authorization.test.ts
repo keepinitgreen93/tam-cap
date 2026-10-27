@@ -4,6 +4,7 @@ import {
 	handleD1BridgeRequest,
 } from "@cap/database/cloudflare/bridge";
 import * as Db from "@cap/database/cloudflare/schema";
+import { nanoId } from "@cap/database/helpers";
 import {
 	CurrentUser,
 	DatabaseError,
@@ -32,6 +33,23 @@ async function setup(
 ) {
 	const user = await createTestOwner(fixture.database);
 	const other = await createTestOwner(fixture.database);
+	const accountWorkspaceId =
+		nanoId() as typeof Db.organizations.$inferInsert.id;
+	await fixture.database
+		.insert(Db.organizations)
+		.values({
+			id: accountWorkspaceId,
+			ownerId: user.id,
+			name: "Account workspace",
+		});
+	await fixture.database
+		.insert(Db.organizationMembers)
+		.values({
+			id: nanoId(),
+			userId: user.id,
+			organizationId: accountWorkspaceId,
+			role: "owner",
+		});
 	const organizationId = options.owner
 		? user.activeOrganizationId
 		: other.activeOrganizationId;

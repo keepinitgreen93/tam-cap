@@ -1,6 +1,13 @@
 import crypto from "node:crypto";
 import { authOptions } from "@cap/database/auth/auth-options";
-import { cloudflareAccessPolicy, normalizeEmail } from "@cap/database/auth/identity";
+import {
+	cloudflareAccessPolicy,
+	normalizeEmail,
+} from "@cap/database/auth/identity";
+import {
+	requireWorkspaceAccount,
+	WorkspaceAccountRequiredError,
+} from "@cap/database/cloudflare/access";
 import { db as cloudflareDb } from "@cap/database/cloudflare/application";
 import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
@@ -443,7 +450,9 @@ const ensureEmailSignInAllowed = Effect.fn("Mobile.ensureEmailSignInAllowed")(
 		}
 
 		const database = yield* CloudflareDatabase;
-		const allowed = yield* database.use((db) => canSignInCloudflare(db, email, cloudflareAccessPolicy()));
+		const allowed = yield* database.use((db) =>
+			canSignInCloudflare(db, email, cloudflareAccessPolicy()),
+		);
 		if (!allowed) return yield* Effect.fail(new HttpApiError.Forbidden());
 	},
 );
@@ -466,11 +475,17 @@ const createMobileApiKey = Effect.fn("Mobile.createMobileApiKey")(function* (
 	yield* ensureAccountDeletionNotPending({ userId });
 	const database = yield* CloudflareDatabase;
 	const apiKey = crypto.randomUUID();
-	yield* database.use((db) =>
+	const created = yield* database.use((db) =>
 		atomic(db, async (snapshot) => {
 			const statements: AtomicStatement[] = [];
-const [account] = await snapshot.read((reader)=>reader.select({id:Db.users.id}).from(Db.users).where(eq(Db.users.id,userId)).limit(1));
-if(!account)throw new Error("Mobile account no longer exists");
+			try {
+				await requireWorkspaceAccount(snapshot, userId);
+			} catch (error) {
+				if (error instanceof WorkspaceAccountRequiredError)
+					return { statements: [], result: false };
+				throw error;
+			}
+
 			statements.push(
 				db
 					.delete(Db.authApiKeys)
@@ -489,10 +504,11 @@ if(!account)throw new Error("Mobile account no longer exists");
 				}),
 			);
 
-			return { statements, result: undefined };
+			return { statements, result: true };
 		}),
 	);
 
+	if (!created) return yield* Effect.fail(new HttpApiError.Forbidden());
 	return {
 		type: "api_key" as const,
 		apiKey,

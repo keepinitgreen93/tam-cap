@@ -54,8 +54,8 @@ export type VideosPolicyDeps = {
 
 export type ViewDecisionDeps = Pick<
 	VideosPolicyDeps,
-	"repo" | "orgsRepo" | "spacesRepo"
->;
+	"orgsRepo" | "spacesRepo"
+> & { repo: Pick<VideosPolicyDeps["repo"], "hasViewerGrant"> };
 
 const decideCanView = (
 	{ repo, orgsRepo, spacesRepo }: ViewDecisionDeps,
@@ -155,8 +155,8 @@ export function buildCanView(deps: VideosPolicyDeps, videoId: Video.VideoId) {
 			const res = yield* deps.repo.getById(videoId);
 
 			if (Option.isNone(res)) {
-				yield* Effect.log("Video not found. Access granted.");
-				return true;
+				yield* Effect.log("Video is unavailable. Access denied.");
+				return false;
 			}
 
 			const [video, password] = res.value;

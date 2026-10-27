@@ -8,7 +8,6 @@ const workflowEntries = [
 	"workflows/transcribe.ts",
 	"workflows/generate-ai.ts",
 	"workflows/edit-video.ts",
-	"workflows/admin-reprocess-video.ts",
 	"workflows/import-loom-video.ts",
 	"workflows/agent-cap-operation.ts",
 ];

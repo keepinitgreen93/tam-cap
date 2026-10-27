@@ -1,8 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videoEdits, videos, videoUploads } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	videoEdits,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
 import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";

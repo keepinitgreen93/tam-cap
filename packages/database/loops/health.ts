@@ -45,6 +45,7 @@ export async function readQueueHealth(
 
 export async function readLoopsHealth(): Promise<LoopsHealth> {
 	if (
+		process.env.CAP_RUNTIME === "cloudflare" ||
 		process.env.LOOPS_SYNC_ENABLED !== "true" ||
 		process.env.LOOPS_SYNC_MODE !== "production" ||
 		process.env.LOOPS_ENROLLMENT_ENABLED !== "true"

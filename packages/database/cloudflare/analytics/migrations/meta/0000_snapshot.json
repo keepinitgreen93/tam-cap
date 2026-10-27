@@ -1,0 +1,157 @@
+{
+  "version": "6",
+  "dialect": "sqlite",
+  "id": "b260c562-0a71-4b12-a3eb-9e6b73a5e6fb",
+  "prevId": "00000000-0000-0000-0000-000000000000",
+  "tables": {
+    "analytics_events": {
+      "name": "analytics_events",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "organization_id": {
+          "name": "organization_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "video_id": {
+          "name": "video_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "session_hash": {
+          "name": "session_hash",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "occurred_at": {
+          "name": "occurred_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "country": {
+          "name": "country",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "''"
+        },
+        "region": {
+          "name": "region",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "''"
+        },
+        "city": {
+          "name": "city",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "''"
+        },
+        "browser": {
+          "name": "browser",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'unknown'"
+        },
+        "device": {
+          "name": "device",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'desktop'"
+        },
+        "os": {
+          "name": "os",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": "'unknown'"
+        }
+      },
+      "indexes": {
+        "analytics_events_organization_time": {
+          "name": "analytics_events_organization_time",
+          "columns": [
+            "organization_id",
+            "occurred_at"
+          ],
+          "isUnique": false
+        },
+        "analytics_events_video_time_session": {
+          "name": "analytics_events_video_time_session",
+          "columns": [
+            "organization_id",
+            "video_id",
+            "occurred_at",
+            "session_hash"
+          ],
+          "isUnique": false
+        },
+        "analytics_events_expiry": {
+          "name": "analytics_events_expiry",
+          "columns": [
+            "expires_at"
+          ],
+          "isUnique": false
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {
+        "analytics_events_identity_length": {
+          "name": "analytics_events_identity_length",
+          "value": "length(\"analytics_events\".\"id\") = 64 and length(\"analytics_events\".\"session_hash\") = 64 and length(\"analytics_events\".\"organization_id\") between 1 and 64 and length(\"analytics_events\".\"video_id\") between 1 and 64"
+        },
+        "analytics_events_time": {
+          "name": "analytics_events_time",
+          "value": "\"analytics_events\".\"occurred_at\" >= 0 and \"analytics_events\".\"expires_at\" > \"analytics_events\".\"occurred_at\""
+        },
+        "analytics_events_dimensions_length": {
+          "name": "analytics_events_dimensions_length",
+          "value": "length(\"analytics_events\".\"country\") <= 256 and length(\"analytics_events\".\"region\") <= 256 and length(\"analytics_events\".\"city\") <= 256 and length(\"analytics_events\".\"browser\") <= 256 and length(\"analytics_events\".\"device\") <= 256 and length(\"analytics_events\".\"os\") <= 256"
+        }
+      }
+    }
+  },
+  "views": {},
+  "enums": {},
+  "_meta": {
+    "schemas": {},
+    "tables": {},
+    "columns": {}
+  },
+  "internal": {
+    "indexes": {}
+  }
+}

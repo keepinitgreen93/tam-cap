@@ -8,7 +8,11 @@ export async function enqueueLoopsSync(
 	userId: User.UserId,
 	teammateJoined = false,
 ) {
-	if (process.env.LOOPS_SYNC_ENABLED !== "true") return;
+	if (
+		process.env.CAP_RUNTIME === "cloudflare" ||
+		process.env.LOOPS_SYNC_ENABLED !== "true"
+	)
+		return;
 	await database
 		.insert(loopsSyncJobs)
 		.values({

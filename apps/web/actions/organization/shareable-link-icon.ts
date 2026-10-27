@@ -1,8 +1,10 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizations, users } from "@cap/database/schema";
+import { requireOrganizationManager } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { organizations, users } from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
 import { ImageUploads } from "@cap/web-backend";
 import { Organisation } from "@cap/web-domain";
@@ -45,7 +47,7 @@ async function getManageableProOrganization(
 		throw new Error("Organization not found");
 	}
 
-	return organization;
+	return { ...organization, actorId: user.id };
 }
 
 function validateIcon(file: File) {
@@ -93,11 +95,27 @@ export async function uploadShareableLinkIcon(formData: FormData) {
 			}),
 			existing: Option.fromNullable(organization.shareableLinkIconUrl),
 			keyPrefix: `organizations/${organization.id}/shareable-links`,
-			update: (db, urlOrKey) =>
-				db
-					.update(organizations)
-					.set({ shareableLinkIconUrl: urlOrKey })
-					.where(eq(organizations.id, organization.id)),
+			update: (database, urlOrKey) =>
+				atomic(database, async (snapshot) => {
+					const { organization: current } = await requireOrganizationManager(
+						snapshot,
+						organization.id,
+						organization.actorId,
+					);
+					if (
+						current.shareableLinkIconUrl !== organization.shareableLinkIconUrl
+					)
+						throw new Error("Organization branding changed; refresh and retry");
+					return {
+						statements: [
+							database
+								.update(organizations)
+								.set({ shareableLinkIconUrl: urlOrKey })
+								.where(eq(organizations.id, organization.id)),
+						],
+						result: undefined,
+					};
+				}),
 		});
 	}).pipe(runPromise);
 
@@ -118,11 +136,27 @@ export async function removeShareableLinkIcon(
 			payload: Option.none(),
 			existing: Option.fromNullable(organization.shareableLinkIconUrl),
 			keyPrefix: `organizations/${organization.id}/shareable-links`,
-			update: (db, urlOrKey) =>
-				db
-					.update(organizations)
-					.set({ shareableLinkIconUrl: urlOrKey })
-					.where(eq(organizations.id, organization.id)),
+			update: (database, urlOrKey) =>
+				atomic(database, async (snapshot) => {
+					const { organization: current } = await requireOrganizationManager(
+						snapshot,
+						organization.id,
+						organization.actorId,
+					);
+					if (
+						current.shareableLinkIconUrl !== organization.shareableLinkIconUrl
+					)
+						throw new Error("Organization branding changed; refresh and retry");
+					return {
+						statements: [
+							database
+								.update(organizations)
+								.set({ shareableLinkIconUrl: urlOrKey })
+								.where(eq(organizations.id, organization.id)),
+						],
+						result: undefined,
+					};
+				}),
 		});
 	}).pipe(runPromise);
 
@@ -146,15 +180,32 @@ export async function updateShareableLinkIconPreference({
 		);
 	}
 
-	await db()
-		.update(organizations)
-		.set({
-			settings: {
-				...(organization.settings ?? {}),
-				shareableLinkUseOrganizationIcon: useOrganizationIcon,
-			},
-		})
-		.where(eq(organizations.id, organization.id));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const { organization: current } = await requireOrganizationManager(
+			snapshot,
+			organization.id,
+			organization.actorId,
+		);
+		if (useOrganizationIcon && !current.iconUrl)
+			throw new Error(
+				"Add an organization icon before using it for shareable links",
+			);
+		return {
+			statements: [
+				database
+					.update(organizations)
+					.set({
+						settings: {
+							...current.settings,
+							shareableLinkUseOrganizationIcon: useOrganizationIcon,
+						},
+					})
+					.where(eq(organizations.id, organization.id)),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidateOrganizationBrandingPaths();
 
@@ -166,15 +217,26 @@ export async function hideShareableLinkCapLogo(
 ) {
 	const organization = await getManageableProOrganization(organizationId);
 
-	await db()
-		.update(organizations)
-		.set({
-			settings: {
-				...(organization.settings ?? {}),
-				hideShareableLinkCapLogo: true,
-			},
-		})
-		.where(eq(organizations.id, organization.id));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const { organization: current } = await requireOrganizationManager(
+			snapshot,
+			organization.id,
+			organization.actorId,
+		);
+
+		return {
+			statements: [
+				database
+					.update(organizations)
+					.set({
+						settings: { ...current.settings, hideShareableLinkCapLogo: true },
+					})
+					.where(eq(organizations.id, organization.id)),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidateOrganizationBrandingPaths();
 
@@ -190,12 +252,19 @@ export async function selectShareableLinkBrandingOrganization(
 		throw new Error("Unauthorized");
 	}
 
-	await requireOrganizationSettingsManager(user.id, organizationId);
-
-	await db()
-		.update(users)
-		.set({ activeOrganizationId: organizationId })
-		.where(eq(users.id, user.id));
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, organizationId, user.id);
+		return {
+			statements: [
+				database
+					.update(users)
+					.set({ activeOrganizationId: organizationId })
+					.where(eq(users.id, user.id)),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidatePath("/dashboard");
 

@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { comments } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { comments } from "@cap/database/cloudflare/schema";
 import type { Comment, Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 

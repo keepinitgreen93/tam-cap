@@ -1,7 +1,7 @@
-import { db } from "@cap/database";
 import { isCrossSiteCookieWrite } from "@cap/database/auth/request-site";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { users, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users, videos } from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";

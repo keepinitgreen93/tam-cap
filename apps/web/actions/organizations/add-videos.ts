@@ -1,18 +1,9 @@
 "use server";
-
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoId } from "@cap/database/helpers";
-import {
-	organizationMembers,
-	organizations,
-	sharedVideos,
-	videos,
-} from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
 import type { Organisation, Video } from "@cap/web-domain";
-import { and, eq, inArray, isNull } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-
+import { mutateSharedVideos } from "@/lib/sharing-persistence";
 export async function addVideosToOrganization(
 	organizationId: Organisation.OrganisationId,
 	videoIds: Video.VideoId[],
@@ -28,99 +19,17 @@ export async function addVideosToOrganization(
 			throw new Error("Missing required data");
 		}
 
-		const [organization] = await db()
-			.select()
-			.from(organizations)
-			.where(
-				and(
-					eq(organizations.id, organizationId),
-					isNull(organizations.tombstoneAt),
-				),
-			);
-
-		if (!organization) {
-			throw new Error("Organization not found");
-		}
-
-		const isOrgOwner = organization.ownerId === user.id;
-		let hasAccess = isOrgOwner;
-
-		if (!isOrgOwner) {
-			const orgMembership = await db()
-				.select({ id: organizationMembers.id })
-				.from(organizationMembers)
-				.where(
-					and(
-						eq(organizationMembers.userId, user.id),
-						eq(organizationMembers.organizationId, organizationId),
-					),
-				)
-				.limit(1);
-
-			hasAccess = orgMembership.length > 0;
-		}
-
-		if (!hasAccess) {
-			throw new Error(
-				"You don't have permission to add videos to this organization",
-			);
-		}
-
-		const userVideos = await db()
-			.select({ id: videos.id })
-			.from(videos)
-			.where(and(eq(videos.ownerId, user.id), inArray(videos.id, videoIds)));
-
-		const validVideoIds = userVideos.map((v) => v.id);
-
-		if (validVideoIds.length === 0) {
-			throw new Error("No valid videos found");
-		}
-
-		const existingSharedVideos = await db()
-			.select({ videoId: sharedVideos.videoId })
-			.from(sharedVideos)
-			.where(
-				and(
-					eq(sharedVideos.organizationId, organizationId),
-					inArray(sharedVideos.videoId, validVideoIds),
-				),
-			);
-
-		const existingVideoIds = existingSharedVideos.map((sv) => sv.videoId);
-		const newVideoIds = validVideoIds.filter(
-			(id) => !existingVideoIds.includes(id),
-		);
-
-		// Update existing videos to move them to root (clear folderId)
-		if (existingVideoIds.length > 0) {
-			await db()
-				.update(sharedVideos)
-				.set({ folderId: null })
-				.where(
-					and(
-						eq(sharedVideos.organizationId, organizationId),
-						inArray(sharedVideos.videoId, existingVideoIds),
-					),
-				);
-		}
-
-		// Insert new videos
-		if (newVideoIds.length > 0) {
-			const sharedVideoEntries = newVideoIds.map((videoId) => ({
-				id: nanoId(),
-				videoId,
-				organizationId,
-				sharedByUserId: user.id,
-			}));
-
-			await db().insert(sharedVideos).values(sharedVideoEntries);
-		}
-
+		const { count } = await mutateSharedVideos(db(), {
+			userId: user.id,
+			destination: { type: "organization", id: organizationId },
+			videoIds,
+			action: "add",
+			mode: "member",
+		});
 		revalidatePath(`/dashboard/spaces/${organizationId}`);
 		revalidatePath("/dashboard/caps");
 
-		const totalUpdated = existingVideoIds.length + newVideoIds.length;
+		const totalUpdated = count;
 		return {
 			success: true,
 			message: `${totalUpdated} video${

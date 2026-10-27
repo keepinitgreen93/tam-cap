@@ -12,6 +12,7 @@
 		"mcp-card:generate": "bun scripts/build-mcp-card.mjs",
 		"mcp-card:check": "bun scripts/build-mcp-card.mjs --check",
 		"test": "vitest run",
+		"typecheck:cloudflare": "next typegen && tsc -p tsconfig.cloudflare.json",
 		"test:agent-e2e": "CAP_AGENT_E2E=1 vitest run __tests__/e2e/agent-local-e2e.test.ts",
 		"test:watch": "vitest",
 		"test:coverage": "vitest run --coverage",

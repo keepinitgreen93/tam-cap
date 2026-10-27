@@ -1,5 +1,8 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { requireActiveOrganization } from "@cap/database/cloudflare/access";
+import {
+	requireActiveOrganization,
+	requireWorkspaceAccount,
+} from "@cap/database/cloudflare/access";
 import { db } from "@cap/database/cloudflare/application";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
@@ -337,6 +340,7 @@ protectedApp.post(
 		const database = db();
 		const activated = await atomic(database, async (snapshot) => {
 			const statements: AtomicStatement[] = [];
+			await requireWorkspaceAccount(snapshot, user.id);
 			const [currentUser] = await snapshot.read((reader) =>
 				reader
 					.select({ id: users.id })
@@ -405,24 +409,33 @@ protectedApp.post(
 
 protectedApp.delete("/google-drive/disconnect", async (c) => {
 	const user = c.get("user");
-	await db()
-		.update(storageIntegrations)
-		.set({
-			active: false,
-			status: "disconnected",
-			googleDriveAccessToken: null,
-			googleDriveAccessTokenExpiresAt: null,
-			googleDriveTokenRefreshLeaseId: null,
-			googleDriveTokenRefreshLeaseExpiresAt: null,
-			googleDriveStorageQuotaCache: null,
-		})
-		.where(
-			and(
-				eq(storageIntegrations.ownerId, user.id),
-				isNull(storageIntegrations.organizationId),
-				eq(storageIntegrations.provider, googleDriveProvider),
-			),
-		);
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireWorkspaceAccount(snapshot, user.id);
+		return {
+			statements: [
+				database
+					.update(storageIntegrations)
+					.set({
+						active: false,
+						status: "disconnected",
+						googleDriveAccessToken: null,
+						googleDriveAccessTokenExpiresAt: null,
+						googleDriveTokenRefreshLeaseId: null,
+						googleDriveTokenRefreshLeaseExpiresAt: null,
+						googleDriveStorageQuotaCache: null,
+					})
+					.where(
+						and(
+							eq(storageIntegrations.ownerId, user.id),
+							isNull(storageIntegrations.organizationId),
+							eq(storageIntegrations.provider, googleDriveProvider),
+						),
+					),
+			],
+			result: undefined,
+		};
+	});
 
 	return c.json({ success: true });
 });
@@ -520,6 +533,7 @@ app.get("/google-drive/callback", async (c) => {
 		const database = db();
 		await atomic(database, async (snapshot) => {
 			const statements: AtomicStatement[] = [];
+			if (!organizationId) await requireWorkspaceAccount(snapshot, userId);
 			const [currentUser] = await snapshot.read((reader) =>
 				reader
 					.select({ id: users.id })

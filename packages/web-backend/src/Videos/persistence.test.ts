@@ -309,7 +309,7 @@ test("storage reservation has one stable winner and tombstones block object publ
 				database,
 				{
 					...object,
-					id: Storage.StorageObjectId.make(`${object.id}${providerObjectId}`),
+					id: Storage.StorageObjectId.make(`${video.id}${providerObjectId}`),
 					providerObjectId,
 				},
 				{ reserve: true },

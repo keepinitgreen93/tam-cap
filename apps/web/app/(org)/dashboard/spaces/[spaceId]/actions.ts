@@ -1,19 +1,22 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoIdLength } from "@cap/database/helpers";
-import { organizationMembers, spaceMembers } from "@cap/database/schema";
-import { type Organisation, Space, User } from "@cap/web-domain";
-import { and, eq, inArray } from "drizzle-orm";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { spaceMembers } from "@cap/database/cloudflare/schema";
+import { Space, User } from "@cap/web-domain";
+import { eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { v4 as uuidv4 } from "uuid";
 import { z } from "zod";
-import { requireSpaceManager } from "@/actions/organization/space-authorization";
+import {
+	insertSpaceMembers,
+	requireManagedSpace,
+	requireSpaceRoster,
+} from "@/lib/organization-settings-persistence";
 import {
 	canRemoveSpaceMember,
 	normalizeSpaceRole,
-	type SpaceRole,
 } from "@/lib/permissions/roles";
 
 const spaceRole = z.preprocess(
@@ -38,74 +41,17 @@ const addSpaceMembersSchema = z.object({
 	role: spaceRole,
 });
 
-async function assertUsersBelongToOrganization(
-	organizationId: Organisation.OrganisationId,
-	organizationOwnerId: User.UserId,
-	userIds: User.UserId[],
-) {
-	const uniqueUserIds = Array.from(new Set(userIds));
-	if (uniqueUserIds.length === 0) return;
-
-	const rows = await db()
-		.select({ userId: organizationMembers.userId })
-		.from(organizationMembers)
-		.where(
-			and(
-				eq(organizationMembers.organizationId, organizationId),
-				inArray(
-					organizationMembers.userId,
-					uniqueUserIds.map((id) => User.UserId.make(id)),
-				),
-			),
-		);
-	const allowedUserIds = new Set([
-		organizationOwnerId,
-		...rows.map((row) => row.userId),
-	]);
-	const invalidUserIds = uniqueUserIds.filter((id) => !allowedUserIds.has(id));
-
-	if (invalidUserIds.length > 0) {
-		throw new Error("All space members must belong to the organization");
-	}
-}
-
 export async function addSpaceMember(
 	data: z.infer<typeof addSpaceMemberSchema>,
 ) {
 	const validation = addSpaceMemberSchema.safeParse(data);
-
-	if (!validation.success) {
-		throw new Error("Invalid input");
-	}
-
-	const currentUser = await getCurrentUser();
-
-	if (!currentUser) {
-		throw new Error("Unauthorized");
-	}
-
-	const { spaceId, userId, role } = validation.data;
-	const access = await requireSpaceManager(currentUser.id, spaceId);
-	await assertUsersBelongToOrganization(
-		access.organizationId,
-		access.organizationOwnerId,
-		[userId],
-	);
-
-	await db()
-		.insert(spaceMembers)
-		.values({
-			id: uuidv4().substring(0, nanoIdLength),
-			spaceId,
-			userId,
-			role,
-			createdAt: new Date(),
-			updatedAt: new Date(),
-		});
-
-	revalidatePath(`/dashboard/spaces/${spaceId}`);
-
-	return { success: true };
+	if (!validation.success) throw new Error("Invalid input");
+	const result = await addSpaceMembers({
+		spaceId: validation.data.spaceId,
+		userIds: [validation.data.userId],
+		role: validation.data.role,
+	});
+	return { success: result.success };
 }
 
 export async function addSpaceMembers(
@@ -122,42 +68,39 @@ export async function addSpaceMembers(
 	}
 
 	const { spaceId, userIds, role } = validation.data;
-	const access = await requireSpaceManager(currentUser.id, spaceId);
-	await assertUsersBelongToOrganization(
-		access.organizationId,
-		access.organizationOwnerId,
-		userIds,
-	);
-
-	const existing = await db()
-		.select({ userId: spaceMembers.userId })
-		.from(spaceMembers)
-		.where(eq(spaceMembers.spaceId, spaceId));
-	const existingIds = new Set(existing.map((m) => m.userId));
-	const newUserIds = userIds.filter((id) => !existingIds.has(id));
-
-	if (newUserIds.length === 0) {
-		revalidatePath(`/dashboard/spaces/${spaceId}`);
-		return { success: true, added: [], alreadyMembers: userIds };
-	}
-
+	const database = db();
+	const operationId = uuidv4();
 	const now = new Date();
-	const values = newUserIds.map((userId) => ({
-		id: uuidv4().substring(0, nanoIdLength),
-		spaceId,
-		userId,
-		role,
-		createdAt: now,
-		updatedAt: now,
-	}));
-
-	await db().insert(spaceMembers).values(values);
+	const result = await atomic(database, async (snapshot) => {
+		const access = await requireManagedSpace(snapshot, currentUser.id, spaceId);
+		await requireSpaceRoster(snapshot, access, userIds);
+		const existing = await snapshot.read((reader) =>
+			reader
+				.select({ userId: spaceMembers.userId })
+				.from(spaceMembers)
+				.where(eq(spaceMembers.spaceId, spaceId)),
+		);
+		const existingIds = new Set(existing.map((member) => member.userId));
+		const added = Array.from(new Set(userIds)).filter(
+			(id) => !existingIds.has(id),
+		);
+		return {
+			statements: added.length
+				? [
+						insertSpaceMembers(
+							database,
+							spaceId,
+							added.map((userId) => ({ userId, role })),
+							operationId,
+							now,
+						),
+					]
+				: [],
+			result: { success: true, added, alreadyMembers: Array.from(existingIds) },
+		};
+	});
 	revalidatePath(`/dashboard/spaces/${spaceId}`);
-	return {
-		success: true,
-		added: newUserIds,
-		alreadyMembers: Array.from(existingIds),
-	};
+	return result;
 }
 
 const removeSpaceMemberSchema = z.object({
@@ -168,50 +111,11 @@ export async function removeSpaceMember(
 	data: z.infer<typeof removeSpaceMemberSchema>,
 ) {
 	const validation = removeSpaceMemberSchema.safeParse(data);
-
-	if (!validation.success) {
-		throw new Error("Invalid input");
-	}
-
-	const currentUser = await getCurrentUser();
-
-	if (!currentUser) {
-		throw new Error("Unauthorized");
-	}
-
-	const { memberId } = validation.data;
-
-	const member = await db()
-		.select({ spaceId: spaceMembers.spaceId, userId: spaceMembers.userId })
-		.from(spaceMembers)
-		.where(eq(spaceMembers.id, memberId))
-		.limit(1);
-
-	if (member.length === 0) {
-		throw new Error("Member not found");
-	}
-
-	const spaceId = member[0]?.spaceId;
-
-	if (!spaceId) {
-		throw new Error("Space ID not found");
-	}
-
-	const access = await requireSpaceManager(currentUser.id, spaceId);
-	if (
-		!canRemoveSpaceMember({
-			canManage: access.canManage,
-			targetUserId: member[0]?.userId,
-			createdById: access.createdById,
-		})
-	) {
-		throw new Error("You do not have permission to remove this space member");
-	}
-
-	await db().delete(spaceMembers).where(eq(spaceMembers.id, memberId));
-
-	revalidatePath(`/dashboard/spaces/${spaceId}`);
-
+	if (!validation.success) throw new Error("Invalid input");
+	const result = await batchRemoveSpaceMembers({
+		memberIds: [validation.data.memberId],
+	});
+	if (!result.removed.length) throw new Error("Member not found");
 	return { success: true };
 }
 
@@ -237,53 +141,30 @@ export async function setSpaceMembers(
 	}
 	const { spaceId, userIds, role, members } = validation.data;
 
-	const access = await requireSpaceManager(currentUser.id, spaceId);
-
-	const submittedMembers =
-		members?.map((member) => ({
-			userId: member.userId,
-			role: normalizeSpaceRole(member.role) ?? "member",
-		})) ??
-		userIds.map((userId) => ({
-			userId,
-			role: normalizeSpaceRole(role) ?? "member",
-		}));
-
-	await assertUsersBelongToOrganization(
-		access.organizationId,
-		access.organizationOwnerId,
-		submittedMembers.map((member) => member.userId),
-	);
-
-	const roleByUserId = new Map(
-		submittedMembers.map((member) => [member.userId, member.role]),
-	);
-	const allMemberIds = Array.from(
-		new Set([
-			...submittedMembers.map((member) => member.userId),
-			access.createdById,
-		]),
-	);
+	const database = db();
+	const operationId = uuidv4();
 	const now = new Date();
-	const values = allMemberIds.map((userId) => {
+	const result = await atomic(database, async (snapshot) => {
+		const access = await requireManagedSpace(snapshot, currentUser.id, spaceId);
+		const roles = new Map(
+			(members ?? userIds.map((userId) => ({ userId, role }))).map((member) => [
+				member.userId,
+				normalizeSpaceRole(member.role) ?? "member",
+			]),
+		);
+		roles.set(access.createdById, "admin");
+		await requireSpaceRoster(snapshot, access, Array.from(roles.keys()));
+		const values = Array.from(roles, ([userId, role]) => ({ userId, role }));
 		return {
-			id: uuidv4().substring(0, nanoIdLength),
-			spaceId,
-			userId,
-			role:
-				userId === access.createdById
-					? ("admin" as const)
-					: ((roleByUserId.get(userId) as SpaceRole | undefined) ?? "member"),
-			createdAt: now,
-			updatedAt: now,
+			statements: [
+				database.delete(spaceMembers).where(eq(spaceMembers.spaceId, spaceId)),
+				insertSpaceMembers(database, spaceId, values, operationId, now),
+			],
+			result: { success: true, count: values.length },
 		};
 	});
-
-	await db().delete(spaceMembers).where(eq(spaceMembers.spaceId, spaceId));
-	await db().insert(spaceMembers).values(values);
-
 	revalidatePath(`/dashboard/spaces/${spaceId}`);
-	return { success: true, count: allMemberIds.length };
+	return result;
 }
 
 const batchRemoveSpaceMembersSchema = z.object({
@@ -308,39 +189,39 @@ export async function batchRemoveSpaceMembers(
 		return { success: true, removed: [] };
 	}
 
-	const members = await db()
-		.select({
-			id: spaceMembers.id,
-			spaceId: spaceMembers.spaceId,
-			userId: spaceMembers.userId,
-		})
-		.from(spaceMembers)
-		.where(inArray(spaceMembers.id, memberIds));
-	const spaceId = members[0]?.spaceId;
-
-	if (!spaceId) {
-		return { success: true, removed: [] };
-	}
-
-	if (members.some((member) => member.spaceId !== spaceId)) {
-		throw new Error("Cannot remove members from multiple spaces at once");
-	}
-
-	const access = await requireSpaceManager(currentUser.id, spaceId);
-	const protectedMember = members.find(
-		(member) =>
-			!canRemoveSpaceMember({
-				canManage: access.canManage,
-				targetUserId: member.userId,
-				createdById: access.createdById,
-			}),
-	);
-
-	if (protectedMember) {
-		throw new Error("You do not have permission to remove one or more members");
-	}
-
-	await db().delete(spaceMembers).where(inArray(spaceMembers.id, memberIds));
-	revalidatePath(`/dashboard/spaces/${spaceId}`);
-	return { success: true, removed: memberIds };
+	const database = db();
+	const predicate = sql`${spaceMembers.id} in (select value from json_each(${JSON.stringify(memberIds)}))`;
+	const result = await atomic(database, async (snapshot) => {
+		const members = await snapshot.read((reader) =>
+			reader.select().from(spaceMembers).where(predicate),
+		);
+		const spaceId = members[0]?.spaceId;
+		if (!spaceId)
+			return {
+				statements: [],
+				result: { spaceId: null, removed: [] as string[] },
+			};
+		if (members.some((member) => member.spaceId !== spaceId))
+			throw new Error("Cannot remove members from multiple spaces at once");
+		const access = await requireManagedSpace(snapshot, currentUser.id, spaceId);
+		if (
+			members.some(
+				(member) =>
+					!canRemoveSpaceMember({
+						canManage: access.canManage,
+						targetUserId: member.userId,
+						createdById: access.createdById,
+					}),
+			)
+		)
+			throw new Error(
+				"You do not have permission to remove one or more members",
+			);
+		return {
+			statements: [database.delete(spaceMembers).where(predicate)],
+			result: { spaceId, removed: members.map((member) => member.id) },
+		};
+	});
+	if (result.spaceId) revalidatePath(`/dashboard/spaces/${result.spaceId}`);
+	return { success: true, removed: result.removed };
 }

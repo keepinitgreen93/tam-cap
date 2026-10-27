@@ -4,6 +4,8 @@ import {
 	decode,
 	encode,
 } from "../../packages/workflow-cloudflare/transport.mjs";
+import { runMaintenance } from "./maintenance";
+import { applicationHeaders } from "./request-headers";
 import { webEnvironment } from "./runtime-env";
 
 export { ContainerProxy } from "@cloudflare/containers";
@@ -11,6 +13,7 @@ export { CapWorkflowStore } from "./workflow-store.mjs";
 
 interface RuntimeBindings {
 	DB: D1Database;
+	ANALYTICS_DB: D1Database;
 	CAP_WEB: DurableObjectNamespace<CapWeb>;
 	CAP_MEDIA: DurableObjectNamespace<CapMedia>;
 	CAP_WORKFLOW: DurableObjectNamespace;
@@ -18,6 +21,8 @@ interface RuntimeBindings {
 	MEDIA_SERVER_WEBHOOK_SECRET: string;
 	CAP_RUNTIME_READY: string;
 	CAP_DEPLOYMENT_ID: string;
+	CAP_MAINTENANCE_ENABLED?: string;
+	WORKFLOW_QUEUE: Queue<unknown>;
 	CAP_PREVIEW_KEY?: string;
 }
 
@@ -128,6 +133,8 @@ export class CapMedia extends CapContainer {
 CapWeb.outboundByHost = {
 	"cap.database": (request, env: RuntimeBindings) =>
 		handleD1BridgeRequest(request, env.DB),
+	"cap.analytics": (request, env: RuntimeBindings) =>
+		handleD1BridgeRequest(request, env.ANALYTICS_DB),
 	"cap.workflow": (request, env: RuntimeBindings) =>
 		env.CAP_WORKFLOW.getByName("primary").fetch(request),
 	"cap.media": (request, env: RuntimeBindings) =>
@@ -152,7 +159,7 @@ export default {
 			return new Response("Invalid path", { status: 400 });
 		}
 		if (
-			["/.well-known/workflow", "/query", "/rpc"].some(
+			["/.well-known/workflow", "/query", "/rpc", "/api/cron"].some(
 				(prefix) => path === prefix || path.startsWith(`${prefix}/`),
 			)
 		) {
@@ -165,8 +172,7 @@ export default {
 				headers: { "Cache-Control": "no-store" },
 			});
 		}
-		const headers = new Headers(request.headers);
-		headers.delete("x-cap-preview-key");
+		const headers = applicationHeaders(request, request.cf);
 		const response = await getContainer(env.CAP_WEB, "primary").fetch(
 			new Request(request, { headers }),
 		);
@@ -175,9 +181,35 @@ export default {
 		previewResponse.headers.set("Cache-Control", "private, no-store");
 		return previewResponse;
 	},
+	async scheduled(event: ScheduledController, env: RuntimeBindings) {
+		if (env.CAP_MAINTENANCE_ENABLED !== "true") return;
+		await env.WORKFLOW_QUEUE.send({
+			kind: "maintenance",
+			scheduledTime: event.scheduledTime,
+		});
+	},
 	async queue(batch: MessageBatch<unknown>, env: RuntimeBindings) {
 		for (const message of batch.messages) {
 			try {
+				const maintenance = message.body as {
+					kind?: unknown;
+					scheduledTime?: unknown;
+				} | null;
+				if (maintenance?.kind === "maintenance") {
+					if (env.CAP_MAINTENANCE_ENABLED !== "true") {
+						message.retry({ delaySeconds: 900 });
+						continue;
+					}
+					if (typeof maintenance.scheduledTime !== "number")
+						throw new Error("Invalid maintenance message");
+					await runMaintenance(
+						maintenance.scheduledTime,
+						env.CAP_WEB_ENV,
+						(request) => getContainer(env.CAP_WEB, "primary").fetch(request),
+					);
+					message.ack();
+					continue;
+				}
 				const pointer = message.body as { messageId: string };
 				const envelope = await workflowRpc(env, "delivery.get", [
 					pointer.messageId,

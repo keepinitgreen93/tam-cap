@@ -93,7 +93,9 @@ export function sourceConsent(source: SourceContact): Consent {
 			? "suppressed"
 			: "unsubscribed";
 	}
-	if (["false", "0", "no"].includes(source.subscribed?.trim().toLowerCase()))
+	if (
+		["false", "0", "no"].includes(source.subscribed?.trim().toLowerCase() ?? "")
+	)
 		return "unsubscribed";
 	return "subscribed";
 }

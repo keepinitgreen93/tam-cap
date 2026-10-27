@@ -15,7 +15,7 @@ const mocks = vi.hoisted(() => ({
 	readError: undefined as Error | undefined,
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: (columns: unknown) => {
 			mocks.select(columns);
@@ -38,19 +38,17 @@ vi.mock("@cap/web-backend/src/Storage/index", async () => {
 	}) {}
 	return { Storage };
 });
-vi.mock("@cap/web-backend/src/Tinybird/index", async () => {
+vi.mock("@cap/web-backend/src/Analytics/index", async () => {
 	const { Effect } = await import("effect");
-	class Tinybird extends Effect.Service<Tinybird>()("Tinybird", {
+	class Analytics extends Effect.Service<Analytics>()("Analytics", {
 		sync: () => ({
-			querySql: (sql: string) => {
-				mocks.query(sql);
-				return Effect.succeed({
-					data: [{ pathname: "/s/owned", views: 12 }],
-				});
+			countViews: (scope: { videoIds: readonly string[] }) => {
+				mocks.query(scope);
+				return Effect.succeed([{ videoId: "owned", views: 12 }]);
 			},
 		}),
 	}) {}
-	return { Tinybird };
+	return { Analytics };
 });
 
 const { Videos } = await import("@cap/web-backend/src/Videos/index");
@@ -58,9 +56,11 @@ const { VideosPolicy } = await import(
 	"@cap/web-backend/src/Videos/VideosPolicy"
 );
 const { VideosRepo } = await import("@cap/web-backend/src/Videos/VideosRepo");
-const { Database } = await import("@cap/web-backend/src/Database");
+const { CloudflareDatabase } = await import(
+	"@cap/web-backend/src/CloudflareDatabase"
+);
 const { Storage } = await import("@cap/web-backend/src/Storage/index");
-const { Tinybird } = await import("@cap/web-backend/src/Tinybird/index");
+const { Analytics } = await import("@cap/web-backend/src/Analytics/index");
 const check = vi.fn(
 	(
 		video: { id: string },
@@ -109,10 +109,10 @@ function run(ids: string[]) {
 				}),
 			),
 			Effect.provide([
-				Database.Default,
+				CloudflareDatabase.Default,
 				VideosRepo.Default,
 				Storage.Default,
-				Tinybird.Default,
+				Analytics.Default,
 			]),
 			Effect.provideService(CurrentUser, user),
 		),
@@ -150,8 +150,8 @@ describe("bulk video analytics", () => {
 		expect(results.map((result) => Exit.getOrElse(result, () => null))).toEqual(
 			[null, { count: 12 }, null],
 		);
-		expect(mocks.query.mock.calls[0]?.[0]).not.toContain("/s/denied");
-		expect(mocks.query.mock.calls[0]?.[0]).not.toContain("/s/protected");
+		expect(mocks.query.mock.calls[0]?.[0]?.videoIds).not.toContain("denied");
+		expect(mocks.query.mock.calls[0]?.[0]?.videoIds).not.toContain("protected");
 		expect(check).toHaveBeenCalledWith(
 			expect.objectContaining({ id: "protected" }),
 			Option.some("password-hash"),

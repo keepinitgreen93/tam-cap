@@ -22,3 +22,13 @@ To switch application URL settings during the authorized production cutover, use
 The preview gate uses a separate temporary credential, not a user authentication bypass. The Node application still validates ordinary NextAuth sessions.
 
 Database validation preflight uses `node scripts/cloudflare/validation-preflight.mjs` with Node 24 and authenticated Wrangler. It emits table counts only; nonzero invalid-row counts stop the script before migration. D1 schema migration and backup/restore remain separate operations.
+
+## Database restore drill
+
+On 2026-10-27 at 19:25 UTC, the staging metadata database was exported and imported into a newly created, isolated Cloudflare D1 database. Comparison confirmed identical schema, all 51 application/concurrency tables, all four current records, zero mismatched tables, `PRAGMA quick_check` returning `ok`, and zero foreign-key violations. The temporary restore database was deleted after verification. No production database was overwritten.
+
+The export is protected with Windows DPAPI (CurrentUser) at `.secrets/metadata-20261027.sql.dpapi`, with entropy `tam-cap-d1-export-v1`. Decryption was round-trip verified before removing the temporary plaintext SQL. This is a staging restore drill, not proof that future production media have been backed up. Repeat the drill after representative videos and edits exist.
+
+Use Node24 with Wrangler4.152 or later for this deployment; the older global4.123 failed export authentication while the newer authenticated CLI succeeded. Capture export output privately: Wrangler prints a temporary signed download URL. Never paste it into tickets, logs, or chat. The SQL includes private account/session records.
+
+[D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/) is automatic and supports point-in-time recovery for 30days on the paid plan. Recover the database and matching media state together; a metadata-only restore cannot recover deleted R2 objects. D1 supports [`quick_check` and `foreign_key_check`](https://developers.cloudflare.com/d1/sql-api/sql-statements/); full SQLite `integrity_check` is not permitted through D1.

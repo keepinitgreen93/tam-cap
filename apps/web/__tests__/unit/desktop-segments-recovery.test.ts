@@ -9,8 +9,18 @@ const mocks = vi.hoisted(() => ({
 	queue: vi.fn(),
 	recoverable: vi.fn(),
 }));
-vi.mock("@cap/database", () => ({ db: mocks.db }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/schema", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@cap/database/cloudflare/schema")>()),
+	organizations: {
+		id: "org.id",
+		ownerId: "org.ownerId",
+		tombstoneAt: "org.tombstoneAt",
+	},
+	organizationMembers: {
+		organizationId: "member.orgId",
+		userId: "member.userId",
+	},
 	videos: { id: "video.id", ownerId: "video.ownerId", source: "video.source" },
 	videoUploads: {
 		videoId: "upload.videoId",

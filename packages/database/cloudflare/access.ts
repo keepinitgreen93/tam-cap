@@ -1,5 +1,5 @@
 import type { Organisation, User } from "@cap/web-domain";
-import { and, eq, gt, isNull, ne, notExists, or } from "drizzle-orm";
+import { and, eq, gt, isNull, notExists, or } from "drizzle-orm";
 import { normalizeEmail } from "../auth/identity.ts";
 import type { AtomicSnapshot, SnapshotReader } from "./atomic.ts";
 import {
@@ -98,16 +98,6 @@ export async function hasWorkspaceAccess(
 			.limit(1);
 		if (!account) return false;
 	}
-	const provisional = reader
-		.select({ id: organizationInvites.id })
-		.from(organizationInvites)
-		.where(
-			and(
-				eq(organizationInvites.organizationId, organizations.id),
-				eq(organizationInvites.invitedEmail, normalizeEmail(user.email)),
-				ne(organizationInvites.status, "accepted"),
-			),
-		);
 	const [membership] = await reader
 		.select({ id: organizations.id })
 		.from(organizations)
@@ -123,7 +113,7 @@ export async function hasWorkspaceAccess(
 				isNull(organizations.tombstoneAt),
 				or(
 					eq(organizations.ownerId, user.id),
-					and(eq(organizationMembers.userId, user.id), notExists(provisional)),
+					eq(organizationMembers.userId, user.id),
 				),
 			),
 		)

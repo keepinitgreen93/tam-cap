@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	comments,
 	organizations,
@@ -9,7 +9,7 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { buildEnv } from "@cap/env";
 import { Logo } from "@cap/ui";

@@ -1,7 +1,9 @@
 "use server";
 
 import { getCurrentUser } from "@cap/database/auth/session";
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
 import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	agentApiKeys,
 	authApiKeys,
@@ -156,16 +158,25 @@ export async function createCliApiKey(input: {
 	);
 	const scopes = agentScopeProfiles[input.profile];
 	const id = nanoId();
-	await db()
-		.insert(agentApiKeys)
-		.values({
-			id,
-			userId: currentUser.id,
-			tokenHash: hashAgentSecret(token),
-			name,
-			scopes,
-			expiresAt,
-		});
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireWorkspaceAccount(snapshot, currentUser.id);
+		return {
+			statements: [
+				database
+					.insert(agentApiKeys)
+					.values({
+						id,
+						userId: currentUser.id,
+						tokenHash: hashAgentSecret(token),
+						name,
+						scopes,
+						expiresAt,
+					}),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidatePath("/dashboard/settings/account");
 	return {

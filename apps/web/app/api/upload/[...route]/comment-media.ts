@@ -1,6 +1,6 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
+import * as Db from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import * as Db from "@cap/database/schema";
 import {
 	createCommentMediaUploadToken,
 	makeCurrentUserLayer,

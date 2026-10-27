@@ -11,29 +11,35 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@cap/env", () => ({
-	buildEnv: { NEXT_PUBLIC_IS_CAP: true },
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" },
 }));
 
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => mocks.user,
 }));
 
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: () => ({
-				where: async () => (mocks.video ? [mocks.video] : []),
-			}),
-		}),
-		update: () => ({
-			set: (values: unknown) => ({
-				where: async () => {
-					mocks.updates.push(values);
-				},
-			}),
-		}),
-	}),
-}));
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const schema = await import("@cap/database/cloudflare/schema");
+	const { createRecordingD1Model } = await import(
+		"../helpers/recording-d1-model"
+	);
+	const database = createRecordingD1Model({
+		read: ({ table }) => {
+			if (table === schema.videos)
+				return mocks.video
+					? [{ id: "video123", orgId: "org", ...mocks.video }]
+					: [];
+			if (table === schema.organizations)
+				return [{ id: "org", ownerId: "owner", tombstoneAt: null }];
+			return [];
+		},
+		apply: (statements) => {
+			for (const item of statements)
+				if (item.table === schema.videos) mocks.updates.push(item.values);
+		},
+	});
+	return { db: () => database };
+});
 
 import type { Video } from "@cap/web-domain";
 import { updateVideoCallToAction } from "@/actions/videos/call-to-action";
@@ -140,7 +146,7 @@ describe("updateVideoCallToAction", () => {
 		const settings = sqlText(
 			(mocks.updates[0] as { settings: unknown }).settings,
 		);
-		expect(settings).toContain("JSON_MERGE_PATCH(");
+		expect(settings).toContain("json_patch(");
 		expect(settings).toContain('"callToAction":null');
 		expect(settings).toContain('"url":"https://cal.com/demo"');
 	});
@@ -151,7 +157,7 @@ describe("updateVideoCallToAction", () => {
 		const settings = sqlText(
 			(mocks.updates[0] as { settings: unknown }).settings,
 		);
-		expect(settings).toContain("JSON_MERGE_PATCH(");
+		expect(settings).toContain("json_patch(");
 		expect(settings).toContain('{"callToAction":null}');
 		expect(settings).not.toContain('"url"');
 	});

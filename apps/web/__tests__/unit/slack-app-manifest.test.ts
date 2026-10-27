@@ -53,14 +53,14 @@ describe("Slack app manifest", () => {
 		const source = readFileSync(
 			join(
 				process.cwd(),
-				"../../packages/web-backend/src/Organisations/index.ts",
+				"../../packages/database/cloudflare/organization-delete.ts",
 			),
 			"utf8",
 		);
 		const integrationDelete = source.indexOf(
-			".delete(Db.integrationInstallations)",
+			".delete(tables.integrationInstallations)",
 		);
-		const organizationDelete = source.indexOf(".delete(Db.organizations)");
+		const organizationDelete = source.indexOf(".delete(tables.organizations)");
 
 		expect(integrationDelete).toBeGreaterThan(-1);
 		expect(organizationDelete).toBeGreaterThan(integrationDelete);

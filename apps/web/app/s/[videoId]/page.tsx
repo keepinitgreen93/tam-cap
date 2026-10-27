@@ -1,6 +1,5 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoIdLength } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	comments,
 	organizationMembers,
@@ -13,12 +12,13 @@ import {
 	videos,
 	videoUploads,
 	videoViewerGrants,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
+import { nanoIdLength } from "@cap/database/helpers";
 import type { VideoMetadata } from "@cap/database/types";
 import { buildEnv, serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	ImageUploads,
 	provideOptionalAuth,
 	resolveEffectiveVideoRules,

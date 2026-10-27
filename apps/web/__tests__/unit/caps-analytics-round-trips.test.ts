@@ -21,8 +21,8 @@ const mocks = vi.hoisted(() => ({
 	fixtures: null as AccessFixture[] | null,
 	failTable: "",
 }));
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	return { db: () => drizzle(mocks.query) };
 });
 vi.mock("@cap/utils", async () => {
@@ -38,20 +38,20 @@ vi.mock("@cap/web-backend/src/Storage/index", async () => {
 	}) {}
 	return { Storage };
 });
-vi.mock("@cap/web-backend/src/Tinybird/index", async () => {
+vi.mock("@cap/web-backend/src/Analytics/index", async () => {
 	const { Effect } = await import("effect");
-	class Tinybird extends Effect.Service<Tinybird>()("Tinybird", {
+	class Analytics extends Effect.Service<Analytics>()("Analytics", {
 		succeed: {
-			querySql: () =>
-				Effect.succeed({
-					data: Array.from({ length: mocks.size }, (_, index) => ({
-						pathname: `/s/video-${index}`,
+			countViews: (scope: { videoIds: readonly string[] }) =>
+				Effect.succeed(
+					Array.from({ length: mocks.size }, (_, index) => ({
+						videoId: `video-${index}`,
 						views: index + 1,
-					})),
-				}),
+					})).filter((row) => scope.videoIds.includes(row.videoId)),
+				),
 		},
 	}) {}
-	return { Tinybird };
+	return { Analytics };
 });
 
 const { Videos } = await import("@cap/web-backend/src/Videos/index");
@@ -59,9 +59,11 @@ const { VideosPolicy } = await import(
 	"@cap/web-backend/src/Videos/VideosPolicy"
 );
 const { VideosRepo } = await import("@cap/web-backend/src/Videos/VideosRepo");
-const { Database } = await import("@cap/web-backend/src/Database");
+const { CloudflareDatabase } = await import(
+	"@cap/web-backend/src/CloudflareDatabase"
+);
 const { Storage } = await import("@cap/web-backend/src/Storage/index");
-const { Tinybird } = await import("@cap/web-backend/src/Tinybird/index");
+const { Analytics } = await import("@cap/web-backend/src/Analytics/index");
 
 const user: CurrentUser["Type"] = {
 	id: User.UserId.make("viewer"),
@@ -83,8 +85,8 @@ function run() {
 			VideosPolicy.Default,
 			VideosRepo.Default,
 			Storage.Default,
-			Tinybird.Default,
-			Database.Default,
+			Analytics.Default,
+			CloudflareDatabase.Default,
 		]),
 		Effect.provideService(CurrentUser, user),
 		Logger.withMinimumLogLevel(LogLevel.None),
@@ -92,49 +94,56 @@ function run() {
 	);
 }
 function reply(sql: string, params: unknown[] = []) {
-	if (mocks.failTable && sql.includes(`from \`${mocks.failTable}\``))
-		throw new Error("Database unavailable");
+	params = params.flatMap((value) => {
+		if (typeof value === "string" && value.startsWith("[")) {
+			const parsed: unknown = JSON.parse(value);
+			if (Array.isArray(parsed)) return parsed;
+		}
+		return [value];
+	});
+	if (mocks.failTable && sql.includes(`from "${mocks.failTable}"`))
+		throw new Error("CloudflareDatabase unavailable");
 	if (mocks.fixtures) {
 		const selected = mocks.fixtures.filter((fixture) =>
 			params.includes(fixture.id),
 		);
-		if (sql.includes("from `organization_members`")) {
+		if (sql.includes('from "organization_members"')) {
 			expect(params[0]).toBe("viewer");
 			return selected
 				.filter((fixture) => fixture.orgMember)
 				.map((fixture) =>
-					sql.includes("`shared_videos`.`videoId`,")
+					sql.includes('"shared_videos"."videoId",')
 						? [fixture.id, "org-membership"]
 						: ["org-membership"],
 				);
 		}
-		if (sql.includes("from `space_members`")) {
+		if (sql.includes('from "space_members"')) {
 			expect(params[0]).toBe("viewer");
 			return selected
 				.filter((fixture) => fixture.spaceMember)
 				.map((fixture) =>
-					sql.includes("`space_videos`.`videoId`,")
+					sql.includes('"space_videos"."videoId",')
 						? [fixture.id, "space-membership"]
 						: ["space-membership"],
 				);
 		}
-		if (sql.includes("from `space_videos`"))
+		if (sql.includes('from "space_videos"'))
 			return selected.flatMap((fixture) =>
 				(fixture.spacePasswords ?? []).map((password) =>
-					sql.startsWith("select `space_videos`.`videoId`")
+					sql.startsWith('select "space_videos"."videoId"')
 						? [fixture.id, password]
 						: ["space", "Space", password],
 				),
 			);
-		if (sql.includes("from `organizations`"))
+		if (sql.includes('from "organizations"'))
 			return mocks.fixtures
 				.filter((fixture) => params.includes(`org-${fixture.id}`))
 				.map((fixture) => [fixture.domain ?? null]);
-		if (sql.includes("from `video_viewer_grants`"))
+		if (sql.includes('from "video_viewer_grants"'))
 			return selected.filter((fixture) => fixture.grant).map(() => ["grant"]);
 		throw new Error(`Unexpected policy query: ${sql}`);
 	}
-	if (sql.includes("from `videos`"))
+	if (sql.includes('from "videos"'))
 		return ids().map((id) => [
 			id,
 			"org",
@@ -142,13 +151,13 @@ function reply(sql: string, params: unknown[] = []) {
 			0,
 			null,
 		]);
-	if (sql.includes("from `organization_members`"))
-		return sql.includes("`shared_videos`.`videoId`,")
+	if (sql.includes('from "organization_members"'))
+		return sql.includes('"shared_videos"."videoId",')
 			? ids().map((id) => [id, "membership"])
 			: [["membership"]];
 	if (
-		sql.includes("from `space_members`") ||
-		sql.includes("from `space_videos`")
+		sql.includes('from "space_members"') ||
+		sql.includes('from "space_videos"')
 	)
 		return [];
 	throw new Error(`Unexpected query: ${sql}`);

@@ -1,6 +1,5 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
 import {
 	getRegisteredSsoOrganization,
@@ -12,7 +11,8 @@ import {
 	createSsoLoginIntent,
 	ssoIntentCookie,
 } from "@cap/database/auth/sso-state";
-import { organizations } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { hasSsoAccess } from "@cap/utils";
 import { Organisation } from "@cap/web-domain";

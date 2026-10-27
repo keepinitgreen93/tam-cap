@@ -1,5 +1,5 @@
-import { db } from "@cap/database";
-import { videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { videos } from "@cap/database/cloudflare/schema";
 import {
 	findScreenshotObjectKey,
 	provideOptionalAuth,

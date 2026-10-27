@@ -1,5 +1,6 @@
 export * from "./AgentAuth.ts";
 export * from "./AgentManagement.ts";
+export * from "./Analytics/index.ts";
 export * from "./Auth.ts";
 export * from "./Aws.ts";
 export * from "./CloudflareDatabase.ts";

@@ -575,10 +575,13 @@ describe("VideosPolicy.canView", () => {
 	});
 
 	describe("video not found", () => {
-		it("allows access when video does not exist", async () => {
+		it("denies access when the recording is missing or hidden by deletion", async () => {
 			const deps = makeDeps({ video: null });
 
-			expect(await runCanView(deps, noUser)).toBe("allowed");
+			expect(await runCanView(deps, noUser)).toBe("denied");
+			expect(
+				await runCanView(deps, makeUser("owner@example.com", TEST_OWNER_ID)),
+			).toBe("denied");
 		});
 	});
 

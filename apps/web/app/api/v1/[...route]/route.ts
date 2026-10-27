@@ -1,6 +1,10 @@
 import { createHash, createHmac } from "node:crypto";
 import { HeadBucketCommand, S3Client } from "@aws-sdk/client-s3";
 import { normalizeEmail } from "@cap/database/auth/identity";
+import {
+	requireWorkspaceAccount,
+	WorkspaceAccountRequiredError,
+} from "@cap/database/cloudflare/access";
 import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import { releaseProSeatStatement } from "@cap/database/cloudflare/pro-seat";
@@ -3835,8 +3839,15 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: Schema.decodeUnknownSync(
 								DeveloperKeyOperationResult,
 							),
-							execute: async (_snapshot, db) => {
+							execute: async (snapshot, db) => {
 								const statements: AtomicStatement[] = [];
+								try {
+									await requireWorkspaceAccount(snapshot, principal.id);
+								} catch (error) {
+									if (error instanceof WorkspaceAccountRequiredError)
+										return { statements: [], result: { state: "forbidden" } };
+									throw error;
+								}
 								const appId = mutationId2;
 								const publicKeyId = mutationId3;
 								const secretKeyId = mutationId4;
@@ -6090,6 +6101,13 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 							decodeReplay: decodeMutationResponse,
 							execute: async (snapshot, db) => {
 								const statements: AtomicStatement[] = [];
+								try {
+									await requireWorkspaceAccount(snapshot, principal.id);
+								} catch (error) {
+									if (error instanceof WorkspaceAccountRequiredError)
+										return { statements: [], result: { state: "forbidden" } };
+									throw error;
+								}
 								const [existingName] = await snapshot.read((reader) =>
 									reader
 										.select({ id: Db.organizations.id })

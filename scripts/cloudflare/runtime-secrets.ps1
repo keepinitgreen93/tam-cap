@@ -47,8 +47,11 @@ try {
 	}
 	if (-not $capPayload.media) { throw 'Missing protected media credential.' }
 	if ($Operation -eq 'Verify') {
-		@{ verified = $true; owner = $capPayload.web.CAP_OWNER_EMAIL; origin = $capPayload.web.WEB_URL } | ConvertTo-Json
+		@{ verified = $true; owner = $capPayload.web.CAP_OWNER_EMAIL; origin = $capPayload.web.WEB_URL; maintenanceConfigured = [bool]$capPayload.web.CRON_SECRET } | ConvertTo-Json
 		return
+	}
+	if (-not $capPayload.web.CRON_SECRET) {
+		$capPayload.web.CRON_SECRET = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
 	}
 	if ($Origin) {
 		if ($Origin -notin @('https://videos.trulyauthenticmarketing.com', 'https://tam-cap-app.ciglesia.workers.dev')) { throw 'Origin must be the configured staging or production origin.' }

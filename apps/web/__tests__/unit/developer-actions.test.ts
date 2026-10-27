@@ -1,3 +1,6 @@
+vi.mock("@cap/database/cloudflare/access", () => ({
+	requireWorkspaceAccount: vi.fn(async () => ({})),
+}));
 vi.mock("@cap/env", () => ({ buildEnv: { NEXT_PUBLIC_IS_CAP: "true" } }));
 
 import type {

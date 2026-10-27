@@ -1,7 +1,12 @@
-import { db } from "@cap/database";
 import { decodeSessionToken } from "@cap/database/auth/auth-options";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { authApiKeys } from "@cap/database/schema";
+import {
+	requireWorkspaceAccount,
+	WorkspaceAccountRequiredError,
+} from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { authApiKeys } from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
@@ -34,6 +39,16 @@ app.get(
 
 		const user = await getCurrentUser();
 		if (!user) return c.redirect(loginRedirectUrl);
+		try {
+			await atomic(db(), async (snapshot) => ({
+				statements: [],
+				result: await requireWorkspaceAccount(snapshot, user.id),
+			}));
+		} catch (error) {
+			if (error instanceof WorkspaceAccountRequiredError)
+				return c.json({ error: "workspace_membership_required" }, 403);
+			throw error;
+		}
 
 		let data:
 			| { type: "token"; token: string; expires: string }
@@ -54,9 +69,18 @@ app.get(
 			};
 		} else {
 			const id = crypto.randomUUID();
-			await db()
-				.insert(authApiKeys)
-				.values({ id, userId: user.id, source: "desktop" });
+			const database = db();
+			await atomic(database, async (snapshot) => {
+				await requireWorkspaceAccount(snapshot, user.id);
+				return {
+					statements: [
+						database
+							.insert(authApiKeys)
+							.values({ id, userId: user.id, source: "desktop" }),
+					],
+					result: undefined,
+				};
+			});
 
 			data = { type: "api_key", api_key: id };
 		}

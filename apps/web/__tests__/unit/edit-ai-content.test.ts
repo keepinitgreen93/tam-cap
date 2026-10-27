@@ -1,5 +1,9 @@
-import { MySqlDialect } from "drizzle-orm/mysql-core";
+import type { SQL } from "drizzle-orm";
+import { SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
+
+let database: ReturnType<typeof createRecordingD1Model>;
 
 const mocks = vi.hoisted(() => ({
 	getCurrentUser: vi.fn(),
@@ -9,8 +13,8 @@ const mocks = vi.hoisted(() => ({
 	lockedRead: vi.fn(),
 	write: vi.fn(),
 }));
-vi.mock("@cap/database", () => ({
-	db: () => ({ transaction: mocks.transaction }),
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => database,
 }));
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.getCurrentUser,
@@ -47,28 +51,23 @@ beforeEach(() => {
 		{ metadata, duration: 120 },
 	]);
 	mocks.write.mockResolvedValue([{ affectedRows: 1 }]);
-	const dialect = new MySqlDialect();
-	const tx = {
-		select: () => ({
-			from: () => ({
-				where: (condition: Parameters<MySqlDialect["sqlToQuery"]>[0]) => {
-					readSql = JSON.stringify(dialect.sqlToQuery(condition));
-					return { for: mocks.lockedRead };
-				},
-			}),
-		}),
-		update: () => ({
-			set: (values: {
-				metadata: Parameters<MySqlDialect["sqlToQuery"]>[0];
-			}) => {
-				const query = dialect.sqlToQuery(values.metadata);
+	const dialect = new SQLiteSyncDialect();
+	database = createRecordingD1Model({
+		read: async ({ condition }) => {
+			if (condition) readSql = JSON.stringify(dialect.sqlToQuery(condition));
+			return mocks.lockedRead();
+		},
+		apply: async (statements) => {
+			for (const statement of statements) {
+				const query = dialect.sqlToQuery(
+					(statement.values as { metadata: SQL }).metadata,
+				);
 				writeSql = query.sql;
 				writeParams = query.params;
-				return { where: mocks.write };
-			},
-		}),
-	};
-	mocks.transaction.mockImplementation((callback) => callback(tx));
+				await mocks.write();
+			}
+		},
+	});
 });
 
 describe("editing AI content", () => {
@@ -88,7 +87,7 @@ describe("editing AI content", () => {
 		});
 		expect(writeSql).not.toContain("chaptersManuallyEdited");
 	});
-	it("compares chapters independently of MySQL JSON key ordering", async () => {
+	it("compares chapters independently of serialized JSON key ordering", async () => {
 		metadata.chapters = [{ start: 0, title: "Intro" }];
 		expect(
 			(
@@ -132,7 +131,7 @@ describe("editing AI content", () => {
 		).toBe(false);
 		expect(readSql).toContain("ownerId");
 		expect(readSql).toContain("owner");
-		expect(mocks.lockedRead).toHaveBeenCalledWith("update");
+		expect(mocks.lockedRead).toHaveBeenCalledOnce();
 		expect(mocks.write).not.toHaveBeenCalled();
 	});
 	it("updates only the summary while retaining concurrently updated chapters", async () => {
@@ -164,7 +163,7 @@ describe("editing AI content", () => {
 				chapters: [{ title: "Changed", start: 20 }],
 			},
 		});
-		expect(writeSql).toContain("CAST(? AS JSON)");
+		expect(writeSql).toContain("JSON(?)");
 		expect(writeSql).not.toContain("summaryManuallyEdited");
 		expect(writeParams).toContain('[{"title":"Changed","start":20}]');
 	});
@@ -246,18 +245,18 @@ describe("generation preserves manual content", () => {
 	it.each(["summary", "chapters"] as const)(
 		"guards %s using the current row and permits regeneration after content removal",
 		(field) => {
-			const query = new MySqlDialect().sqlToQuery(
+			const query = new SQLiteSyncDialect().sqlToQuery(
 				setGeneratedAiContent(
 					sql`JSON_OBJECT()`,
 					field,
 					field === "summary" ? "Generated" : [],
 				),
 			);
-			expect(query.sql).toContain("JSON_CONTAINS_PATH");
-			expect(query.sql).toContain("IF(");
+			expect(query.sql).toContain("json_type");
+			expect(query.sql).toContain("CASE WHEN");
 			expect(query.params).toContain(`$.${field}ManuallyEdited`);
 			expect(query.params).toContain(`$.${field}`);
-			expect(query.sql).toContain("CAST('false' AS JSON)");
+			expect(query.sql).toContain("json('false')");
 		},
 	);
 });

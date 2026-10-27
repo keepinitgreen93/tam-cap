@@ -1,7 +1,9 @@
 "use server";
 
 import { getCurrentUser } from "@cap/database/auth/session";
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
 import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	developerApiKeys,
 	developerApps,
@@ -24,6 +26,9 @@ export async function createDeveloperApp(data: {
 	if (!data.name.trim()) throw new Error("App name is required");
 
 	const appId = nanoId();
+	const publicKeyId = nanoId();
+	const secretKeyId = nanoId();
+	const accountId = nanoId();
 	const publicKeyRaw = `cpk_${nanoIdLong()}`;
 	const secretKeyRaw = `csk_${nanoIdLong()}`;
 	const publicKeyHash = await hashKey(publicKeyRaw);
@@ -33,39 +38,45 @@ export async function createDeveloperApp(data: {
 	const encryptedSecretKey = await encrypt(secretKeyRaw);
 
 	const database = db();
-	await database.batch([
-		database.insert(developerApps).values({
-			id: appId,
-			ownerId: user.id,
-			name: data.name.trim(),
-			environment: data.environment,
-		}),
+	await atomic(database, async (snapshot) => {
+		await requireWorkspaceAccount(snapshot, user.id);
+		return {
+			statements: [
+				database.insert(developerApps).values({
+					id: appId,
+					ownerId: user.id,
+					name: data.name.trim(),
+					environment: data.environment,
+				}),
 
-		database.insert(developerApiKeys).values([
-			{
-				id: nanoId(),
-				appId,
-				keyType: "public",
-				keyPrefix: publicKeyRaw.slice(0, 12),
-				keyHash: publicKeyHash,
-				encryptedKey: encryptedPublicKey,
-			},
-			{
-				id: nanoId(),
-				appId,
-				keyType: "secret",
-				keyPrefix: secretKeyRaw.slice(0, 12),
-				keyHash: secretKeyHash,
-				encryptedKey: encryptedSecretKey,
-			},
-		]),
+				database.insert(developerApiKeys).values([
+					{
+						id: publicKeyId,
+						appId,
+						keyType: "public",
+						keyPrefix: publicKeyRaw.slice(0, 12),
+						keyHash: publicKeyHash,
+						encryptedKey: encryptedPublicKey,
+					},
+					{
+						id: secretKeyId,
+						appId,
+						keyType: "secret",
+						keyPrefix: secretKeyRaw.slice(0, 12),
+						keyHash: secretKeyHash,
+						encryptedKey: encryptedSecretKey,
+					},
+				]),
 
-		database.insert(developerCreditAccounts).values({
-			id: nanoId(),
-			appId,
-			ownerId: user.id,
-		}),
-	]);
+				database.insert(developerCreditAccounts).values({
+					id: accountId,
+					appId,
+					ownerId: user.id,
+				}),
+			],
+			result: undefined,
+		};
+	});
 
 	return {
 		appId,

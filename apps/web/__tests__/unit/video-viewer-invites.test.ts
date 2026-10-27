@@ -18,52 +18,55 @@ const fixtures = vi.hoisted(() => ({
 	updated: vi.fn(),
 }));
 
-const schema = vi.hoisted(() => ({
-	videos: { id: "videoId", name: "videoName", ownerId: "videoOwnerId" },
-	videoViewerGrants: {
-		videoId: "grantVideoId",
-		email: "grantEmail",
-		revokedAt: "grantRevokedAt",
-	},
-}));
+import * as schema from "@cap/database/cloudflare/schema";
 
-vi.mock("@cap/database", () => ({
-	db: () => {
-		let selectedTable: unknown;
-		return {
-			select: () => ({
-				from: (table: unknown) => {
-					fixtures.selected(table);
-					selectedTable = table;
-					return {
-						where: () => ({
-							limit: async () =>
-								selectedTable === schema.videos
-									? [fixtures.video]
-									: fixtures.grants.map((email) => ({
-											email,
-											revokedAt: fixtures.revokedEmails.includes(email)
-												? new Date(0)
-												: null,
-										})),
-							orderBy: async () => fixtures.grants.map((email) => ({ email })),
-						}),
-					};
-				},
-			}),
-			insert: () => ({
-				values: (value: unknown) => ({
-					onDuplicateKeyUpdate: async () => fixtures.inserted(value),
-				}),
-			}),
-			update: () => ({
-				set: (value: unknown) => ({
-					where: async () => fixtures.updated(value),
-				}),
-			}),
-		};
-	},
-}));
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const schema = await import("@cap/database/cloudflare/schema");
+	const { createRecordingD1Model } = await import(
+		"../helpers/recording-d1-model"
+	);
+	const { SQLiteSyncDialect } = await import("drizzle-orm/sqlite-core");
+	const dialect = new SQLiteSyncDialect();
+	const database = createRecordingD1Model({
+		read: ({ table, condition }) => {
+			if (table === schema.videos) {
+				fixtures.selected(table);
+				return [{ ...fixtures.video, orgId: "org" }];
+			}
+			if (table === schema.organizations)
+				return [
+					{ id: "org", ownerId: fixtures.video.ownerId, tombstoneAt: null },
+				];
+			if (table !== schema.videoViewerGrants) return [];
+			fixtures.selected(table);
+			const query = condition ? dialect.sqlToQuery(condition) : null;
+			const email = query?.params.find(
+				(item) => typeof item === "string" && item.includes("@"),
+			);
+			return fixtures.grants
+				.filter((value) => !email || value === email)
+				.filter(
+					(value) =>
+						!query?.sql.includes("is null") ||
+						!fixtures.revokedEmails.includes(value),
+				)
+				.map((email) => ({
+					id: "grant-1",
+					email,
+					revokedAt: fixtures.revokedEmails.includes(email)
+						? new Date(0)
+						: null,
+				}));
+		},
+		apply: async (statements) => {
+			for (const item of statements) {
+				if (item.operation === "insert") await fixtures.inserted(item.values);
+				else await fixtures.updated(item.values);
+			}
+		},
+	});
+	return { db: () => database };
+});
 
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: fixtures.user,
@@ -77,14 +80,9 @@ vi.mock("@cap/database/emails/video-viewer-invite", () => ({
 vi.mock("@cap/database/helpers", () => ({
 	nanoId: () => "grant-1",
 }));
-vi.mock("@cap/database/schema", () => schema);
+
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({ WEB_URL: "https://cap.test" }),
-}));
-vi.mock("drizzle-orm", () => ({
-	and: vi.fn((...parts: unknown[]) => parts),
-	eq: vi.fn((column: unknown, value: unknown) => ({ column, value })),
-	isNull: vi.fn((column: unknown) => ({ column })),
 }));
 vi.mock("next/cache", () => ({
 	revalidatePath: fixtures.revalidatePath,
@@ -156,7 +154,7 @@ describe("recording viewer invitations", () => {
 	);
 
 	it("still accepts 254 characters after trimming and lowercasing", async () => {
-		const email = `${"A".repeat(242)}@Example.com`;
+		const email = `${"A".repeat(64)}@${"b".repeat(63)}.${"c".repeat(63)}.${"d".repeat(61)}`;
 		const result = await inviteVideoViewer(VIDEO_ID, ` ${email} `);
 
 		expect(result.success).toBe(true);

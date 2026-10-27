@@ -13,7 +13,10 @@ export type SupermemoryConversationMessage = {
 	timestamp: string;
 };
 
-const getApiKey = () => serverEnv().SUPERMEMORY_API_KEY;
+const getApiKey = () =>
+	process.env.CAP_RUNTIME === "cloudflare"
+		? undefined
+		: serverEnv().SUPERMEMORY_API_KEY;
 
 let _client: Supermemory | null = null;
 
@@ -101,6 +104,10 @@ export const storeConversationInSupermemory = async ({
 };
 
 export const syncCapKnowledgeBase = async (requestedByEmail: string) => {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap Cloud knowledge synchronization is unavailable on this self-hosted server",
+		);
 	if (requestedByEmail !== MESSENGER_ADMIN_EMAIL) {
 		throw new Error("Unauthorized");
 	}

@@ -1,35 +1,55 @@
-import type { VideoEditSpec } from "@cap/database/types";
-import { User, Video } from "@cap/web-domain";
-import { Effect, Option, Schema } from "effect";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	type CloudflareDatabase,
+	createCloudflareDb,
+} from "@cap/database/cloudflare";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import {
+	createD1BridgeBinding,
+	handleD1BridgeRequest,
+} from "@cap/database/cloudflare/bridge";
+import * as Db from "@cap/database/cloudflare/schema";
+import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
+import { Organisation, S3Bucket, User, Video } from "@cap/web-domain";
+import { eq } from "drizzle-orm";
+import { Effect, Option } from "effect";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
 
 const mocks = vi.hoisted(() => ({
-	db: vi.fn(),
+	database: undefined as CloudflareDatabase | undefined,
 	access: vi.fn(),
 	head: vi.fn(),
-	post: vi.fn(),
-	retire: vi.fn(),
-	env: vi.fn(),
+	target: vi.fn(),
 	fetch: vi.fn(),
-	cloudfront: vi.fn(),
 	auth: vi.fn(),
+	queue: vi.fn(),
 }));
-vi.mock("@cap/database", () => ({ db: mocks.db }));
-vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.auth }));
-vi.mock("@cap/database/schema", () => ({
-	videos: { table: "videos", id: "id" },
-	videoUploads: {
-		table: "uploads",
-		videoId: "videoId",
-		phase: "phase",
-		rawFileKey: "rawFileKey",
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!mocks.database) throw Error("Missing test database");
+		return mocks.database;
 	},
-	videoEdits: { table: "edits" },
-	videoProcessingJobs: { table: "jobs", videoId: "videoId" },
-	comments: { table: "comments" },
 }));
-vi.mock("drizzle-orm", () => ({ and: vi.fn(), eq: vi.fn() }));
-vi.mock("@cap/env", () => ({ serverEnv: mocks.env }));
+vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.auth }));
+vi.mock("@cap/env", () => ({
+	serverEnv: () => ({
+		NEXTAUTH_SECRET: "test-only-desktop-reupload-signing-key",
+		MEDIA_SERVER_URL: "https://media.test",
+		MEDIA_SERVER_WEBHOOK_SECRET: "secret",
+		WEB_URL: "https://cap.test",
+	}),
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "false" },
+	NODE_ENV: "test",
+}));
 vi.mock("@cap/web-backend", () => ({
 	Storage: { getAccessForVideo: mocks.access },
 	AwsCredentials: {},
@@ -37,680 +57,497 @@ vi.mock("@cap/web-backend", () => ({
 vi.mock("@cap/web-backend/src/Storage/index", () => ({
 	Storage: { getAccessForVideo: mocks.access },
 }));
-vi.mock("@cap/web-backend/src/Aws", () => ({ AwsCredentials: {} }));
-vi.mock("workflow", () => ({
-	FatalError: class FatalError extends Error {},
-	sleep: vi.fn(),
+vi.mock("@/lib/server", () => ({ runPromise: Effect.runPromise }));
+vi.mock("@/lib/workflow-runtime", () => ({
+	runWorkflowPromise: Effect.runPromise,
 }));
-vi.mock("@aws-sdk/client-cloudfront", () => ({
-	CloudFrontClient: class {
-		send = mocks.cloudfront;
-	},
-	CreateInvalidationCommand: class {
-		constructor(readonly input: unknown) {}
-	},
+vi.mock("@/lib/queue-video-transcription", () => ({
+	queueVideoTranscription: mocks.queue,
 }));
-vi.mock("@/lib/desktop-recording-jobs", () => ({
-	retireDesktopRecordingJobForOutputReplacement: mocks.retire,
-}));
+vi.mock("@/lib/transcribe", () => ({ transcribeVideo: vi.fn() }));
 vi.mock("@/lib/messenger/constants", () => ({
 	MESSENGER_ADMIN_EMAIL: "admin@cap.test",
 }));
-vi.mock("@/lib/server", async () => ({
-	runPromise: (await import("effect")).Effect.runPromise,
-}));
-vi.mock("@/lib/workflow-runtime", async () => ({
-	runWorkflowPromise: (await import("effect")).Effect.runPromise,
-}));
-vi.mock("@/lib/video-storage", () => ({
-	decodeStorageVideo: (video: unknown) => video,
-}));
-vi.mock("@/lib/edit-transcript-storage", () => ({
-	decryptEditTranscriptObject: () => null,
-}));
-vi.mock("@/lib/generate-ai", () => ({ startAiGeneration: vi.fn() }));
-vi.mock("@/lib/transcribe", () => ({ transcribeVideo: vi.fn() }));
 
 import {
 	getVideoReplaceUploadUrl,
 	invalidateVideoCache,
 } from "@/actions/admin/replace-video";
-import { prepareDesktopReupload } from "@/lib/desktop-reupload";
+import {
+	prepareDesktopReupload,
+	publishDesktopReupload,
+} from "@/lib/desktop-reupload";
 import {
 	createDesktopReuploadKey,
 	createDesktopReuploadToken,
 	decodeDesktopReuploadToken,
 } from "@/lib/desktop-reupload-token";
-import { saveMetadataAndComplete } from "@/workflows/admin-reprocess-video";
+import { decodeStorageVideo } from "@/lib/video-storage";
 import {
 	saveEditResultAndComplete,
 	startMediaServerEditJob,
 	verifyRenderedEditOutput,
 } from "@/workflows/edit-video";
 
-let video: {
-	id: string;
-	ownerId: string;
-	bucket: string | null;
-	storageIntegrationId: string | null;
-	source: {
-		type: string;
-		outputKey?: string;
-		thumbnailKey?: string;
-		previewKey?: string;
-		audioLevelOutputKey?: string;
-		audioLevelSourceKey?: string;
-	};
-	metadata: Record<string, unknown>;
+let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
+let video: typeof Db.videos.$inferSelect;
+let sequence = 0;
+let loseResponse = false;
+const rendered = { duration: 5, width: 320, height: 180, fps: 30 };
+const editSpec = {
+	version: 1 as const,
+	sourceDuration: 10,
+	keepRanges: [{ start: 0, end: 5 }],
 };
-let events: string[];
-let updates: Record<string, unknown>[];
-let reorderSourceKeys: boolean;
 const operation = {
 	token: "11111111-1111-4111-8111-111111111111",
 	startedAt: "2026-09-08T12:00:00.000Z",
 };
-const sourceKey = "user/video/edit-original.mp4";
-let upload: Record<string, unknown>;
-const metadata = { duration: 5, width: 320, height: 180, fps: 30 };
-const editSpec: VideoEditSpec = {
-	version: 1,
-	sourceDuration: 10,
-	keepRanges: [{ start: 0, end: 5 }],
-};
-
-function createClient() {
-	const client = {
-		select() {
-			return {
-				from: (table: { table: string }) => ({
-					where: () => {
-						const rows =
-							table.table === "comments"
-								? []
-								: table.table === "uploads"
-									? [upload]
-									: [video];
-						return Object.assign(Promise.resolve(rows), {
-							for: async () => {
-								events.push(
-									table.table === "jobs"
-										? "lock-job"
-										: table.table === "uploads"
-											? "lock-upload"
-											: "lock-video",
-								);
-								return rows;
-							},
-						});
-					},
-				}),
-			};
-		},
-		update(table: { table: string }) {
-			return {
-				set: (values: Record<string, unknown>) => ({
-					where: async () => {
-						events.push(`update-${table.table}`);
-						if (table.table === "videos") {
-							updates.push(values);
-							Object.assign(video, values);
-							if (values.source && reorderSourceKeys) {
-								video.source = Object.assign(
-									{ type: video.source.type },
-									Object.fromEntries(Object.entries(video.source).reverse()),
-								);
-							}
-						}
-						return [{ affectedRows: 1 }];
-					},
-				}),
-			};
-		},
-		insert() {
-			return {
-				values: () => ({
-					onDuplicateKeyUpdate: async () => [{ affectedRows: 1 }],
-				}),
-			};
-		},
-		delete(table: { table: string }) {
-			return {
-				where: async () => {
-					events.push(`delete-${table.table}`);
-					return [{ affectedRows: 1 }];
-				},
-			};
-		},
-	};
-	return {
-		...client,
-		transaction: async (callback: (tx: typeof client) => Promise<unknown>) => {
-			events.push("transaction");
-			return callback(client);
-		},
-	};
-}
-
-beforeEach(() => {
-	reorderSourceKeys = false;
-	video = {
-		id: "video",
-		ownerId: "user",
-		bucket: null,
-		storageIntegrationId: null,
+beforeAll(async () => {
+	runtime = await createTestDatabase();
+	mocks.database = createCloudflareDb(
+		createD1BridgeBinding({
+			fetch: async (request) => {
+				const payload = (await request.clone().json()) as { operation: string };
+				const response = await handleD1BridgeRequest(request, runtime.binding);
+				if (payload.operation === "batch" && loseResponse && response.ok) {
+					loseResponse = false;
+					throw new Error("Committed publication response lost");
+				}
+				return response;
+			},
+		}),
+	);
+}, 60000);
+afterAll(async () => runtime?.dispose());
+afterEach(() => vi.unstubAllGlobals());
+beforeEach(async () => {
+	vi.clearAllMocks();
+	const suffix = String(++sequence),
+		ownerId = User.UserId.make(`o${suffix}`),
+		orgId = Organisation.OrganisationId.make(`org${suffix}`),
+		id = Video.VideoId.make(`v${suffix}`);
+	await runtime.database.insert(Db.users).values({
+		id: ownerId,
+		email: `${suffix}@replacement.test`,
+		activeOrganizationId: orgId,
+	});
+	await runtime.database
+		.insert(Db.organizations)
+		.values({ id: orgId, ownerId, name: "Team" });
+	await runtime.database.insert(Db.videos).values({
+		id,
+		ownerId,
+		orgId,
 		source: {
 			type: "desktopMP4",
-			outputKey: "user/video/.recording/outputs/generation/attempt.mp4",
+			outputKey: `${ownerId}/${id}/.recording/outputs/old.mp4`,
 			thumbnailKey: "old-thumbnail",
 			previewKey: "old-preview",
 		},
 		metadata: {
-			desktopRecordingUpload: { fullDecode: true },
 			customCreatedAt: "2020-01-01T00:00:00Z",
 			summary: "old summary",
 		},
-	};
-	upload = {
-		phase: "complete",
-		startedAt: new Date(operation.startedAt),
-		rawFileKey: sourceKey,
-	};
-	events = [];
-	updates = [];
-	mocks.db.mockReturnValue(createClient());
-	mocks.head.mockImplementation(() => {
-		events.push("head-canonical");
-		return Effect.succeed({ ETag: '"new-output"', ContentLength: 1000 });
 	});
-	mocks.post.mockReturnValue(
+	video = await readVideo();
+	mocks.auth.mockResolvedValue({ id: "admin", email: "admin@cap.test" });
+	mocks.queue.mockImplementation(async () => {
+		await runtime.database
+			.update(Db.videos)
+			.set({ transcriptionStatus: "PROCESSING" })
+			.where(eq(Db.videos.id, video.id));
+	});
+	mocks.head.mockReturnValue(
+		Effect.succeed({ ETag: '"new-output"', ContentLength: 1000 }),
+	);
+	mocks.target.mockReturnValue(
 		Effect.succeed({
+			type: "put",
 			url: "https://storage.test/upload",
-			fields: { key: "user/video/result.mp4" },
+			headers: { "Content-Type": "video/mp4" },
 		}),
 	);
-	mocks.access.mockImplementation(
-		(_video, options?: { resolvePublishedOutput?: boolean }) =>
-			Effect.succeed([
-				{
-					headObject: mocks.head,
-					getPresignedPostUrl: mocks.post,
-					getInternalSignedObjectUrl: (key: string) =>
-						Effect.succeed(
-							`https://storage.test/${options?.resolvePublishedOutput === false ? "canonical" : "published"}/${key}`,
-						),
-					getObject: () => Effect.succeed(Option.none()),
-					listObjects: () => Effect.succeed({ Contents: [] }),
-				},
-			]),
-	);
-	mocks.retire.mockImplementation(async () => {
-		events.push("retire-job");
-	});
-	mocks.env.mockReturnValue({
-		NEXTAUTH_SECRET: "test-only-desktop-reupload-signing-key",
-		MEDIA_SERVER_URL: "https://media.test",
-		MEDIA_SERVER_WEBHOOK_SECRET: "secret",
-		WEB_URL: "https://cap.test",
-	});
-	mocks.auth.mockResolvedValue({ id: "admin", email: "admin@cap.test" });
-	mocks.fetch.mockResolvedValue(Response.json({ metadata }));
-	vi.stubGlobal("fetch", mocks.fetch);
-});
-
-afterEach(() => vi.unstubAllGlobals());
-
-describe("desktop reupload publication", () => {
-	const original = () => ({
-		id: Video.VideoId.make(video.id),
-		ownerId: User.UserId.make(video.ownerId),
-		bucketId: Option.none(),
-		storageIntegrationId: Option.none(),
-		source: Schema.decodeUnknownSync(Video.Video.fields.source)(video.source),
-	});
-	const tokenFor = (snapshot = original()) => {
-		const token = decodeDesktopReuploadToken(
-			createDesktopReuploadToken(snapshot, {
-				uploadId: "provider-upload-id",
+	mocks.access.mockImplementation((_video, options) =>
+		Effect.succeed([
+			{
 				provider: "s3",
-				outputKey: createDesktopReuploadKey(snapshot),
-			}),
-		);
-		if (!token) throw new Error("Expected a replacement token");
-		upload.rawFileKey = token.outputKey;
-		return token;
-	};
-	const transaction = () =>
-		createClient() as unknown as Parameters<typeof prepareDesktopReupload>[0];
+				headObject: mocks.head,
+				createUploadTarget: mocks.target,
+				getObject: () => Effect.succeed(Option.none()),
+				listObjects: () => Effect.succeed({ Contents: [] }),
+				getInternalSignedObjectUrl: (key: string) =>
+					Effect.succeed(
+						`https://storage.test/${options?.resolvePublishedOutput === false ? "canonical" : "published"}/${key}`,
+					),
+			},
+		]),
+	);
+	mocks.fetch.mockResolvedValue(Response.json({ metadata: rendered }));
+	vi.stubGlobal("fetch", mocks.fetch);
+	async function readVideo() {
+		const [row] = await runtime.database
+			.select()
+			.from(Db.videos)
+			.where(eq(Db.videos.id, id));
+		if (!row) throw Error("Missing fixture");
+		return row;
+	}
+});
+async function current() {
+	const [row] = await runtime.database
+		.select()
+		.from(Db.videos)
+		.where(eq(Db.videos.id, video.id));
+	if (!row) throw Error("Missing video");
+	return row;
+}
+async function change(values: Partial<typeof Db.videos.$inferInsert>) {
+	await runtime.database
+		.update(Db.videos)
+		.set(values)
+		.where(eq(Db.videos.id, video.id));
+	video = await current();
+}
+async function replacement() {
+	const original = decodeStorageVideo(video),
+		outputKey = createDesktopReuploadKey(original);
+	const token = decodeDesktopReuploadToken(
+		createDesktopReuploadToken(original, {
+			uploadId: "provider-upload",
+			provider: "s3",
+			outputKey,
+		}),
+	);
+	if (!token) throw Error("Missing token");
+	await runtime.database
+		.insert(Db.videoUploads)
+		.values({ videoId: video.id, rawFileKey: outputKey });
+	return { original, token };
+}
+async function plan(
+	original: Parameters<typeof prepareDesktopReupload>[1],
+	token: Parameters<typeof prepareDesktopReupload>[2],
+) {
+	const invalidation = createTranscriptInvalidation();
+	return atomic(runtime.database, async (snapshot) => ({
+		statements: [],
+		result: await prepareDesktopReupload(
+			snapshot,
+			original,
+			token,
+			invalidation,
+		),
+	}));
+}
 
-	it("replaces processed playback and stale AI while preserving the link's other metadata", async () => {
-		video.source.audioLevelOutputKey =
-			"user/video/.recording/outputs/old-audio.mp4";
-		video.metadata.editProcessing = { token: "old-edit" };
-		video.metadata.completedVideoEdit = { token: "completed-edit" };
-		video.metadata.chapters = [{ title: "old chapter" }];
-		video.metadata.aiGenerationStatus = "complete";
-		const before = structuredClone(video);
-		const snapshot = original();
-		const token = tokenFor(snapshot);
-		const tx = transaction();
-		const replacement = await prepareDesktopReupload(tx, snapshot, token);
-		expect(replacement).toEqual({
+describe("desktop reupload publication on D1", () => {
+	it("plans media and transcript invalidation without changing stored playback", async () => {
+		const before = await current();
+		const { original, token } = await replacement();
+		const result = await plan(original, token);
+		expect(result).toMatchObject({
 			source: { type: "desktopMP4", outputKey: token.outputKey },
-			metadata: { customCreatedAt: "2020-01-01T00:00:00Z" },
+			metadata: {
+				customCreatedAt: "2020-01-01T00:00:00Z",
+				transcriptPublication: { vtt: false, edit: false },
+			},
 			transcriptionStatus: null,
 		});
-		expect(video).toEqual(before);
-		expect(events).toEqual([
-			"lock-job",
-			"lock-video",
-			"lock-upload",
-			"retire-job",
-		]);
-		expect(mocks.retire).toHaveBeenCalledWith(tx, {
-			videoId: "video",
-			userId: "user",
-		});
+		expect(result?.metadata).not.toHaveProperty("summary");
+		expect(await current()).toEqual(before);
 		expect(mocks.head).not.toHaveBeenCalled();
-		expect(mocks.access).not.toHaveBeenCalled();
 	});
-
-	it.each(["desktopSegments", "webMP4"])(
-		"publishes a %s replacement with its immutable MP4 key",
+	it.each(["desktopSegments", "webMP4"] as const)(
+		"publishes a %s replacement",
 		async (type) => {
-			video.source = { type };
-			const replacement = await prepareDesktopReupload(
-				transaction(),
-				original(),
-				tokenFor(),
-			);
-			expect(replacement?.source.type).toBe(
-				type === "webMP4" ? "webMP4" : "desktopMP4",
-			);
-			expect(replacement?.source.outputKey).toContain(
-				"user/video/.recording/outputs/reupload-",
-			);
+			await change({ source: { type } });
+			const { original, token } = await replacement();
+			await publishDesktopReupload(runtime.database, original, token);
+			expect((await current()).source).toEqual({
+				type: type === "webMP4" ? "webMP4" : "desktopMP4",
+				outputKey: token.outputKey,
+			});
 		},
 	);
-
 	it.each(["bucket", "storageIntegrationId", "ownerId"] as const)(
-		"rejects publication if %s changed during upload before retiring any job",
+		"rejects changed %s before publication",
 		async (field) => {
-			const snapshot = original();
-			const token = tokenFor(snapshot);
-			video[field] = "different-identity";
-			const before = structuredClone(video);
-			await expect(
-				prepareDesktopReupload(transaction(), snapshot, token),
-			).rejects.toThrow("storage changed");
-			expect(video).toEqual(before);
-			expect(updates).toEqual([]);
-			expect(events).toEqual(["lock-job", "lock-video"]);
-			expect(mocks.retire).not.toHaveBeenCalled();
+			const { original, token } = await replacement();
+			if (field === "storageIntegrationId")
+				await runtime.binding
+					.prepare(
+						"INSERT INTO storage_integrations (id, ownerId, provider, displayName, encryptedConfig) VALUES (?, ?, 'googleDrive', 'Changed storage', '{}')",
+					)
+					.bind("changed", video.ownerId)
+					.run();
+			await change({ [field]: "changed" });
+			const before = await current();
+			await expect(plan(original, token)).rejects.toThrow("storage changed");
+			expect(await current()).toEqual(before);
 		},
 	);
-
 	it.each([null, "newer-upload"])(
-		"rejects canceled or superseded upload %s under the lock",
+		"rejects a canceled or superseded upload %s",
 		async (rawFileKey) => {
-			const snapshot = original();
-			const token = tokenFor(snapshot);
-			upload.rawFileKey = rawFileKey;
-			const before = structuredClone(video);
-			await expect(
-				prepareDesktopReupload(transaction(), snapshot, token),
-			).rejects.toThrow("canceled or superseded");
-			expect(video).toEqual(before);
-			expect(mocks.retire).not.toHaveBeenCalled();
-			expect(events).toEqual(["lock-job", "lock-video", "lock-upload"]);
+			const { original, token } = await replacement();
+			await runtime.database
+				.update(Db.videoUploads)
+				.set({ rawFileKey })
+				.where(eq(Db.videoUploads.videoId, video.id));
+			await expect(plan(original, token)).rejects.toThrow(
+				"canceled or superseded",
+			);
 		},
 	);
-	it("rejects an older upload completion after another publication", async () => {
-		const snapshot = original();
-		const token = tokenFor(snapshot);
-		video.source.outputKey = "user/video/.recording/outputs/newer/result.mp4";
-		const before = structuredClone(video);
-		await expect(
-			prepareDesktopReupload(transaction(), snapshot, token),
-		).rejects.toThrow("source changed");
-		expect(video).toEqual(before);
-		expect(mocks.retire).not.toHaveBeenCalled();
+	it("rejects an old completion after another source publication", async () => {
+		const { original, token } = await replacement();
+		await change({ source: { type: "desktopMP4", outputKey: "newer.mp4" } });
+		await expect(plan(original, token)).rejects.toThrow("source changed");
 	});
-
-	it("compares normalized source fields under the lock", async () => {
-		const snapshot = original();
-		const token = tokenFor(snapshot);
-		video.source = Object.assign(
-			{ type: video.source.type },
-			Object.fromEntries(Object.entries(video.source).reverse()),
-			{ legacyExtra: "ignored by Video.source" },
-		);
-		await expect(
-			prepareDesktopReupload(transaction(), snapshot, token),
-		).resolves.toMatchObject({ source: { outputKey: token.outputKey } });
-		expect(events).toEqual([
-			"lock-job",
-			"lock-video",
-			"lock-upload",
-			"retire-job",
-		]);
+	it("normalizes source field ordering", async () => {
+		const { original, token } = await replacement();
+		await change({
+			source: JSON.parse(
+				JSON.stringify(
+					Object.fromEntries(Object.entries(video.source).reverse()),
+				),
+			),
+		});
+		expect(await plan(original, token)).toMatchObject({
+			source: { outputKey: token.outputKey },
+		});
 	});
-
-	it("returns no update for the exact already-published attempt without retiring a new job", async () => {
-		const snapshot = original();
-		const token = tokenFor(snapshot);
-		video.source = { type: "desktopMP4", outputKey: token.outputKey };
-		video.metadata.summary = "new summary";
-		const before = structuredClone(video);
-		await expect(
-			prepareDesktopReupload(transaction(), snapshot, token),
-		).resolves.toBeNull();
-		expect(video).toEqual(before);
-		expect(events).toEqual(["lock-job", "lock-video"]);
-		expect(mocks.retire).not.toHaveBeenCalled();
-		expect(updates).toEqual([]);
+	it("replays the committed publication without rotating its transcript or retired generation", async () => {
+		const { original, token } = await replacement();
+		expect(
+			await publishDesktopReupload(runtime.database, original, token),
+		).toBe(true);
+		const before = await current();
+		const jobs = await runtime.database
+			.select()
+			.from(Db.videoProcessingJobs)
+			.where(eq(Db.videoProcessingJobs.videoId, video.id));
+		expect(
+			await publishDesktopReupload(runtime.database, original, token),
+		).toBe(false);
+		expect(await current()).toEqual(before);
+		expect(
+			await runtime.database
+				.select()
+				.from(Db.videoProcessingJobs)
+				.where(eq(Db.videoProcessingJobs.videoId, video.id)),
+		).toEqual(jobs);
 	});
-
-	it("still validates storage on an already-published retry", async () => {
-		const snapshot = original();
-		const token = tokenFor(snapshot);
-		video.source = { type: "desktopMP4", outputKey: token.outputKey };
-		video.bucket = "changed-bucket";
+	it("still validates storage for already-published retries", async () => {
+		const { original, token } = await replacement();
+		await publishDesktopReupload(runtime.database, original, token);
+		await change({ bucket: S3Bucket.S3BucketId.make("changed") });
 		await expect(
-			prepareDesktopReupload(transaction(), snapshot, token),
+			publishDesktopReupload(runtime.database, original, token),
 		).rejects.toThrow("storage changed");
-		expect(mocks.retire).not.toHaveBeenCalled();
 	});
-
-	it("leaves the publication and metadata intact if retiring the job fails", async () => {
-		const before = structuredClone(video);
-		mocks.retire.mockImplementationOnce(async () => {
-			events.push("retire-job");
-			throw new Error("Job retirement failed");
-		});
+	it("rolls back the retirement when publication fails in the same D1 batch", async () => {
+		const { original, token } = await replacement();
+		const before = await current();
+		await runtime.binding
+			.prepare(
+				`CREATE TRIGGER fail_replacement BEFORE UPDATE ON videos WHEN NEW.id = '${video.id}' BEGIN SELECT RAISE(ABORT,'publication failure'); END`,
+			)
+			.run();
+		try {
+			await expect(
+				publishDesktopReupload(runtime.database, original, token),
+			).rejects.toThrow();
+		} finally {
+			await runtime.binding.prepare("DROP TRIGGER fail_replacement").run();
+		}
+		expect(await current()).toEqual(before);
+		expect(
+			await runtime.database
+				.select()
+				.from(Db.videoProcessingJobs)
+				.where(eq(Db.videoProcessingJobs.videoId, video.id)),
+		).toEqual([]);
+	});
+	it("rejects tombstoned organizations without publishing", async () => {
+		const { original, token } = await replacement();
+		await runtime.database
+			.update(Db.organizations)
+			.set({ tombstoneAt: new Date() })
+			.where(eq(Db.organizations.id, video.orgId));
 		await expect(
-			prepareDesktopReupload(transaction(), original(), tokenFor()),
-		).rejects.toThrow("Job retirement failed");
-		expect(video).toEqual(before);
-		expect(updates).toEqual([]);
-		expect(events).toEqual([
-			"lock-job",
-			"lock-video",
-			"lock-upload",
-			"retire-job",
-		]);
-	});
-
-	it("keeps job retirement inside the caller's publication transaction", async () => {
-		const before = structuredClone(video);
-		const retainedJob = {
-			generation: "original-generation",
-			state: "complete",
-			sourceKey: "user/video/original-source.mp4",
-			outputKey: video.source.outputKey,
-		};
-		let job = { ...retainedJob };
-		const tx = transaction();
-		mocks.retire.mockImplementationOnce(async (owner) => {
-			expect(owner).toBe(tx);
-			events.push("retire-job");
-			job = {
-				...job,
-				generation: "retired-generation",
-				state: "source-blocked",
-			};
-		});
-		const publishTransaction = async () => {
-			events.push("transaction");
-			const savedVideo = structuredClone(video);
-			const savedJob = { ...job };
-			try {
-				const replacement = await prepareDesktopReupload(
-					tx,
-					original(),
-					tokenFor(),
-				);
-				expect(replacement).not.toBeNull();
-				expect(job.state).toBe("source-blocked");
-				Object.assign(video, replacement);
-				events.push("publication-failed");
-				throw new Error("Publication failed");
-			} catch (error) {
-				video = savedVideo;
-				job = savedJob;
-				events.push("rollback");
-				throw error;
-			}
-		};
-		await expect(publishTransaction()).rejects.toThrow("Publication failed");
-		expect(video).toEqual(before);
-		expect(job).toEqual(retainedJob);
-		expect(events).toEqual([
-			"transaction",
-			"lock-job",
-			"lock-video",
-			"lock-upload",
-			"retire-job",
-			"publication-failed",
-			"rollback",
-		]);
+			publishDesktopReupload(runtime.database, original, token),
+		).rejects.toThrow();
+		expect((await current()).source).toEqual(video.source);
 	});
 });
 
 describe("edited recording publication", () => {
-	it.each(["reprocess", "replace"])(
-		"clears a browser audio derivative after %s",
-		async (operation) => {
-			video.source = {
-				type: "webMP4",
-				audioLevelSourceKey: "user/video/result.mp4",
-				audioLevelOutputKey:
-					"user/video/.recording/outputs/audio-quality-v3/test.mp4",
-			};
-			if (operation === "reprocess")
-				await saveMetadataAndComplete("video", metadata);
-			else await invalidateVideoCache("video");
-			expect(video.source).toEqual({ type: "webMP4" });
-		},
-	);
-	it.each(["desktopMP4", "webMP4"])(
-		"clears the previous audio derivative when publishing a %s edit",
+	it.each(["desktopMP4", "webMP4"] as const)(
+		"clears stale %s audio derivatives atomically and replays the edit",
 		async (type) => {
-			video.source = {
+			const source = {
 				type,
-				...(type === "desktopMP4"
-					? {
-							outputKey: "user/video/.recording/outputs/generation/attempt.mp4",
-						}
-					: {}),
-				audioLevelSourceKey:
-					type === "desktopMP4"
-						? "user/video/.recording/outputs/generation/attempt.mp4"
-						: "user/video/result.mp4",
-				audioLevelOutputKey:
-					"user/video/.recording/outputs/audio-quality-v3/test.mp4",
+				audioLevelSourceKey: "old.mp4",
+				audioLevelOutputKey: "audio.mp4",
 			};
-			video.metadata.editProcessing = {
-				...operation,
-				ownerId: video.ownerId,
-				bucket: video.bucket,
-				storageIntegrationId: video.storageIntegrationId,
-				sourceKey,
-				source: JSON.stringify(video.source),
-				dispatch: "accepted",
-			};
+			const sourceKey = `${video.ownerId}/${video.id}/edit-original.mp4`;
+			await change({
+				source,
+				metadata: {
+					customCreatedAt: "2020-01-01T00:00:00Z",
+					editProcessing: {
+						...operation,
+						ownerId: video.ownerId,
+						bucket: null,
+						storageIntegrationId: null,
+						sourceKey,
+						source: JSON.stringify(source),
+						dispatch: "accepted",
+					},
+				},
+			});
+			await runtime.database.insert(Db.videoUploads).values({
+				videoId: video.id,
+				rawFileKey: sourceKey,
+				startedAt: new Date(operation.startedAt),
+				phase: "complete",
+			});
 			await saveEditResultAndComplete(
-				"video",
+				video.id,
 				sourceKey,
 				editSpec,
 				editSpec,
-				metadata,
+				rendered,
 				operation,
 			);
-			expect(video.source).toEqual({
+			const result = await current();
+			expect(result.source).toMatchObject({
 				type,
-				outputKey: `user/video/.recording/outputs/edit-${operation.token}/result.mp4`,
-				thumbnailKey: `user/video/.recording/outputs/edit-${operation.token}/thumbnail.jpg`,
-				previewKey: `user/video/.recording/outputs/edit-${operation.token}/preview.gif`,
+				outputKey: `${video.ownerId}/${video.id}/.recording/outputs/edit-${operation.token}/result.mp4`,
 			});
-			expect(video.metadata.completedVideoEdit).toMatchObject(operation);
+			expect(result.source).not.toHaveProperty("audioLevelOutputKey");
+			expect(result.metadata?.customCreatedAt).toBe("2020-01-01T00:00:00Z");
+			await saveEditResultAndComplete(
+				video.id,
+				sourceKey,
+				editSpec,
+				editSpec,
+				rendered,
+				operation,
+			);
+			expect(await current()).toEqual(result);
 		},
 	);
-	it("verifies the newly rendered canonical output instead of the old published immutable recording", async () => {
-		await verifyRenderedEditOutput("video", "user", editSpec, metadata);
-		expect(mocks.access).toHaveBeenCalledWith(video, {
-			resolvePublishedOutput: false,
-		});
-		expect(mocks.fetch).toHaveBeenCalledWith(
-			"https://media.test/video/probe",
-			expect.objectContaining({
-				body: JSON.stringify({
-					videoUrl: "https://storage.test/canonical/user/video/result.mp4",
+	it.each([undefined, operation])(
+		"probes the selected edit output instead of previous published media: %j",
+		async (edit) => {
+			await verifyRenderedEditOutput(
+				video.id,
+				video.ownerId,
+				editSpec,
+				rendered,
+				edit,
+			);
+			const key = edit
+				? `${video.ownerId}/${video.id}/.recording/outputs/edit-${operation.token}/result.mp4`
+				: `${video.ownerId}/${video.id}/result.mp4`;
+			expect(mocks.fetch).toHaveBeenCalledWith(
+				"https://media.test/video/probe",
+				expect.objectContaining({
+					body: JSON.stringify({
+						videoUrl: `https://storage.test/canonical/${key}`,
+					}),
 				}),
-			}),
-		);
-	});
-
-	it("verifies the current edit output independently of the published video", async () => {
-		await verifyRenderedEditOutput(
-			"video",
-			"user",
-			editSpec,
-			metadata,
-			operation,
-		);
-		expect(mocks.fetch).toHaveBeenCalledWith(
-			"https://media.test/video/probe",
-			expect.objectContaining({
-				body: JSON.stringify({
-					videoUrl: `https://storage.test/canonical/user/video/.recording/outputs/edit-${operation.token}/result.mp4`,
-				}),
-			}),
-		);
-	});
-
-	it.each([false, true])(
-		"publishes a completed edit atomically with reordered JSON keys: %s",
-		async (reorder) => {
-			reorderSourceKeys = reorder;
-			video.metadata.editProcessing = {
-				...operation,
-				ownerId: video.ownerId,
-				bucket: video.bucket,
-				storageIntegrationId: video.storageIntegrationId,
-				sourceKey,
-				source: JSON.stringify(video.source),
-				dispatch: "accepted",
-			};
-			await saveEditResultAndComplete(
-				"video",
-				"user/video/edit-original.mp4",
-				editSpec,
-				editSpec,
-				metadata,
-				operation,
 			);
-			expect(video.source).toEqual({
-				type: "desktopMP4",
-				outputKey: `user/video/.recording/outputs/edit-${operation.token}/result.mp4`,
-				thumbnailKey: `user/video/.recording/outputs/edit-${operation.token}/thumbnail.jpg`,
-				previewKey: `user/video/.recording/outputs/edit-${operation.token}/preview.gif`,
-			});
-			expect(video.metadata).not.toHaveProperty("desktopRecordingUpload");
-			expect(video.metadata.customCreatedAt).toBe("2020-01-01T00:00:00Z");
-			expect(events.indexOf("lock-job")).toBeLessThan(
-				events.indexOf("lock-video"),
-			);
-			expect(events.indexOf("lock-video")).toBeLessThan(
-				events.indexOf("update-videos"),
-			);
-			const before = events.length;
-			await saveEditResultAndComplete(
-				"video",
-				sourceKey,
-				editSpec,
-				editSpec,
-				metadata,
-				operation,
-			);
-			expect(events).toHaveLength(before);
 		},
 	);
-
-	it("checks a reprocessed canonical object before clearing its previous immutable publication", async () => {
-		await saveMetadataAndComplete("video", metadata);
-		expect(mocks.access).toHaveBeenCalledWith(expect.any(Object), {
-			resolvePublishedOutput: false,
-		});
-		expect(events.indexOf("head-canonical")).toBeLessThan(
-			events.indexOf("retire-job"),
-		);
-		expect(video.source).toEqual({ type: "desktopMP4" });
-		expect(video.metadata).not.toHaveProperty("desktopRecordingUpload");
-	});
-
-	it("retains the published recording when reprocessing did not produce a usable object", async () => {
-		mocks.head.mockReturnValue(
-			Effect.succeed({ ETag: '"empty"', ContentLength: 0 }),
-		);
-		await expect(saveMetadataAndComplete("video", metadata)).rejects.toThrow(
-			"missing or empty",
-		);
-		expect(updates).toEqual([]);
-		expect(mocks.retire).not.toHaveBeenCalled();
-		expect(video.source.outputKey).toBeDefined();
-	});
 });
 
 describe("intentional administrator replacements", () => {
-	it("publishes the replacement even when CloudFront is not configured", async () => {
-		await invalidateVideoCache("video");
-		expect(video.source).toEqual({ type: "desktopMP4" });
-		expect(video.metadata).not.toHaveProperty("desktopRecordingUpload");
-		expect(events).toContain("delete-uploads");
-		expect(mocks.cloudfront).not.toHaveBeenCalled();
+	it("resumes transcription after a lost publication response without republishing", async () => {
+		const prepared = await getVideoReplaceUploadUrl(video.id);
+		loseResponse = true;
+		await expect(
+			invalidateVideoCache(video.id, prepared.replacementToken),
+		).rejects.toThrow("response lost");
+		const committed = await current();
+		expect(mocks.queue).not.toHaveBeenCalled();
+		await invalidateVideoCache(video.id, prepared.replacementToken);
+		const resumed = await current();
+		expect(resumed.source).toEqual(committed.source);
+		expect(resumed.metadata).toEqual(committed.metadata);
+		expect(mocks.queue).toHaveBeenCalledOnce();
 	});
-
-	it("publishes replacements in custom storage before the cache bypass return", async () => {
-		video.bucket = "custom-bucket";
-		mocks.env.mockReturnValue({
-			CAP_CLOUDFRONT_DISTRIBUTION_ID: "distribution",
-		});
-		await invalidateVideoCache("video");
-		expect(video.source).toEqual({ type: "desktopMP4" });
-		expect(mocks.retire).toHaveBeenCalledOnce();
-		expect(mocks.cloudfront).not.toHaveBeenCalled();
-	});
-
-	it("leaves the published recording and receipt untouched if the replacement has not uploaded", async () => {
+	it.each(["desktopMP4", "desktopSegments", "webMP4"] as const)(
+		"publishes %s with an immutable token and no CloudFront dependency",
+		async (type) => {
+			await change({
+				source: {
+					type,
+					audioLevelSourceKey: "old.mp4",
+					audioLevelOutputKey: "audio.mp4",
+				},
+			});
+			const before = await current();
+			const prepared = await getVideoReplaceUploadUrl(video.id);
+			expect(await current()).toEqual(before);
+			const token = decodeDesktopReuploadToken(prepared.replacementToken);
+			expect(token).not.toBeNull();
+			expect(mocks.target).toHaveBeenCalledWith(
+				token?.outputKey,
+				expect.objectContaining({ method: "put", ifNoneMatch: "*" }),
+			);
+			await invalidateVideoCache(video.id, prepared.replacementToken);
+			const result = await current();
+			expect(result.source).toEqual({
+				type: type === "webMP4" ? "webMP4" : "desktopMP4",
+				outputKey: token?.outputKey,
+			});
+			expect(mocks.queue).toHaveBeenCalledOnce();
+			await invalidateVideoCache(video.id, prepared.replacementToken);
+			expect(mocks.queue).toHaveBeenCalledOnce();
+			expect(await current()).toEqual(result);
+		},
+	);
+	it("preserves playback if the new object is empty", async () => {
+		const prepared = await getVideoReplaceUploadUrl(video.id);
 		mocks.head.mockReturnValue(Effect.succeed({ ContentLength: 0 }));
-		await expect(invalidateVideoCache("video")).rejects.toThrow(
-			"not finished uploading",
-		);
-		expect(updates).toEqual([]);
-		expect(mocks.retire).not.toHaveBeenCalled();
-		expect(video.metadata).toHaveProperty("desktopRecordingUpload");
+		await expect(
+			invalidateVideoCache(video.id, prepared.replacementToken),
+		).rejects.toThrow("not finished uploading");
+		expect((await current()).source).toEqual(video.source);
 	});
-
-	it("moves an explicitly replaced segmented recording to its real MP4 output", async () => {
-		video.source = { type: "desktopSegments" };
-		await invalidateVideoCache("video");
-		expect(video.source).toEqual({ type: "desktopMP4" });
-	});
-
-	it("prepares replacement writes against the recording storage without retiring the current publication early", async () => {
-		await getVideoReplaceUploadUrl("video");
-		expect(mocks.access).toHaveBeenCalledWith(video, {
-			resolvePublishedOutput: false,
-		});
-		expect(mocks.post).toHaveBeenCalledWith(
-			"user/video/result.mp4",
-			expect.any(Object),
+	it("rolls back its upload reservation on signing failure", async () => {
+		mocks.target.mockReturnValue(Effect.fail(new Error("Signing unavailable")));
+		await expect(getVideoReplaceUploadUrl(video.id)).rejects.toThrow(
+			"Signing unavailable",
 		);
-		expect(mocks.retire).not.toHaveBeenCalled();
+		expect(
+			await runtime.database
+				.select()
+				.from(Db.videoUploads)
+				.where(eq(Db.videoUploads.videoId, video.id)),
+		).toEqual([]);
+		expect((await current()).source).toEqual(video.source);
+	});
+	it("rejects concurrent replacement reservation and changed ownership", async () => {
+		const results = await Promise.allSettled([
+			getVideoReplaceUploadUrl(video.id),
+			getVideoReplaceUploadUrl(video.id),
+		]);
+		expect(
+			results.filter((result) => result.status === "fulfilled"),
+		).toHaveLength(1);
+		const result = results.find((value) => value.status === "fulfilled");
+		if (result?.status !== "fulfilled") throw Error("No accepted replacement");
+		await change({ ownerId: User.UserId.make("another-owner") });
+		await expect(
+			invalidateVideoCache(video.id, result.value.replacementToken),
+		).rejects.toThrow();
 	});
 });
-
 describe("edit dispatch acceptance", () => {
 	it("retries only an explicit capacity rejection", async () => {
 		mocks.fetch.mockResolvedValue(

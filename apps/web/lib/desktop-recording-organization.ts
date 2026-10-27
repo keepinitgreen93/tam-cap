@@ -1,4 +1,5 @@
 import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
 import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	organizationMembers,
@@ -58,6 +59,7 @@ export function ensureRecordingOrganization(
 		);
 		if (member)
 			return { statements: [], result: { ...member, created: false } };
+		await requireWorkspaceAccount(snapshot, userId);
 		return {
 			statements: [
 				database.insert(organizations).values({

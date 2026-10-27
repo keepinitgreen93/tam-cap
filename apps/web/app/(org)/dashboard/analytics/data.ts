@@ -1,6 +1,6 @@
 import { db } from "@cap/database/cloudflare/application";
 import { comments, spaceVideos, videos } from "@cap/database/cloudflare/schema";
-import { Tinybird } from "@cap/web-backend";
+import { Analytics } from "@cap/web-backend";
 import { and, between, eq } from "drizzle-orm";
 import { type SQL, sql } from "drizzle-orm/sql";
 import { Effect } from "effect";
@@ -25,7 +25,7 @@ type ViewSeriesRow = { bucket: string; views: number };
 type BreakdownSourceRow = { name: string; views: number; subtitle?: string };
 type TopCapRow = { videoId: string; views: number };
 
-type TinybirdAnalyticsData = {
+type AnalyticsData = {
 	viewSeries: ViewSeriesRow[];
 	countries: BreakdownSourceRow[];
 	cities: BreakdownSourceRow[];
@@ -51,22 +51,6 @@ const LIFETIME_FALLBACK_DAYS = 30;
 // Escape backslashes BEFORE quotes: ClickHouse honors C-style `\'` inside
 // single-quoted literals, so doubling quotes alone lets a trailing backslash
 // neutralise the doubled quote and break out of the string (SQL injection).
-const escapeLiteral = (value: string) =>
-	value.replace(/\\/g, "\\\\").replace(/'/g, "''");
-const toDateString = (date: Date) => date.toISOString().slice(0, 10);
-const toDateTimeString = (date: Date) =>
-	date.toISOString().slice(0, 19).replace("T", " ");
-
-const buildPathnameFilter = (spaceVideoIds?: VideoId[]): string => {
-	if (!spaceVideoIds || spaceVideoIds.length === 0) {
-		return "";
-	}
-	const pathnames = spaceVideoIds
-		.map((id) => `'/s/${escapeLiteral(id)}'`)
-		.join(", ");
-	return `AND pathname IN (${pathnames})`;
-};
-
 const normalizeBucket = (
 	input: string | null | undefined,
 	bucket: "hour" | "day",
@@ -78,7 +62,6 @@ const normalizeBucket = (
 };
 
 const formatBucketTimestamp = (value: Date) =>
-	// Strip milliseconds so we can string-compare with MySQL/Tinybird buckets
 	`${value.toISOString().slice(0, 19)}Z`;
 
 const buildBuckets = (from: Date, to: Date, bucket: "hour" | "day") => {
@@ -136,35 +119,6 @@ const resolveRangeBounds = async (
 	const from = new Date(to.getTime() - config.hours * 60 * 60 * 1000);
 	return { from, to, bucket: config.bucket };
 };
-
-const fallbackIfEmpty = <Row>(
-	primary: Effect.Effect<Row[], never, never>,
-	fallback?: Effect.Effect<Row[], never, never>,
-) =>
-	fallback
-		? primary.pipe(
-				Effect.flatMap((rows: Row[]) =>
-					rows.length > 0 ? Effect.succeed(rows) : fallback,
-				),
-			)
-		: primary;
-
-const withTinybirdFallback = <Row>(
-	effect: Effect.Effect<unknown, unknown, never>,
-) =>
-	effect.pipe(
-		Effect.catchAll((e: unknown) => {
-			console.error("tinybird query error", e);
-			return Effect.succeed<{ data: Row[] }>({ data: [] as Row[] });
-		}),
-		Effect.map((res: unknown) => {
-			const response = res as { data?: unknown[] };
-			const data = response.data ?? [];
-			return data.filter(
-				(item): item is Row => typeof item === "object" && item !== null,
-			) as Row[];
-		}),
-	);
 
 const getSpaceVideoIds = async (spaceId: SpaceOrOrgId): Promise<VideoId[]> => {
 	const rows = await db()
@@ -236,76 +190,47 @@ export const getOrgAnalyticsData = async (
 		queryCommentsSeries(typedOrgId, from, to, "emoji", bucket, videoIds),
 	]);
 
-	const tinybirdData = await runPromise(
+	const analyticsData = await runPromise(
 		Effect.gen(function* () {
-			const tinybird = yield* Tinybird;
-
-			const viewSeries = yield* queryViewSeries(
-				tinybird,
-				typedOrgId,
-				from,
-				to,
-				bucket,
-				videoIds,
-			);
-
-			const countries = yield* queryCountries(
-				tinybird,
-				typedOrgId,
-				from,
-				to,
-				videoIds,
-			);
-
-			const cities = yield* queryCities(
-				tinybird,
-				typedOrgId,
-				from,
-				to,
-				videoIds,
-			);
-
-			const browsers = yield* queryBrowsers(
-				tinybird,
-				typedOrgId,
-				from,
-				to,
-				videoIds,
-			);
-
-			const devices = yield* queryDevices(
-				tinybird,
-				typedOrgId,
-				from,
-				to,
-				videoIds,
-			);
-
-			const operatingSystems = yield* queryOperatingSystems(
-				tinybird,
-				typedOrgId,
-				from,
-				to,
-				videoIds,
-			);
-
-			const topCapsRaw = capId
-				? []
-				: yield* queryTopCaps(tinybird, typedOrgId, from, to, videoIds);
-
-			return {
+			const analytics = yield* Analytics;
+			const scope = { organizationId: typedOrgId, from, to, videoIds };
+			const [
 				viewSeries,
 				countries,
-				cities,
+				cityRows,
 				browsers,
 				devices,
 				operatingSystems,
 				topCapsRaw,
-			} satisfies TinybirdAnalyticsData;
+			] = yield* Effect.all(
+				[
+					analytics.viewSeries(scope, bucket),
+					analytics.breakdown(scope, "country"),
+					analytics.cityBreakdown(scope),
+					analytics.breakdown(scope, "browser"),
+					analytics.breakdown(scope, "device"),
+					analytics.breakdown(scope, "os"),
+					capId ? Effect.succeed([]) : analytics.topCaps(scope),
+				],
+				{ concurrency: 4 },
+			);
+			return {
+				viewSeries,
+				countries,
+				cities: cityRows.map((row) => ({
+					name: row.name,
+					subtitle: row.country,
+					views: row.views,
+				})),
+				browsers,
+				devices,
+				operatingSystems,
+				topCapsRaw,
+			} satisfies AnalyticsData;
 		}),
 	);
 
-	const totalViews = tinybirdData.viewSeries.reduce(
+	const totalViews = analyticsData.viewSeries.reduce(
 		(sum: number, row: ViewSeriesRow) => sum + row.views,
 		0,
 	);
@@ -328,7 +253,7 @@ export const getOrgAnalyticsData = async (
 			capsSeries.find((row: CountSeriesRow) => row.bucket === bucket)?.count ??
 			0,
 		views:
-			tinybirdData.viewSeries.find(
+			analyticsData.viewSeries.find(
 				(row: ViewSeriesRow) => row.bucket === bucket,
 			)?.views ?? 0,
 		comments:
@@ -340,7 +265,7 @@ export const getOrgAnalyticsData = async (
 	}));
 
 	const videoNames = await loadVideoNames(
-		tinybirdData.topCapsRaw
+		analyticsData.topCapsRaw
 			.map((cap: TopCapRow) => cap.videoId)
 			.filter(Boolean),
 		videoBelongsToOrganization(typedOrgId),
@@ -362,34 +287,34 @@ export const getOrgAnalyticsData = async (
 		chart: chartData,
 		breakdowns: {
 			countries: formatBreakdown(
-				tinybirdData.countries,
+				analyticsData.countries,
 				totalViews,
 				(row) => row.name,
 			),
 			cities: formatBreakdown(
-				tinybirdData.cities,
+				analyticsData.cities,
 				totalViews,
 				(row) => row.name,
 			),
 			browsers: normalizeAndAggregate(
-				tinybirdData.browsers,
+				analyticsData.browsers,
 				totalViews,
 				(row) => row.name,
 				normalizeBrowserName,
 			),
 			operatingSystems: normalizeAndAggregate(
-				tinybirdData.operatingSystems,
+				analyticsData.operatingSystems,
 				totalViews,
 				(row) => row.name,
 				normalizeOSName,
 			),
 			devices: normalizeAndAggregate(
-				tinybirdData.devices,
+				analyticsData.devices,
 				totalViews,
 				(row) => row.name,
 				normalizeDeviceName,
 			),
-			topCaps: tinybirdData.topCapsRaw.map((row: TopCapRow) => ({
+			topCaps: analyticsData.topCapsRaw.map((row: TopCapRow) => ({
 				id: row.videoId,
 				name: videoNames.get(row.videoId) ?? row.videoId,
 				views: row.views,
@@ -612,384 +537,4 @@ const queryCommentsSeries = async (
 			count: Number(row.count) || 0,
 		}))
 		.filter((row): row is CountSeriesRow => Boolean(row.bucket));
-};
-
-type TinybirdService = Effect.Effect.Success<typeof Tinybird>;
-
-const queryViewSeries = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	bucket: "hour" | "day",
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const bucketFormatter =
-		bucket === "hour" ? "%Y-%m-%dT%H:00:00Z" : "%Y-%m-%dT00:00:00Z";
-	const rawSql = `
-		SELECT
-			formatDateTime(${bucket === "hour" ? "toStartOfHour" : "toStartOfDay"}(timestamp), '${bucketFormatter}') as bucket,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			${pathnameFilter}
-		GROUP BY bucket
-		ORDER BY bucket
-	`;
-
-	const aggregatedSql = `
-		SELECT
-			formatDateTime(date, '${bucketFormatter}') as bucket,
-			uniqMerge(visits) as views
-		FROM analytics_pages_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			${pathnameFilter}
-		GROUP BY bucket
-		ORDER BY bucket
-	`;
-
-	type Row = { bucket: string; views: number };
-	const rawEffect = withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql));
-	const effect =
-		bucket === "hour"
-			? rawEffect
-			: fallbackIfEmpty(
-					withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-					rawEffect,
-				);
-
-	return effect.pipe(
-		Effect.map((rows: Row[]) =>
-			rows.map((row: Row) => ({
-				bucket: row.bucket,
-				views: Number(row.views) || 0,
-			})),
-		),
-	);
-};
-
-const queryCountries = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const aggregatedSql = `
-		SELECT
-			country as name,
-			uniqMerge(visits) as views
-		FROM analytics_pages_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			AND country != ''
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	const rawSql = `
-		SELECT
-			coalesce(nullIf(country, ''), '') as name,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			AND country != ''
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	type Row = { name: string; views: number };
-	return fallbackIfEmpty(
-		withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-		withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql)),
-	).pipe(
-		Effect.map((rows: Row[]) =>
-			rows.map((row: Row) => ({
-				name: row.name,
-				views: Number(row.views) || 0,
-			})),
-		),
-	);
-};
-
-const queryCities = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const aggregatedSql = `
-		SELECT
-			country as country,
-			city as city,
-			uniqMerge(visits) as views
-		FROM analytics_pages_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			AND city != ''
-			${pathnameFilter}
-		GROUP BY country, city
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	const rawSql = `
-		SELECT
-			coalesce(nullIf(country, ''), '') as country,
-			coalesce(nullIf(city, ''), '') as city,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			AND city != ''
-			${pathnameFilter}
-		GROUP BY country, city
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	type Row = { country: string; city: string; views: number };
-	return fallbackIfEmpty(
-		withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-		withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql)),
-	).pipe(
-		Effect.map((rows: Row[]) =>
-			rows.map((row: Row) => ({
-				name: row.city,
-				subtitle: row.country,
-				views: Number(row.views) || 0,
-			})),
-		),
-	);
-};
-
-const queryBrowsers = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const aggregatedSql = `
-		SELECT
-			browser as name,
-			uniq(session_id) as views
-		FROM analytics_sessions_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	const rawSql = `
-		SELECT
-			coalesce(nullIf(browser, ''), 'unknown') as name,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	type Row = { name: string; views: number };
-	const rawEffect = withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql));
-	const effect = pathnameFilter
-		? rawEffect
-		: fallbackIfEmpty(
-				withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-				rawEffect,
-			);
-
-	return effect.pipe(
-		Effect.map((rows: Row[]) =>
-			rows.map((row: Row) => ({
-				name: row.name,
-				views: Number(row.views) || 0,
-			})),
-		),
-	);
-};
-
-const queryDevices = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const aggregatedSql = `
-		SELECT
-			device as name,
-			uniq(session_id) as views
-		FROM analytics_sessions_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	const rawSql = `
-		SELECT
-			coalesce(nullIf(device, ''), 'desktop') as name,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	type Row = { name: string; views: number };
-	const rawEffect = withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql));
-	const effect = pathnameFilter
-		? rawEffect
-		: fallbackIfEmpty(
-				withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-				rawEffect,
-			);
-
-	return effect.pipe(
-		Effect.map((rows: Row[]) =>
-			rows.map((row: Row) => ({
-				name: row.name,
-				views: Number(row.views) || 0,
-			})),
-		),
-	);
-};
-
-const queryOperatingSystems = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const aggregatedSql = `
-		SELECT
-			os as name,
-			uniq(session_id) as views
-		FROM analytics_sessions_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	const rawSql = `
-		SELECT
-			coalesce(nullIf(os, ''), 'unknown') as name,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			${pathnameFilter}
-		GROUP BY name
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	type Row = { name: string; views: number };
-	const rawEffect = withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql));
-	const effect = pathnameFilter
-		? rawEffect
-		: fallbackIfEmpty(
-				withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-				rawEffect,
-			);
-
-	return effect.pipe(
-		Effect.map((rows: Row[]) =>
-			rows.map((row: Row) => ({
-				name: row.name,
-				views: Number(row.views) || 0,
-			})),
-		),
-	);
-};
-
-const queryTopCaps = (
-	tinybird: TinybirdService,
-	orgId: OrgId,
-	from: Date,
-	to: Date,
-	spaceVideoIds?: VideoId[],
-) => {
-	const pathnameFilter = buildPathnameFilter(spaceVideoIds);
-	const aggregatedSql = `
-		SELECT
-			pathname,
-			uniqMerge(visits) as views
-		FROM analytics_pages_mv
-		WHERE tenant_id = '${escapeLiteral(orgId)}'
-			AND date BETWEEN toDate('${toDateString(from)}') AND toDate('${toDateString(to)}')
-			AND startsWith(pathname, '/s/')
-			${pathnameFilter}
-		GROUP BY pathname
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	const rawSql = `
-		SELECT
-			coalesce(pathname, '') as pathname,
-			uniq(session_id) as views
-		FROM analytics_events
-		WHERE action = 'page_hit'
-			AND tenant_id = '${escapeLiteral(orgId)}'
-			AND timestamp BETWEEN toDateTime('${toDateTimeString(from)}') AND toDateTime('${toDateTimeString(to)}')
-			${pathnameFilter}
-		GROUP BY pathname
-		HAVING startsWith(pathname, '/s/')
-		ORDER BY views DESC
-		LIMIT 10
-	`;
-
-	type Row = { pathname: string; views: number };
-	return fallbackIfEmpty(
-		withTinybirdFallback<Row>(tinybird.querySql<Row>(aggregatedSql)),
-		withTinybirdFallback<Row>(tinybird.querySql<Row>(rawSql)),
-	).pipe(
-		Effect.map((rows: Row[]) =>
-			rows
-				.map((row: Row) => ({
-					videoId: row.pathname?.split("/s/")[1] ?? row.pathname,
-					views: Number(row.views) || 0,
-				}))
-				.filter((row: { videoId: string; views: number }): row is TopCapRow =>
-					Boolean(row.videoId),
-				),
-		),
-	);
 };

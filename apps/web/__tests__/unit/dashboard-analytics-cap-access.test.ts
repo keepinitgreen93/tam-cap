@@ -2,10 +2,13 @@ import type { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GET } from "@/app/api/dashboard/analytics/route";
 
-type TinybirdStub = {
-	querySql: (
-		statement: string,
-	) => import("effect").Effect.Effect<{ data: unknown[] }>;
+type AnalyticsStub = {
+	viewSeries: () => import("effect").Effect.Effect<never[]>;
+	breakdown: () => import("effect").Effect.Effect<never[]>;
+	cityBreakdown: () => import("effect").Effect.Effect<never[]>;
+	topCaps: () => import("effect").Effect.Effect<
+		{ videoId: string; views: number }[]
+	>;
 };
 
 const mocks = vi.hoisted(() => ({
@@ -30,13 +33,13 @@ vi.mock("@cap/web-backend", async () => {
 	);
 	return {
 		AgentManagement,
-		Tinybird: Context.GenericTag<TinybirdStub>("Tinybird"),
+		Analytics: Context.GenericTag<AnalyticsStub>("Analytics"),
 	};
 });
 vi.mock("@/lib/server", async () => {
 	const { Effect } = await import("effect");
-	const { Tinybird } = (await import("@cap/web-backend")) as unknown as {
-		Tinybird: import("effect").Context.Tag<TinybirdStub, TinybirdStub>;
+	const { Analytics } = (await import("@cap/web-backend")) as unknown as {
+		Analytics: import("effect").Context.Tag<AnalyticsStub, AnalyticsStub>;
 	};
 	const { CloudflareDatabase } = await import(
 		"../../../../packages/web-backend/src/CloudflareDatabase"
@@ -46,18 +49,22 @@ vi.mock("@/lib/server", async () => {
 			effect: import("effect").Effect.Effect<
 				A,
 				E,
-				InstanceType<typeof CloudflareDatabase> | TinybirdStub
+				InstanceType<typeof CloudflareDatabase> | AnalyticsStub
 			>,
 		) =>
 			Effect.runPromise(
 				effect.pipe(
-					Effect.provideService(Tinybird, {
-						querySql: (statement: string) =>
-							Effect.succeed({
-								data: statement.includes("GROUP BY pathname")
-									? mocks.topCapRows
-									: [],
-							}),
+					Effect.provideService(Analytics, {
+						viewSeries: () => Effect.succeed([]),
+						breakdown: () => Effect.succeed([]),
+						cityBreakdown: () => Effect.succeed([]),
+						topCaps: () =>
+							Effect.succeed(
+								mocks.topCapRows.map((row) => ({
+									videoId: row.pathname.replace("/s/", ""),
+									views: row.views,
+								})),
+							),
 					}),
 					Effect.provide(CloudflareDatabase.Default),
 				),
@@ -205,7 +212,9 @@ describe("dashboard analytics top cap names", () => {
 		const nameQuery = mocks.query.mock.calls.find(([statement]) =>
 			(statement as string).startsWith('select "id", "name" from "videos"'),
 		) as [string, unknown[]];
-		expect(nameQuery[0]).toContain('"videos"."id" in (?, ?)');
+		expect(nameQuery[0]).toContain(
+			'"videos"."id" in (select value from json_each(?))',
+		);
 		expectOrganizationScope(nameQuery[0], nameQuery[1]);
 		expect(
 			data.breakdowns.topCaps.map(({ id, name }) => ({ id, name })),

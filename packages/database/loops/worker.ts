@@ -1,11 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { STRIPE_AVAILABLE } from "@cap/utils";
-import { User } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
 import mysql, { type RowDataPacket } from "mysql2/promise";
-import { provisionStripeCustomer } from "../auth/stripe-customer";
-import { db } from "../index";
-import { users } from "../schema";
 import {
 	createLoopsClient,
 	type LoopsClient,
@@ -47,6 +42,10 @@ export async function syncLoopsContact(
 	config: LoopsRuntimeConfig,
 	customerCopy: CustomerCopy,
 ) {
+	if (process.env.CAP_RUNTIME === "cloudflare")
+		throw new Error(
+			"Cap marketing sync is disabled for Cloudflare deployments",
+		);
 	const email = normalizeEmail(source.input.source.email);
 	if (config.allowedEmails && !config.allowedEmails.has(email))
 		throw new Error("outside_test_allowlist");
@@ -78,8 +77,10 @@ export async function syncLoopsContact(
 		const created = await api.request<LifecycleContact[]>(
 			`contacts/find?email=${encodeURIComponent(email)}`,
 		);
-		if (created.length !== 1) throw new Error("created_contact_not_found");
-		remote = created[0];
+		const [createdContact] = created;
+		if (created.length !== 1 || !createdContact)
+			throw new Error("created_contact_not_found");
+		remote = createdContact;
 	}
 	const update = lifecycleUpdate(source, remote, config, customerCopy);
 	await api.request("contacts/update", "PUT", update);
@@ -228,7 +229,10 @@ export function loopsRuntimeConfig(env: NodeJS.ProcessEnv): LoopsRuntimeConfig {
 }
 
 export async function runLoopsSync(customerCopy: CustomerCopy) {
-	if (process.env.LOOPS_SYNC_ENABLED !== "true")
+	if (
+		process.env.CAP_RUNTIME === "cloudflare" ||
+		process.env.LOOPS_SYNC_ENABLED !== "true"
+	)
 		return { enabled: false, processed: 0, failed: 0 };
 	const config = loopsRuntimeConfig(process.env);
 	const capUrl = process.env.DATABASE_URL;
@@ -266,23 +270,14 @@ export async function runLoopsSync(customerCopy: CustomerCopy) {
 			}
 			const syncJob = async (job: Job, token: string) => {
 				try {
-					let source = await readLoopsProfile(cap, license, job.userId);
+					const source = await readLoopsProfile(cap, license, job.userId);
 					if (identityChanged(job, source)) {
 						await holdRemovedIdentity(api, job.syncedEmail, job.userId);
 						throw new Error("identity_change_held");
 					}
 					if (!source) throw new Error("user_removed");
-					if (needsStripeCustomer(source)) {
-						const [user] = await db()
-							.select()
-							.from(users)
-							.where(eq(users.id, User.UserId.make(job.userId)))
-							.limit(1);
-						if (!user) throw new Error("user_removed");
-						await provisionStripeCustomer(db(), user);
-						source = await readLoopsProfile(cap, license, job.userId);
-						if (!source) throw new Error("user_removed");
-					}
+					if (needsStripeCustomer(source))
+						throw new Error("stripe_signup_not_complete");
 					const { localProfile, jobConfig, hash } = syncFingerprint(
 						job,
 						source,

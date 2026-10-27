@@ -12,7 +12,7 @@ ENV NEXT_PUBLIC_WEB_URL=$NEXT_PUBLIC_WEB_URL
 ENV NEXT_PUBLIC_DOCKER_BUILD=true
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV WORKFLOW_TARGET_WORLD=@cap/workflow-cloudflare
-RUN --mount=type=cache,id=cap-next,target=/app/apps/web/.next/cache bun run build:web
+RUN --mount=type=cache,id=cap-next,target=/app/apps/web/.next/cache bun run build:web && node scripts/cloudflare/verify-workflows.mjs && bun run tsc -p apps/web/tsconfig.cloudflare.json
 
 FROM node:24.22.1-bookworm-slim AS web
 WORKDIR /app

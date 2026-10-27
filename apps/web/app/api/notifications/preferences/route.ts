@@ -1,6 +1,6 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { users } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { users } from "@cap/database/cloudflare/schema";
 import { eq } from "drizzle-orm";
 import { NextResponse } from "next/server";
 import { z } from "zod";

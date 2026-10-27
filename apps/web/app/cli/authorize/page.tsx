@@ -1,7 +1,9 @@
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { agentApiAuthorizationCodes } from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
-import { agentApiAuthorizationCodes } from "@cap/database/schema";
 import { Logo } from "@cap/ui";
 import { redirect } from "next/navigation";
 import {
@@ -102,17 +104,28 @@ export default async function CliAuthorizePage(props: {
 			throw new Error("Too many authorization attempts. Try again later.");
 		}
 		const code = createAgentAuthorizationCode();
-		await db()
-			.insert(agentApiAuthorizationCodes)
-			.values({
-				id: nanoId(),
-				userId: currentUser.id,
-				codeHash: hashAgentSecret(code),
-				codeChallenge: submitted.codeChallenge,
-				redirectUri: submitted.redirectUri,
-				scopes: submitted.scopes,
-				expiresAt: new Date(Date.now() + 5 * 60 * 1000),
-			});
+		const database = db();
+		const id = nanoId();
+		const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
+		await atomic(database, async (snapshot) => {
+			await requireWorkspaceAccount(snapshot, currentUser.id);
+			return {
+				statements: [
+					database
+						.insert(agentApiAuthorizationCodes)
+						.values({
+							id,
+							userId: currentUser.id,
+							codeHash: hashAgentSecret(code),
+							codeChallenge: submitted.codeChallenge,
+							redirectUri: submitted.redirectUri,
+							scopes: submitted.scopes,
+							expiresAt,
+						}),
+				],
+				result: undefined,
+			};
+		});
 		const callback = buildAgentCallbackUrl(submitted.redirectUri, {
 			state: submitted.state,
 			code,

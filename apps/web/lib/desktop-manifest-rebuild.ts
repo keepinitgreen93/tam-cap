@@ -1,12 +1,13 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	videoProcessingJobs,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
+import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { type User, Video } from "@cap/web-domain";
-import { and, asc, eq, isNull, like } from "drizzle-orm";
+import { and, asc, eq, isNull, like, sql } from "drizzle-orm";
 import { Option } from "effect";
 import {
 	DESKTOP_RECORDING_SOURCE_REUPLOAD_REQUIRED,
@@ -233,7 +234,7 @@ async function loadCandidate(videoId: Video.VideoId) {
 		.from(videos)
 		.leftJoin(videoUploads, eq(videoUploads.videoId, videos.id))
 		.leftJoin(videoProcessingJobs, eq(videoProcessingJobs.videoId, videos.id))
-		.where(eq(videos.id, videoId))
+		.where(and(writableVideo, eq(videos.id, videoId)))
 		.limit(1);
 	return row;
 }
@@ -349,6 +350,7 @@ export async function rebuildMissingManifest(
 			.where(
 				and(
 					eq(videoUploads.videoId, videoId),
+					sql`exists (select 1 from ${videos} where ${videos.id} = ${videoUploads.videoId} and ${writableVideo} and json_extract(${videos.source}, '$.type') = 'desktopSegments')`,
 					like(
 						videoUploads.processingError,
 						`${MISSING_MANIFEST_ERROR_PREFIX}%`,
@@ -367,6 +369,15 @@ export async function rebuildMissingManifest(
 	const row = await loadCandidate(videoId);
 	if (!row) return { status: "not-found" };
 	const { bucket } = await loadStorage(row.video);
+	if (bucket.provider !== "s3") return { status: "unsupported-storage" };
+	if (
+		row.video.ownerId !== inspected.ownerId ||
+		row.video.source.type !== "desktopSegments"
+	)
+		return {
+			status: "not-eligible",
+			reason: "Recording changed during inspection",
+		};
 	const source = new Video.SegmentsSource({
 		videoId,
 		ownerId: inspected.ownerId,
@@ -377,12 +388,24 @@ export async function rebuildMissingManifest(
 	);
 	if (current !== undefined && current !== inspected.manifest)
 		return { status: "manifest-exists" };
-	if (current === undefined)
-		await bucket
-			.putObject(source.getManifestKey(), inspected.manifest, {
-				contentType: "application/json",
-			})
-			.pipe(runPromise);
+	if (current === undefined) {
+		try {
+			await bucket
+				.putObject(source.getManifestKey(), inspected.manifest, {
+					contentType: "application/json",
+					ifNoneMatch: "*",
+				})
+				.pipe(runPromise);
+		} catch (error) {
+			const observed = Option.getOrUndefined(
+				await bucket.getObject(source.getManifestKey()).pipe(runPromise),
+			);
+			if (observed !== inspected.manifest) {
+				if (observed !== undefined) return { status: "manifest-exists" };
+				throw error;
+			}
+		}
+	}
 
 	let status: "queued" | "already-processing";
 	try {
@@ -423,6 +446,7 @@ export async function listMissingManifestCandidates(limit: number) {
 		.where(
 			and(
 				like(videoUploads.processingError, `${MISSING_MANIFEST_ERROR_PREFIX}%`),
+				writableVideo,
 				isNull(videos.bucket),
 				isNull(videos.storageIntegrationId),
 			),

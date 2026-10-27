@@ -5,7 +5,6 @@ import {
 	mcpOAuthRegistrationQuotas,
 	mcpOAuthTokens,
 } from "@cap/database/cloudflare/schema";
-import type { User } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import {
 	afterAll,
@@ -17,6 +16,7 @@ import {
 	vi,
 } from "vitest";
 import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
 vi.mock("server-only", () => ({}));
 const state = vi.hoisted(() => ({
@@ -45,6 +45,7 @@ const verifier = "v".repeat(43);
 const challenge = createHash("sha256").update(verifier).digest("base64url");
 const callback = "https://chatgpt.com/connector/callback";
 let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
+let owner: Awaited<ReturnType<typeof createTestOwner>>;
 const validRequest = () =>
 	new URLSearchParams({
 		client_id: "cap_mcp_client_test",
@@ -62,7 +63,7 @@ const issue = async () => {
 		redirectUris: [callback],
 	});
 	if (!clientId) throw new Error("Registration failed");
-	const code = await createMcpAuthorizationCode("owner" as User.UserId, {
+	const code = await createMcpAuthorizationCode(owner.id, {
 		clientId,
 		redirectUri: callback,
 		codeChallenge: challenge,
@@ -95,6 +96,7 @@ describe("MCP OAuth on D1", () => {
 		});
 		fixture = await createTestDatabase();
 		state.database = fixture.database;
+		owner = await createTestOwner(fixture.database);
 	});
 	afterAll(async () => fixture?.dispose());
 	beforeEach(async () => {

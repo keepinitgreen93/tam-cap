@@ -1,6 +1,7 @@
 import "server-only";
 
 import {
+	Analytics,
 	AwsCredentials,
 	CloudflareDatabase,
 	Database,
@@ -14,7 +15,6 @@ import {
 	Spaces,
 	SpacesPolicy,
 	Storage,
-	Tinybird,
 	Users,
 	Videos,
 	VideosPolicy,
@@ -47,7 +47,7 @@ export const Dependencies = Layer.mergeAll(
 	Videos.Default,
 	VideosPolicy.Default,
 	VideosRepo.Default,
-	Tinybird.Default,
+	Analytics.Default,
 	Extensions.Default,
 	Folders.Default,
 	SpacesPolicy.Default,

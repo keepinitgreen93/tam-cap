@@ -1,5 +1,9 @@
-import { db } from "@cap/database";
-import { organizations, sharedVideos, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import {
+	organizations,
+	sharedVideos,
+	videos,
+} from "@cap/database/cloudflare/schema";
 import { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import type { NextRequest } from "next/server";

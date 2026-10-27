@@ -246,7 +246,11 @@ export const createS3BucketAccess = Effect.gen(function* () {
 		putObject: <E>(
 			key: string,
 			body: string | Uint8Array | ArrayBuffer | Stream.Stream<Uint8Array, E>,
-			fields?: { contentType?: string; contentLength?: number },
+			fields?: {
+				contentType?: string;
+				contentLength?: number;
+				ifNoneMatch?: "*";
+			},
 		) =>
 			wrapS3Promise(
 				provider.getInternal.pipe(
@@ -273,6 +277,7 @@ export const createS3BucketAccess = Effect.gen(function* () {
 									Body: _body,
 									ContentType: fields?.contentType,
 									ContentLength: fields?.contentLength,
+									IfNoneMatch: fields?.ifNoneMatch,
 								}),
 							);
 						}),

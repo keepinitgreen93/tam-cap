@@ -247,6 +247,15 @@ export async function readTranscriptVtt(
 	const pointer = publication(video.metadata);
 	const key = getTranscriptObjectKey(video, "vtt");
 	const vtt = key ? await store.getText(key) : null;
+	return validateTranscriptVtt(video, vtt);
+}
+
+export function validateTranscriptVtt(
+	video: TranscriptVideoReference,
+	vtt: string | null,
+): string | null {
+	const pointer = publication(video.metadata);
+	if (pointer && !pointer.vtt) return null;
 	if (pointer?.vtt && vtt === null)
 		throw new InvalidTranscriptPublicationError(
 			"A published transcript object is missing.",

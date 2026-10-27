@@ -2,8 +2,10 @@ import { Video } from "@cap/web-domain";
 import { NextRequest } from "next/server";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { isVideoStorageKey } from "@/lib/video-storage-key";
+import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
+	metadataMode: false,
 	db: vi.fn(),
 	getCurrentUser: vi.fn(),
 	getAccessForVideo: vi.fn(),
@@ -15,7 +17,7 @@ const mocks = vi.hoisted(() => ({
 	transaction: vi.fn(),
 }));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: mocks.db,
 }));
 
@@ -23,18 +25,10 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: mocks.getCurrentUser,
 }));
 
-vi.mock("@cap/database/schema", () => ({
-	videos: { id: "videos.id" },
-}));
-
 vi.mock("@cap/web-backend", () => ({
 	Storage: {
 		getAccessForVideo: mocks.getAccessForVideo,
 	},
-}));
-
-vi.mock("drizzle-orm", () => ({
-	eq: (field: unknown, value: unknown) => ({ field, value }),
 }));
 
 vi.mock("@/lib/server", () => ({
@@ -55,6 +49,7 @@ const video = { id: videoId, ownerId };
 
 beforeEach(() => {
 	vi.clearAllMocks();
+	mocks.metadataMode = false;
 	mocks.getCurrentUser.mockResolvedValue({ id: ownerId });
 	mocks.headObject.mockReturnValue({
 		pipe: () => Promise.resolve({ ContentLength: 1024 }),
@@ -65,31 +60,13 @@ beforeEach(() => {
 	mocks.startVideoProcessingWorkflow.mockResolvedValue("started");
 	mocks.updateSet.mockReturnValue({ where: vi.fn().mockResolvedValue([]) });
 	mocks.lockedFor.mockResolvedValue([]);
-	mocks.transaction.mockImplementation((run: (tx: unknown) => unknown) =>
-		run({
-			select: () => ({
-				from: () => ({
-					where: () => ({
-						for: mocks.lockedFor,
-					}),
-				}),
-			}),
-			update: () => ({
-				set: mocks.updateSet,
-			}),
-		}),
-	);
-	mocks.db.mockReturnValue({
-		select: () => ({
-			from: () => ({
-				where: mocks.selectWhere,
-			}),
-		}),
-		update: () => ({
-			set: mocks.updateSet,
-		}),
-		transaction: mocks.transaction,
+	const model = createRecordingD1Model({
+		read: () => (mocks.metadataMode ? mocks.lockedFor() : mocks.selectWhere()),
+		apply: (statements) => {
+			for (const statement of statements) mocks.updateSet(statement.values);
+		},
 	});
+	mocks.db.mockReturnValue(model);
 });
 
 describe("isVideoStorageKey", () => {
@@ -222,6 +199,7 @@ describe("triggerVideoProcessing", () => {
 
 describe("video metadata route", () => {
 	const put = async (metadata: unknown) => {
+		mocks.metadataMode = true;
 		const { PUT } = await import("@/app/api/video/metadata/route");
 		return PUT(
 			new NextRequest("http://localhost:3000/api/video/metadata", {
@@ -272,8 +250,7 @@ describe("video metadata route", () => {
 		const response = await put({ sourceName: "b.mp4" });
 
 		expect(response.status).toBe(200);
-		expect(mocks.transaction).toHaveBeenCalledOnce();
-		expect(mocks.lockedFor).toHaveBeenCalledWith("update");
+		expect(mocks.lockedFor).toHaveBeenCalledOnce();
 		expect(mocks.updateSet).toHaveBeenCalledWith({
 			metadata: { sourceName: "b.mp4", agentUpload: accepted },
 		});

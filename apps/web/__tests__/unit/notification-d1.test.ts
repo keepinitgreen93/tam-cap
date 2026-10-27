@@ -14,6 +14,7 @@ let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
 const mail = vi.hoisted(() =>
 	vi.fn(async () => ({ data: { id: "sent" }, error: null })),
 );
+vi.mock("server-only", () => ({}));
 vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => fixture.database,
 }));
@@ -44,30 +45,26 @@ afterAll(async () => fixture.dispose());
 async function video() {
 	const owner = await createTestOwner(fixture.database);
 	const id = Video.VideoId.make(nanoId());
-	await fixture.database
-		.insert(videos)
-		.values({
-			id,
-			ownerId: owner.id,
-			orgId: owner.activeOrganizationId,
-			name: "Cap",
-			source: { type: "webMP4" },
-		});
+	await fixture.database.insert(videos).values({
+		id,
+		ownerId: owner.id,
+		orgId: owner.activeOrganizationId,
+		name: "Cap",
+		source: { type: "webMP4" },
+	});
 	return { owner, id };
 }
 it("deduplicates concurrent authored notifications and sends links on WEB_URL", async () => {
 	const value = await video();
 	const author = await createTestOwner(fixture.database);
 	const commentId = Comment.CommentId.make(nanoId());
-	await fixture.database
-		.insert(comments)
-		.values({
-			id: commentId,
-			videoId: value.id,
-			authorId: author.id,
-			type: "text",
-			content: "Hello",
-		});
+	await fixture.database.insert(comments).values({
+		id: commentId,
+		videoId: value.id,
+		authorId: author.id,
+		type: "text",
+		content: "Hello",
+	});
 	const input = {
 		type: "comment" as const,
 		videoId: value.id,
@@ -90,19 +87,17 @@ it("deduplicates concurrent authored notifications and sends links on WEB_URL", 
 it("keeps the anonymous view limit under concurrent distinct sessions", async () => {
 	const value = await video();
 	for (let start = 0; start < 49; start += 5)
-		await fixture.database
-			.insert(notifications)
-			.values(
-				Array.from({ length: Math.min(5, 49 - start) }, (_, index) => ({
-					id: nanoId(),
-					videoId: value.id,
-					orgId: value.owner.activeOrganizationId,
-					recipientId: value.owner.id,
-					type: "anon_view" as const,
-					data: { videoId: value.id, anonName: "Viewer", location: null },
-					dedupKey: `seed:${value.id}:${start + index}`,
-				})),
-			);
+		await fixture.database.insert(notifications).values(
+			Array.from({ length: Math.min(5, 49 - start) }, (_, index) => ({
+				id: nanoId(),
+				videoId: value.id,
+				orgId: value.owner.activeOrganizationId,
+				recipientId: value.owner.id,
+				type: "anon_view" as const,
+				data: { videoId: value.id, anonName: "Viewer", location: null },
+				dedupKey: `seed:${value.id}:${start + index}`,
+			})),
+		);
 	await Promise.all(
 		Array.from({ length: 4 }, (_, index) =>
 			createAnonymousViewNotification({

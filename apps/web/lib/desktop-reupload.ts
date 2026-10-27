@@ -2,9 +2,14 @@ import {
 	CloudFrontClient,
 	CreateInvalidationCommand,
 } from "@aws-sdk/client-cloudfront";
+import {
+	type CloudflareDatabase,
+	updateIfDefined,
+} from "@cap/database/cloudflare";
 import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
 import { videos, videoUploads } from "@cap/database/cloudflare/schema";
 import type { TranscriptPublication } from "@cap/database/cloudflare/transcript-publication";
+import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
 import { serverEnv } from "@cap/env";
 import { AwsCredentials } from "@cap/web-backend";
 import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
@@ -16,6 +21,8 @@ import {
 	type DesktopReuploadToken,
 } from "@/lib/desktop-reupload-token";
 import { runPromise } from "@/lib/server";
+import { retireDesktopRecordingJobForOutputReplacement } from "./desktop-recording-jobs";
+import { ownedRecordingPlan } from "./recording-upload-state";
 
 type ReuploadedVideo = Pick<
 	Video.Video,
@@ -84,6 +91,59 @@ export async function prepareDesktopReupload(
 		metadata,
 		transcriptionStatus: null,
 	};
+}
+
+export async function publishDesktopReupload(
+	database: CloudflareDatabase,
+	video: ReuploadedVideo,
+	token: DesktopReuploadToken,
+	dimensions: {
+		duration?: number;
+		width?: number;
+		height?: number;
+		fps?: number;
+	} = {},
+) {
+	const transcriptPublication = createTranscriptInvalidation();
+	const retirement = retireDesktopRecordingJobForOutputReplacement(database, {
+		videoId: video.id,
+		userId: video.ownerId,
+	});
+	return ownedRecordingPlan(database, video, async (snapshot) => {
+		const publication = await prepareDesktopReupload(
+			snapshot,
+			video,
+			token,
+			transcriptPublication,
+		);
+		if (!publication) return { statements: [], result: false };
+		return {
+			statements: [
+				retirement,
+				database
+					.update(videos)
+					.set({
+						...publication,
+						duration: updateIfDefined(dimensions.duration, videos.duration),
+						width: updateIfDefined(dimensions.width, videos.width),
+						height: updateIfDefined(dimensions.height, videos.height),
+						fps: updateIfDefined(dimensions.fps, videos.fps),
+					})
+					.where(
+						and(eq(videos.id, video.id), eq(videos.ownerId, video.ownerId)),
+					),
+				database
+					.delete(videoUploads)
+					.where(
+						and(
+							eq(videoUploads.videoId, video.id),
+							eq(videoUploads.rawFileKey, token.outputKey),
+						),
+					),
+			],
+			result: true,
+		};
+	});
 }
 
 export async function invalidateReuploadedVideo(video: ReuploadedVideo) {

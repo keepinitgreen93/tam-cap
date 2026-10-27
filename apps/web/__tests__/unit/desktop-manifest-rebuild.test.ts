@@ -12,8 +12,18 @@ const mocks = vi.hoisted(() => ({
 	storage: { provider: "s3", custom: false },
 }));
 
-vi.mock("@cap/database", () => ({ db: mocks.db }));
-vi.mock("@cap/database/schema", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({ db: mocks.db }));
+vi.mock("@cap/database/cloudflare/schema", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@cap/database/cloudflare/schema")>()),
+	organizations: {
+		id: "org.id",
+		ownerId: "org.ownerId",
+		tombstoneAt: "org.tombstoneAt",
+	},
+	organizationMembers: {
+		organizationId: "member.orgId",
+		userId: "member.userId",
+	},
 	videos: {
 		id: "video.id",
 		bucket: "video.bucket",
@@ -27,6 +37,10 @@ vi.mock("@cap/database/schema", () => ({
 	videoProcessingJobs: { videoId: "job.videoId" },
 }));
 vi.mock("drizzle-orm", () => ({
+	sql: (strings: TemplateStringsArray, ...values: unknown[]) => ({
+		strings: [...strings],
+		values,
+	}),
 	and: (...args: unknown[]) => ({ and: args }),
 	asc: (value: unknown) => value,
 	eq: (left: unknown, right: unknown) => ({ eq: [left, right] }),

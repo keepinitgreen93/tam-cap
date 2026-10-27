@@ -1,7 +1,7 @@
 import { statSync } from "node:fs";
 import { resolve, sep } from "node:path";
-import { db } from "@cap/database";
-import { organizations } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { organizations } from "@cap/database/cloudflare/schema";
 import { buildEnv, serverEnv } from "@cap/env";
 import { eq } from "drizzle-orm";
 import { notFound } from "next/navigation";

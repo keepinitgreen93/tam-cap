@@ -10,11 +10,13 @@ const mocks = vi.hoisted(() => ({
 	video: undefined as Record<string, unknown> | undefined,
 	userId: null as string | null,
 	appendEvents: vi.fn(),
+	viewable: true,
+	failAnalytics: false,
 }));
 
 vi.mock("server-only", () => ({}));
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({
 			from: () => ({
@@ -33,31 +35,42 @@ vi.mock("@cap/database/auth/request-site", () => ({
 }));
 
 vi.mock("@cap/web-backend", async () => {
-	const { Context, Effect } = await import("effect");
-	const { CurrentUser } = await import("@cap/web-domain");
-	const Tinybird = Context.GenericTag<{
-		appendEvents: (events: unknown[]) => EffectModule.Effect<void>;
-	}>("Tinybird");
+	const { Context, Effect, Option } = await import("effect");
+	const { CurrentUser, Policy } = await import("@cap/web-domain");
+	const Analytics = Context.GenericTag("Analytics");
+	const VideosPolicy = Context.GenericTag("VideosPolicy");
 	return {
-		Tinybird,
+		Analytics,
+		VideosPolicy,
 		provideOptionalAuth: (
 			app: EffectModule.Effect<unknown, unknown, never>,
 		) => {
-			const withTinybird = app.pipe(
-				Effect.provideService(Tinybird, {
-					appendEvents: (events) =>
-						Effect.sync(() => mocks.appendEvents(events)),
+			const provided = app.pipe(
+				Effect.provideService(Analytics, {
+					recordView: (event: unknown) =>
+						mocks.failAnalytics
+							? Effect.fail(new Error("Analytics unavailable"))
+							: Effect.sync(() => {
+									mocks.appendEvents([event]);
+									return true;
+								}),
+				}),
+				Effect.provideService(VideosPolicy, {
+					getViewableById: () =>
+						mocks.viewable
+							? Effect.succeed(Option.some([]))
+							: Effect.fail(new Policy.PolicyDeniedError()),
 				}),
 			);
 			return mocks.userId
-				? withTinybird.pipe(
+				? provided.pipe(
 						Effect.provideService(CurrentUser, {
 							id: mocks.userId,
 							email: "viewer@example.com",
 							activeOrganizationId: ORG_ID,
 						} as never),
 					)
-				: withTinybird;
+				: provided;
 		},
 	};
 });
@@ -92,6 +105,8 @@ describe("POST /api/analytics/track", () => {
 	beforeEach(() => {
 		mocks.appendEvents.mockClear();
 		mocks.userId = null;
+		mocks.viewable = true;
+		mocks.failAnalytics = false;
 		mocks.video = {
 			orgId: ORG_ID,
 			ownerId: OWNER_ID,
@@ -116,10 +131,9 @@ describe("POST /api/analytics/track", () => {
 		expect(response.status).toBe(200);
 		expect(recordedEvents()).toEqual([
 			expect.objectContaining({
-				tenant_id: ORG_ID,
-				video_id: VIDEO_ID,
-				pathname: `/s/${VIDEO_ID}`,
-				session_id: "session-1",
+				organizationId: ORG_ID,
+				videoId: VIDEO_ID,
+				sessionId: "session-1",
 			}),
 		]);
 	});
@@ -155,11 +169,30 @@ describe("POST /api/analytics/track", () => {
 		await track({ videoId: VIDEO_ID, occurredAt: "not a date" });
 
 		const [kept, backdated, invalid] = recordedEvents();
-		expect(kept?.timestamp).toBe(recent);
+		expect((kept?.occurredAt as Date).toISOString()).toBe(recent);
 		for (const event of [backdated, invalid]) {
-			expect(Date.parse(event?.timestamp as string)).toBeGreaterThanOrEqual(
+			expect((event?.occurredAt as Date).getTime()).toBeGreaterThanOrEqual(
 				before,
 			);
 		}
+	});
+	it("does not collect a denied private view", async () => {
+		mocks.viewable = false;
+		expect((await track({ videoId: VIDEO_ID })).status).toBe(200);
+		expect(recordedEvents()).toEqual([]);
+	});
+	it("reports unavailable storage instead of pretending a view was recorded", async () => {
+		mocks.failAnalytics = true;
+		expect((await track({ videoId: VIDEO_ID })).status).toBe(503);
+		expect(recordedEvents()).toEqual([]);
+	});
+	it("accepts a completed upload row as playable", async () => {
+		mocks.video = {
+			...mocks.video,
+			activeUploadVideoId: VIDEO_ID,
+			activeUploadPhase: "complete",
+		};
+		expect((await track({ videoId: VIDEO_ID })).status).toBe(200);
+		expect(recordedEvents()).toHaveLength(1);
 	});
 });

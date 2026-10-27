@@ -1,16 +1,18 @@
 import "server-only";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoIdLong } from "@cap/database/helpers";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
 import {
 	messengerConversations,
 	messengerMessages,
 	users,
-} from "@cap/database/schema";
-import { and, asc, desc, eq, inArray, isNull } from "drizzle-orm";
+} from "@cap/database/cloudflare/schema";
+import { nanoIdLong } from "@cap/database/helpers";
+import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import { cookies } from "next/headers";
-import { MESSENGER_ADMIN_EMAIL, MESSENGER_ANON_COOKIE } from "./constants";
+import { isInstanceAdmin } from "@/lib/instance-admin";
+import { MESSENGER_ANON_COOKIE } from "./constants";
 
 const anonCookieOptions = {
 	httpOnly: true,
@@ -23,7 +25,7 @@ const anonCookieOptions = {
 export const getViewerContext = async () => {
 	const [user, cookieStore] = await Promise.all([getCurrentUser(), cookies()]);
 	const anonymousId = cookieStore.get(MESSENGER_ANON_COOKIE)?.value ?? null;
-	const isAdmin = user?.email === MESSENGER_ADMIN_EMAIL;
+	const isAdmin = isInstanceAdmin(user);
 
 	return {
 		user,
@@ -57,26 +59,31 @@ export const linkAnonymousConversationsToUser = async ({
 }) => {
 	if (!anonymousId) return;
 
-	await Promise.all([
-		db()
-			.update(messengerConversations)
-			.set({ userId })
-			.where(
-				and(
-					isNull(messengerConversations.userId),
-					eq(messengerConversations.anonymousId, anonymousId),
+	const database = db();
+	await atomic(database, async () => ({
+		statements: [
+			database
+				.update(messengerConversations)
+				.set({ userId })
+				.where(
+					and(
+						isNull(messengerConversations.userId),
+						eq(messengerConversations.anonymousId, anonymousId),
+					),
 				),
-			),
-		db()
-			.update(messengerMessages)
-			.set({ userId })
-			.where(
-				and(
-					isNull(messengerMessages.userId),
-					eq(messengerMessages.anonymousId, anonymousId),
+			database
+				.update(messengerMessages)
+				.set({ userId })
+				.where(
+					and(
+						isNull(messengerMessages.userId),
+						eq(messengerMessages.anonymousId, anonymousId),
+						sql`${messengerMessages.conversationId} in (select ${messengerConversations.id} from ${messengerConversations} where ${messengerConversations.userId} = ${userId})`,
+					),
 				),
-			),
-	]);
+		],
+		result: undefined,
+	}));
 };
 
 type ConversationSummaryRow = typeof messengerConversations.$inferSelect & {
@@ -109,10 +116,7 @@ const appendLatestMessage = async (rows: ConversationSummaryRow[]) => {
 		})
 		.from(messengerMessages)
 		.where(
-			inArray(
-				messengerMessages.conversationId,
-				rows.map((row) => row.id),
-			),
+			sql`${messengerMessages.conversationId} in (select value from json_each(${JSON.stringify(rows.map((row) => row.id))}))`,
 		)
 		.orderBy(desc(messengerMessages.createdAt));
 
@@ -142,7 +146,10 @@ export const listViewerMessengerConversations = async (limit = 30) => {
 	const whereClause = viewer.user
 		? eq(messengerConversations.userId, viewer.user.id)
 		: viewer.anonymousId
-			? eq(messengerConversations.anonymousId, viewer.anonymousId)
+			? and(
+					isNull(messengerConversations.userId),
+					eq(messengerConversations.anonymousId, viewer.anonymousId),
+				)
 			: null;
 
 	if (!whereClause) {
@@ -245,7 +252,9 @@ export const getMessengerConversationForViewer = async ({
 	const matchesAnonymousAsSignedInUser = Boolean(
 		viewer.user && !conversation.userId && matchesAnonymous,
 	);
-	const matchesAnonymousAsVisitor = Boolean(!viewer.user && matchesAnonymous);
+	const matchesAnonymousAsVisitor = Boolean(
+		!viewer.user && !conversation.userId && matchesAnonymous,
+	);
 
 	if (
 		!adminAllowed &&

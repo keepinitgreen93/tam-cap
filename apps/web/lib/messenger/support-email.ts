@@ -61,10 +61,10 @@ export const sendMessengerSupportEmail = async ({
 	}
 	const reservationId = nanoId();
 	const database = db();
-	const reserved = await atomic<{
-		status: "sent" | "rate_limited";
-		remainingToday: number;
-	}>(database, async (snapshot) => {
+	const reserved = await atomic<
+		| { status: "sent"; remainingToday: number }
+		| { status: "rate_limited"; remainingToday: 0 }
+	>(database, async (snapshot) => {
 		const [lockedUser] = await snapshot.read((reader) =>
 			reader.select({ id: users.id }).from(users).where(eq(users.id, user.id)),
 		);

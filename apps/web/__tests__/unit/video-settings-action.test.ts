@@ -8,22 +8,26 @@ vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => ({ id: "owner" }),
 }));
 
-vi.mock("@cap/database", () => ({
-	db: () => ({
-		select: () => ({
-			from: () => ({
-				where: async () => [{ ownerId: "owner" }],
-			}),
-		}),
-		update: () => ({
-			set: (values: unknown) => ({
-				where: async () => {
-					mocks.updates.push(values);
-				},
-			}),
-		}),
-	}),
-}));
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const schema = await import("@cap/database/cloudflare/schema");
+	const { createRecordingD1Model } = await import(
+		"../helpers/recording-d1-model"
+	);
+	const database = createRecordingD1Model({
+		read: ({ table }) => {
+			if (table === schema.videos)
+				return [{ id: "video", ownerId: "owner", orgId: "org" }];
+			if (table === schema.organizations)
+				return [{ id: "org", ownerId: "owner", tombstoneAt: null }];
+			return [];
+		},
+		apply: (statements) => {
+			for (const item of statements)
+				if (item.table === schema.videos) mocks.updates.push(item.values);
+		},
+	});
+	return { db: () => database };
+});
 
 import type { Video } from "@cap/web-domain";
 import { updateVideoSettings } from "@/actions/videos/settings";

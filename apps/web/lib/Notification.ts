@@ -484,7 +484,10 @@ export async function sendFirstViewEmail(
 
 		const result = await database
 			.update(videos)
-			.set({ firstViewEmailSentAt: new Date() })
+			.set({
+				firstViewEmailSentAt: new Date(),
+				updatedAt: sql`${videos.updatedAt}`,
+			})
 			.where(
 				and(
 					eq(videos.id, Video.VideoId.make(params.videoId)),

@@ -84,7 +84,7 @@ const makeDeps = (): VideosPolicyDeps => ({
 	},
 });
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		select: () => ({
 			from: () => ({

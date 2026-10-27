@@ -1,15 +1,5 @@
 import type { ImageUpload, Organisation, User } from "@cap/web-domain";
-import {
-	and,
-	eq,
-	exists,
-	gt,
-	inArray,
-	isNotNull,
-	isNull,
-	ne,
-	or,
-} from "drizzle-orm";
+import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 import type { Adapter } from "next-auth/adapters";
 import { normalizeEmail } from "../auth/identity.ts";
 import { nanoId } from "../helpers.ts";
@@ -23,7 +13,6 @@ import type { CloudflareDatabase } from "./index.ts";
 import { loopsSyncStatements } from "./loops.ts";
 import { releaseProSeatStatement } from "./pro-seat.ts";
 import {
-	accounts,
 	organizationInvites,
 	organizationMembers,
 	organizations,

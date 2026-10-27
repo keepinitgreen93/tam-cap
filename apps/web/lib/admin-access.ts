@@ -1,10 +1,10 @@
 import { getCurrentUser } from "@cap/database/auth/session";
 import { Video } from "@cap/web-domain";
-import { MESSENGER_ADMIN_EMAIL } from "@/lib/messenger/constants";
+import { isInstanceAdmin } from "@/lib/instance-admin";
 
 export async function requireAdmin() {
 	const user = await getCurrentUser();
-	if (!user || user.email !== MESSENGER_ADMIN_EMAIL) {
+	if (!user || !isInstanceAdmin(user)) {
 		throw new Error("Unauthorized");
 	}
 	return user;

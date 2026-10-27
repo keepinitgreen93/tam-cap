@@ -6,8 +6,8 @@ const mocks = vi.hoisted(() => ({
 	revalidatePath: vi.fn(),
 }));
 
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
+vi.mock("@cap/database/cloudflare/application", async () => {
+	const { drizzle } = await import("drizzle-orm/sqlite-proxy");
 	const client = drizzle(mocks.query);
 	return { db: () => client };
 });
@@ -23,7 +23,7 @@ beforeEach(() => {
 		id: "user-1",
 		activeOrganizationId: "org-1",
 	});
-	mocks.query.mockResolvedValue({ rows: [{ affectedRows: 1, insertId: 0 }] });
+	mocks.query.mockResolvedValue({ rows: [] });
 });
 
 describe("notification read state", () => {
@@ -34,10 +34,10 @@ describe("notification read state", () => {
 
 			expect(mocks.query).toHaveBeenCalledExactlyOnceWith(
 				expect.stringContaining(
-					"where (`notifications`.`recipientId` = ? and `notifications`.`id` = ?)",
+					'where ("notifications"."recipientId" = ? and "notifications"."id" = ?)',
 				),
-				[expect.any(String), "user-1", notificationId],
-				"execute",
+				[expect.any(Number), "user-1", notificationId],
+				"run",
 			);
 			expect(mocks.revalidatePath).toHaveBeenCalledWith("/dashboard");
 		},
@@ -48,17 +48,17 @@ describe("notification read state", () => {
 
 		expect(mocks.query).toHaveBeenCalledExactlyOnceWith(
 			expect.stringMatching(
-				/where .*`notifications`\.`recipientId` = \?.*`notifications`\.`orgId` = \?/,
+				/where .*"notifications"\."recipientId" = \?.*"notifications"\."orgId" = \?/,
 			),
-			[expect.any(String), "user-1", "org-1"],
-			"execute",
+			[expect.any(Number), "user-1", "org-1"],
+			"run",
 		);
 		expect(mocks.revalidatePath).toHaveBeenCalledWith("/dashboard");
 	});
 
 	it("succeeds without exposing whether a notification matched", async () => {
 		mocks.query.mockResolvedValueOnce({
-			rows: [{ affectedRows: 0, insertId: 0 }],
+			rows: [],
 		});
 
 		await expect(markAsRead("missing-notification")).resolves.toBeUndefined();
@@ -78,7 +78,9 @@ describe("notification read state", () => {
 	});
 
 	it("reports a failed write without revalidating the dashboard", async () => {
-		mocks.query.mockRejectedValueOnce(new Error("Database unavailable"));
+		mocks.query.mockRejectedValueOnce(
+			new Error("CloudflareDatabase unavailable"),
+		);
 		vi.spyOn(console, "log").mockImplementation(() => {});
 
 		await expect(markAsRead("notification-1")).rejects.toThrow(

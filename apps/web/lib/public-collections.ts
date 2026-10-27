@@ -1,7 +1,7 @@
 import "server-only";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	comments,
 	folders,
@@ -12,7 +12,7 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { userIsPro } from "@cap/utils";
 import { ImageUploads } from "@cap/web-backend";

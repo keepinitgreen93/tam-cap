@@ -6,8 +6,10 @@
 	"compatibility_flags": ["nodejs_compat"],
 	"workers_dev": true,
 	"preview_urls": false,
+	"triggers": { "crons": ["*/15 * * * *"] },
 	"vars": {
 		"CAP_RUNTIME_READY": "false",
+		"CAP_MAINTENANCE_ENABLED": "false",
 		"CAP_DEPLOYMENT_ID": "cloudflare-development"
 	},
 	"containers": [
@@ -79,6 +81,12 @@
 		]
 	},
 	"d1_databases": [
+		{
+			"binding": "ANALYTICS_DB",
+			"database_name": "tam-cap-analytics",
+			"database_id": "8d68da95-cf03-49e1-81ff-0ef40007ce6d",
+			"migrations_dir": "../../packages/database/cloudflare/analytics/migrations"
+		},
 		{
 			"binding": "DB",
 			"database_name": "tam-cap-metadata",

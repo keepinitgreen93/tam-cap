@@ -1,8 +1,8 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { notifications } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
+import { notifications } from "@cap/database/cloudflare/schema";
 import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 

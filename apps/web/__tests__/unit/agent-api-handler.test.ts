@@ -6,7 +6,9 @@ import {
 	folders,
 	organizations,
 	videos,
+	videoViewerGrants,
 } from "@cap/database/cloudflare/schema";
+import { createCloudflareUser } from "@cap/database/cloudflare/team";
 import { nanoId } from "@cap/database/helpers";
 import { Folder, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -391,6 +393,86 @@ describe("agent API handler", () => {
 		);
 		expect(read.status).toBe(200);
 		expect((await read.json()).revision).toBe(result.revision);
+	});
+
+	it("denies workspace provisioning to a viewer-only account even with a stale broad token", async () => {
+		const id = Video.VideoId.make(nanoId());
+		const email = `${nanoId()}@example.com`;
+		await fixture.database.batch([
+			fixture.database
+				.insert(videos)
+				.values({
+					id,
+					ownerId: owner.id,
+					orgId: owner.activeOrganizationId,
+					name: "Private share",
+					public: false,
+					source: { type: "webMP4" },
+				}),
+			fixture.database
+				.insert(videoViewerGrants)
+				.values({
+					id: nanoId(),
+					videoId: id,
+					email,
+					invitedByUserId: owner.id,
+				}),
+		]);
+		const guest = await createCloudflareUser(
+			fixture.database,
+			{ email, emailVerified: new Date() },
+			{ ownerEmail: owner.email, inviteOnly: true },
+		);
+		const guestToken = `cap_cli_${"g".repeat(43)}`;
+		await fixture.database
+			.insert(agentApiKeys)
+			.values({
+				id: nanoId(),
+				userId: guest.id,
+				name: "Old credential",
+				tokenHash: createHash("sha256").update(guestToken).digest("hex"),
+				scopes: [
+					"caps:read",
+					"organizations:manage",
+					"developer:write",
+					"developer:secrets",
+				],
+				expiresAt: new Date(Date.now() + 3600000),
+				lastUsedAt: new Date(),
+			});
+		for (const [path, payload] of [
+			["/organizations", { name: "Forbidden workspace" }],
+			[
+				"/developer/apps",
+				{ name: "Forbidden app", environment: "development" },
+			],
+		] as const) {
+			const response = await POST(
+				new Request(`http://localhost/api/v1${path}`, {
+					method: "POST",
+					headers: {
+						Authorization: `Bearer ${guestToken}`,
+						"Content-Type": "application/json",
+						"Idempotency-Key": `guest-denied-${path.length}`,
+						"X-Cap-Confirmation": "user",
+					},
+					body: JSON.stringify(payload),
+				}),
+			);
+			expect(response.status).toBe(403);
+		}
+		expect(
+			await fixture.database
+				.select()
+				.from(organizations)
+				.where(eq(organizations.ownerId, guest.id)),
+		).toHaveLength(0);
+		expect(
+			await fixture.database
+				.select()
+				.from(developerApps)
+				.where(eq(developerApps.ownerId, guest.id)),
+		).toHaveLength(0);
 	});
 
 	it("handles CORS preflight without authentication", async () => {

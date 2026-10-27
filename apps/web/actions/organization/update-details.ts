@@ -1,12 +1,13 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizations } from "@cap/database/schema";
+import { requireOrganizationManager } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { organizations } from "@cap/database/cloudflare/schema";
 import type { Organisation } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-import { requireOrganizationSettingsManager } from "./authorization";
 
 export async function updateOrganizationDetails({
 	organizationName,
@@ -23,34 +24,27 @@ export async function updateOrganizationDetails({
 		throw new Error("Unauthorized");
 	}
 
-	const organization = await db()
-		.select()
-		.from(organizations)
-		.where(eq(organizations.id, organizationId));
-
-	if (!organization || organization.length === 0) {
-		throw new Error("Organization not found");
-	}
-
-	await requireOrganizationSettingsManager(user.id, organizationId);
-
-	if (organizationName) {
-		await db()
-			.update(organizations)
-			.set({
-				name: organizationName,
-			})
-			.where(eq(organizations.id, organizationId));
-	}
-
-	if (allowedEmailDomain || allowedEmailDomain === "") {
-		await db()
-			.update(organizations)
-			.set({
-				allowedEmailDomain: allowedEmailDomain,
-			})
-			.where(eq(organizations.id, organizationId));
-	}
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		await requireOrganizationManager(snapshot, organizationId, user.id);
+		const updates = {
+			...(organizationName ? { name: organizationName } : {}),
+			...(allowedEmailDomain || allowedEmailDomain === ""
+				? { allowedEmailDomain }
+				: {}),
+		};
+		return {
+			statements: Object.keys(updates).length
+				? [
+						database
+							.update(organizations)
+							.set(updates)
+							.where(eq(organizations.id, organizationId)),
+					]
+				: [],
+			result: undefined,
+		};
+	});
 
 	revalidatePath("/dashboard/settings/organization");
 

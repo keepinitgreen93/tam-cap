@@ -1,10 +1,12 @@
-import * as Db from "@cap/database/schema";
+import { requireWorkspaceAccount } from "@cap/database/cloudflare/access";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import * as Db from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
 import type { Organisation, User } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Data, Effect, Option } from "effect";
 
-import { Database } from "../Database.ts";
+import { CloudflareDatabase as Database } from "../CloudflareDatabase.ts";
 
 // Auth keys are minted by a GET navigation, so a forced cross-site navigation
 // could otherwise spam rows; cap how many keys one user can mint per window.
@@ -58,43 +60,36 @@ export class Extensions extends Effect.Service<Extensions>()("Extensions", {
 			mintAuthKey: Effect.fn("Extensions.mintAuthKey")(function* (
 				userId: User.UserId,
 			) {
-				// Insert first, then count (including the new row) and roll back on
-				// overflow. A check-then-insert would let concurrent mints race past
-				// the limit; this way racers can transiently overshoot but every
-				// overshooting mint deletes its own key and fails, so the table
-				// settles at or below the cap.
 				const authApiKey = crypto.randomUUID();
-				yield* db.use((db) =>
-					db.insert(Db.authApiKeys).values({
-						id: authApiKey,
-						userId,
-						source: "extension",
+				const mintedSince = new Date(Date.now() - AUTH_KEY_MINT_WINDOW_MS);
+				const minted = yield* db.use((database) =>
+					atomic(database, async (snapshot) => {
+						await requireWorkspaceAccount(snapshot, userId);
+						const recent = await snapshot.read((reader) =>
+							reader
+								.select({ id: Db.authApiKeys.id })
+								.from(Db.authApiKeys)
+								.where(
+									Dz.and(
+										Dz.eq(Db.authApiKeys.userId, userId),
+										Dz.gt(Db.authApiKeys.createdAt, mintedSince),
+									),
+								)
+								.limit(AUTH_KEY_MINT_LIMIT),
+						);
+						if (recent.length >= AUTH_KEY_MINT_LIMIT)
+							return { statements: [], result: false };
+						return {
+							statements: [
+								database
+									.insert(Db.authApiKeys)
+									.values({ id: authApiKey, userId, source: "extension" }),
+							],
+							result: true,
+						};
 					}),
 				);
-
-				const mintedSince = new Date(Date.now() - AUTH_KEY_MINT_WINDOW_MS);
-				const recentKeys = yield* db.use((db) =>
-					db
-						.select({ id: Db.authApiKeys.id })
-						.from(Db.authApiKeys)
-						.where(
-							Dz.and(
-								Dz.eq(Db.authApiKeys.userId, userId),
-								Dz.gt(Db.authApiKeys.createdAt, mintedSince),
-							),
-						)
-						.limit(AUTH_KEY_MINT_LIMIT + 1),
-				);
-
-				if (recentKeys.length > AUTH_KEY_MINT_LIMIT) {
-					yield* db.use((db) =>
-						db
-							.delete(Db.authApiKeys)
-							.where(Dz.eq(Db.authApiKeys.id, authApiKey)),
-					);
-					return yield* Effect.fail(new AuthKeyMintRateLimited());
-				}
-
+				if (!minted) return yield* Effect.fail(new AuthKeyMintRateLimited());
 				return authApiKey;
 			}),
 

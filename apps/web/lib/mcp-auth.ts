@@ -1,4 +1,8 @@
 import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import {
+	getAccountCapability,
+	requireWorkspaceAccount,
+} from "@cap/database/cloudflare/access";
 import { atomic } from "@cap/database/cloudflare/atomic";
 import "server-only";
 
@@ -161,6 +165,7 @@ export const createMcpAuthorizationCode = async (
 	const id = nanoId();
 	const now = new Date();
 	await atomic(database, async (snapshot) => {
+		await requireWorkspaceAccount(snapshot, userId);
 		const [client] = await snapshot.read((reader) =>
 			reader
 				.select()
@@ -270,6 +275,10 @@ export const exchangeMcpCode = async (params: URLSearchParams) => {
 			!verifyAgentCodeChallenge(verifier, grant.codeChallenge)
 		)
 			return { statements: [], result: null };
+		if (
+			(await getAccountCapability(snapshot, grant.userId)).kind !== "workspace"
+		)
+			return { statements: [], result: null };
 		const next = mintMcpTokens(
 			database,
 			{ userId: grant.userId, clientId, resource, familyId },
@@ -328,6 +337,8 @@ export const refreshMcpTokens = async (params: URLSearchParams) => {
 				result: null,
 			};
 		if (row.refreshExpiresAt <= now) return { statements: [], result: null };
+		if ((await getAccountCapability(snapshot, row.userId)).kind !== "workspace")
+			return { statements: [], result: null };
 		const next = mintMcpTokens(
 			database,
 			{ userId: row.userId, clientId, resource, familyId: row.familyId },

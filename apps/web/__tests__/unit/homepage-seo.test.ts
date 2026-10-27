@@ -14,6 +14,7 @@ import {
 } from "@/components/pages/HomeTwo/metadata";
 import { HomeTwoSchema } from "@/components/pages/HomeTwo/Schema";
 import { homepageSchema, homepageSeo } from "@/components/pages/HomeTwo/seo";
+import { homepageCopy } from "@/data/homepage-copy";
 import { PRICING } from "@/data/pricing";
 
 describe("homepage SEO", () => {
@@ -51,7 +52,15 @@ describe("homepage SEO", () => {
 		const serialized = JSON.stringify(homepageSchema);
 		expect(serialized).not.toContain("aggregateRating");
 		expect(serialized).not.toContain("reviewRating");
-		expect(serialized).not.toContain("FAQPage");
+		expect(
+			graph.find((entity) => entity["@type"] === "FAQPage")?.mainEntity,
+		).toEqual(
+			homepageCopy.faq.items.map((item) => ({
+				"@type": "Question",
+				name: item.question,
+				acceptedAnswer: { "@type": "Answer", text: item.answer },
+			})),
+		);
 		expect(serialized).not.toContain("priceValidUntil");
 	});
 

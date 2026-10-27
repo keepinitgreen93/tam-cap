@@ -11,7 +11,10 @@ import { Option } from "effect";
 
 export function ownedRecordingPlan<T>(
 	database: CloudflareDatabase,
-	video: Video.Video,
+	video: Pick<
+		Video.Video,
+		"id" | "ownerId" | "bucketId" | "storageIntegrationId"
+	>,
 	plan: (
 		snapshot: AtomicSnapshot,
 		current: typeof videos.$inferSelect,

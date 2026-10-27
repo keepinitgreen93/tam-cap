@@ -10,17 +10,27 @@ import {
 	users,
 	videos,
 	videoUploads,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import {
-	Database,
+	CloudflareDatabase as Database,
 	ImageUploads,
 	resolveEffectiveVideoRules,
 } from "@cap/web-backend";
 import type { ImageUpload, Organisation, Space, Video } from "@cap/web-domain";
 import { CurrentUser, Folder } from "@cap/web-domain";
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { sql } from "drizzle-orm/sql";
 import { Effect } from "effect";
+import { z } from "zod";
+import { inJsonArray } from "@/utils/sql";
+
+const sharedOrganizationsSchema = z.array(
+	z.object({
+		id: z.string(),
+		name: z.string(),
+		iconUrl: z.string().nullable(),
+	}),
+);
 
 export const getFolderById = Effect.fn(function* (folderId: string) {
 	if (!folderId) throw new Error("Folder ID is required");
@@ -89,10 +99,10 @@ const getSharedSpacesForVideos = Effect.fn(function* (
 					.innerJoin(spaces, eq(spaceVideos.spaceId, spaces.id))
 					.innerJoin(organizations, eq(spaces.organizationId, organizations.id))
 					.where(
-						sql`${spaceVideos.videoId} IN (${sql.join(
-							videoIds.map((id) => sql`${id}`),
-							sql`, `,
-						)})`,
+						and(
+							inJsonArray(spaceVideos.videoId, videoIds),
+							isNull(organizations.tombstoneAt),
+						),
 					),
 			),
 			db.use((db) =>
@@ -110,10 +120,10 @@ const getSharedSpacesForVideos = Effect.fn(function* (
 						eq(sharedVideos.organizationId, organizations.id),
 					)
 					.where(
-						sql`${sharedVideos.videoId} IN (${sql.join(
-							videoIds.map((id) => sql`${id}`),
-							sql`, `,
-						)})`,
+						and(
+							inJsonArray(sharedVideos.videoId, videoIds),
+							isNull(organizations.tombstoneAt),
+						),
 					),
 			),
 		],
@@ -195,24 +205,19 @@ export const getVideosByFolderId = Effect.fn(function* (
 				orgId: videos.orgId,
 				totalComments: sql<number>`COUNT(DISTINCT CASE WHEN ${comments.type} = 'text' THEN ${comments.id} END)`,
 				totalReactions: sql<number>`COUNT(DISTINCT CASE WHEN ${comments.type} = 'emoji' THEN ${comments.id} END)`,
-				sharedOrganizations: sql<
-					{
-						id: string;
-						name: string;
-						iconUrl: ImageUpload.ImageUrlOrKey | null;
-					}[]
-				>`
-        COALESCE(
-          JSON_ARRAYAGG(
-            JSON_OBJECT(
-              'id', ${organizations.id},
-              'name', ${organizations.name},
-              'iconUrl', ${organizations.iconUrl}
-            )
-          ),
-          JSON_ARRAY()
-        )
-      `,
+				sharedOrganizations:
+					sql<string>`json_group_array(DISTINCT json_object('id', ${organizations.id}, 'name', ${organizations.name}, 'iconUrl', ${organizations.iconUrl})) FILTER (WHERE ${organizations.id} IS NOT NULL AND ${organizations.tombstoneAt} IS NULL)`.mapWith(
+						(value: unknown) => {
+							if (typeof value !== "string")
+								throw new Error("Invalid shared organization projection");
+							return sharedOrganizationsSchema
+								.parse(JSON.parse(value))
+								.map((row) => ({
+									...row,
+									iconUrl: row.iconUrl as ImageUpload.ImageUrlOrKey | null,
+								}));
+						},
+					),
 
 				ownerName: users.name,
 				effectiveDate: videos.effectiveCreatedAt,
@@ -276,7 +281,7 @@ export const getVideosByFolderId = Effect.fn(function* (
 								settings: organizations.settings,
 							})
 							.from(organizations)
-							.where(inArray(organizations.id, orgIds)),
+							.where(inJsonArray(organizations.id, orgIds)),
 					)
 				: Effect.succeed([]),
 		],

@@ -9,12 +9,15 @@ import { InviteDialog } from "@/app/(org)/dashboard/settings/organization/compon
 import { VerifyOTPForm } from "@/app/(org)/verify-otp/form";
 
 const mocks = vi.hoisted(() => ({
+	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" as string | undefined },
 	invites: vi.fn<typeof sendOrganizationInvites>(),
 	signIn: vi.fn(),
 	refresh: vi.fn(),
 	close: vi.fn(),
 	toast: { error: vi.fn(), success: vi.fn(), warning: vi.fn() },
 }));
+
+vi.mock("@cap/env", () => ({ buildEnv: mocks.buildEnv }));
 
 vi.mock("@/actions/organization/send-invites", () => ({
 	sendOrganizationInvites: mocks.invites,
@@ -44,6 +47,7 @@ let container: HTMLDivElement;
 let queryClient: QueryClient;
 
 beforeEach(() => {
+	mocks.buildEnv.NEXT_PUBLIC_IS_CAP = "true";
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
 	mocks.invites.mockReset();
 	mocks.signIn.mockResolvedValue({ ok: true });
@@ -82,6 +86,19 @@ async function clickButton(label: string) {
 }
 
 describe("verification email delivery messages", () => {
+	it("shows organization access guidance for self-hosted workspaces", async () => {
+		mocks.buildEnv.NEXT_PUBLIC_IS_CAP = undefined;
+		await render(
+			createElement(VerifyOTPForm, {
+				email: "person@example.com",
+				emailDeliveryConfigured: true,
+			}),
+		);
+		expect(container.textContent).toContain(
+			"This workspace is managed by your organization",
+		);
+		expect(container.querySelector('a[href="/terms"]')).toBeNull();
+	});
 	it.each([false, true])(
 		"reports the correct resend destination when email configured is %s",
 		async (emailDeliveryConfigured) => {

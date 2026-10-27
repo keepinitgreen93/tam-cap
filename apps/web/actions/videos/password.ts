@@ -1,15 +1,20 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { spaces, spaceVideos, videos } from "@cap/database/cloudflare/schema";
 import {
 	hashPassword,
 	verifyPassword as verifyPlainPassword,
 } from "@cap/database/crypto";
-import { spaces, spaceVideos, videos } from "@cap/database/schema";
 import { collectPasswordHashes } from "@cap/web-backend";
+import {
+	activeVideo,
+	requireWritableVideo,
+} from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { setVerifiedPasswordCookie } from "@/lib/password-cookie";
 
@@ -34,10 +39,19 @@ export async function setVideoPassword(
 		}
 
 		const hashed = await hashPassword(password);
-		await db()
-			.update(videos)
-			.set({ password: hashed })
-			.where(eq(videos.id, videoId));
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			await requireWritableVideo(snapshot, videoId, user.id);
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({ password: hashed })
+						.where(eq(videos.id, videoId)),
+				],
+				result: undefined,
+			};
+		});
 
 		revalidatePath("/dashboard/caps");
 		revalidatePath("/dashboard/shared-caps");
@@ -67,10 +81,19 @@ export async function removeVideoPassword(videoId: Video.VideoId) {
 			throw new Error("Unauthorized");
 		}
 
-		await db()
-			.update(videos)
-			.set({ password: null })
-			.where(eq(videos.id, videoId));
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			await requireWritableVideo(snapshot, videoId, user.id);
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({ password: null })
+						.where(eq(videos.id, videoId)),
+				],
+				result: undefined,
+			};
+		});
 
 		revalidatePath("/dashboard/caps");
 		revalidatePath("/dashboard/shared-caps");
@@ -94,7 +117,7 @@ export async function verifyVideoPassword(
 		const [video] = await db()
 			.select()
 			.from(videos)
-			.where(eq(videos.id, videoId));
+			.where(and(activeVideo, eq(videos.id, videoId)));
 
 		if (!video) return { success: false, error: "Failed to verify password" };
 

@@ -1,10 +1,10 @@
-import { db } from "@cap/database";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	organizationMembers,
 	sharedVideos,
 	spaceMembers,
 	spaceVideos,
-} from "@cap/database/schema";
+} from "@cap/database/cloudflare/schema";
 import type { User, Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 

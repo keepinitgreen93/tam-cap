@@ -1,11 +1,12 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { videos } from "@cap/database/schema";
-import type { VideoMetadata } from "@cap/database/types";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { videos } from "@cap/database/cloudflare/schema";
+import { requireWritableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
 export async function editDate(videoId: Video.VideoId, date: string) {
@@ -40,20 +41,22 @@ export async function editDate(videoId: Video.VideoId, date: string) {
 			throw new Error("Cannot set a date in the future");
 		}
 
-		// Store the custom date in the metadata field
-		const currentMetadata = (video.metadata as VideoMetadata) || {};
-		const updatedMetadata: VideoMetadata = {
-			...currentMetadata,
-			customCreatedAt: newDate.toISOString(),
-		};
-
-		await db()
-			.update(videos)
-			.set({
-				metadata: updatedMetadata,
-			})
-			.where(eq(videos.id, videoId));
-
+		const customCreatedAt = newDate.toISOString();
+		const database = db();
+		await atomic(database, async (snapshot) => {
+			await requireWritableVideo(snapshot, videoId, userId);
+			return {
+				statements: [
+					database
+						.update(videos)
+						.set({
+							metadata: sql`json_set(coalesce(${videos.metadata}, json_object()), '$.customCreatedAt', ${customCreatedAt})`,
+						})
+						.where(eq(videos.id, videoId)),
+				],
+				result: undefined,
+			};
+		});
 		// Revalidate paths to update the UI
 		revalidatePath("/dashboard/caps");
 		revalidatePath("/dashboard/shared-caps");

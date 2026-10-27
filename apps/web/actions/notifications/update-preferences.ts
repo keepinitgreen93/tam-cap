@@ -1,9 +1,9 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { users } from "@cap/database/schema";
-import { eq } from "drizzle-orm";
+import { db } from "@cap/database/cloudflare/application";
+import { users } from "@cap/database/cloudflare/schema";
+import { eq, sql } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
 export const updatePreferences = async ({
@@ -26,10 +26,7 @@ export const updatePreferences = async ({
 		await db()
 			.update(users)
 			.set({
-				preferences: {
-					...(currentUser.preferences ?? {}),
-					notifications,
-				},
+				preferences: sql`json_set(coalesce(${users.preferences}, '{}'), '$.notifications', json(${JSON.stringify(notifications)}))`,
 			})
 			.where(eq(users.id, currentUser.id));
 		revalidatePath("/dashboard");

@@ -1,7 +1,6 @@
 import { updateIfDefined } from "@cap/database/cloudflare";
 import type { AtomicStatement } from "@cap/database/cloudflare/atomic";
 import * as Db from "@cap/database/cloudflare/schema";
-import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
@@ -18,10 +17,9 @@ import { Effect, Option, Schedule } from "effect";
 import { Hono, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { withAuth } from "@/app/api/utils";
-import { retireDesktopRecordingJobForOutputReplacement } from "@/lib/desktop-recording-jobs";
 import {
 	invalidateReuploadedVideo,
-	prepareDesktopReupload,
+	publishDesktopReupload,
 } from "@/lib/desktop-reupload";
 import {
 	assertDesktopReuploadTarget,
@@ -652,55 +650,14 @@ app.post(
 							),
 						);
 					const head = yield* verify;
-					yield* db.use((db) => {
-						const transcriptPublication = createTranscriptInvalidation();
-						const retirement = retireDesktopRecordingJobForOutputReplacement(
-							db,
-							{ videoId, userId: user.id },
-						);
-						return ownedRecordingPlan(db, video, async (snapshot) => {
-							const statements: AtomicStatement[] = [];
-							const publication = await prepareDesktopReupload(
-								snapshot,
-								video,
-								replacement,
-								transcriptPublication,
-							);
-							if (!publication) return { statements, result: undefined };
-							statements.push(retirement);
-							statements.push(
-								db
-									.update(Db.videos)
-									.set({
-										...publication,
-										duration: updateIfDefined(
-											body.durationInSecs,
-											Db.videos.duration,
-										),
-										width: updateIfDefined(body.width, Db.videos.width),
-										height: updateIfDefined(body.height, Db.videos.height),
-										fps: updateIfDefined(body.fps, Db.videos.fps),
-									})
-									.where(
-										and(
-											eq(Db.videos.id, videoId),
-											eq(Db.videos.ownerId, user.id),
-										),
-									),
-							);
-							statements.push(
-								db
-									.delete(Db.videoUploads)
-									.where(
-										and(
-											eq(Db.videoUploads.videoId, videoId),
-											eq(Db.videoUploads.rawFileKey, outputKey),
-										),
-									),
-							);
-							return { statements, result: undefined };
-						});
-					});
+					yield* db.use((database) =>
+						publishDesktopReupload(database, video, replacement, {
+							duration: body.durationInSecs,
+							width: body.width,
+							height: body.height,
+							fps: body.fps,
+						}),
+					);
 					yield* Effect.tryPromise(() =>
 						invalidateGoogleDriveStorageQuotaCache(
 							Option.getOrNull(video.storageIntegrationId),

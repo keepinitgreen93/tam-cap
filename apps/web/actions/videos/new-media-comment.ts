@@ -1,8 +1,7 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { comments } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
 import {
 	provideOptionalAuth,
 	Storage,
@@ -15,7 +14,7 @@ import { type Comment, Policy } from "@cap/web-domain";
 import { Effect, Exit, Option } from "effect";
 import { revalidatePath } from "next/cache";
 import { sanitizeWaveform } from "@/lib/comment-media";
-import { isReplyParentOnVideo } from "@/lib/comment-reply-parent";
+import { insertComment } from "@/lib/comment-persistence";
 import { canUseMediaComments } from "@/lib/media-comments";
 import { createNotification } from "@/lib/Notification";
 import * as EffectRuntime from "@/lib/server";
@@ -55,9 +54,6 @@ export async function newMediaComment(data: {
 	if (!Number.isFinite(data.durationSeconds) || data.durationSeconds < 0)
 		throw new Error("Invalid duration");
 
-	// Same rationale as new-comment.ts: authentication alone isn't
-	// authorization, and canView returns true for nonexistent ids, so fetch the
-	// row under the policy.
 	const accessExit = await Effect.gen(function* () {
 		const repo = yield* VideosRepo;
 		const videosPolicy = yield* VideosPolicy;
@@ -69,12 +65,6 @@ export async function newMediaComment(data: {
 	if (Exit.isFailure(accessExit) || Option.isNone(accessExit.value))
 		throw new Error("Video not found");
 	const [video] = accessExit.value.value;
-
-	if (
-		data.parentCommentId &&
-		!(await isReplyParentOnVideo(data.parentCommentId, data.videoId))
-	)
-		throw new Error("Comment not found");
 
 	const expectedPrefix = `${video.ownerId}/${video.id}/comments/${data.commentId}/`;
 	if (!claims.key.startsWith(expectedPrefix))
@@ -132,25 +122,34 @@ export async function newMediaComment(data: {
 		updatedAt: now,
 	};
 
-	await db().insert(comments).values(newComment);
+	const inserted = await insertComment(db(), newComment, {
+		mediaVideo: video,
+		authorize: (policy) =>
+			Effect.void.pipe(
+				Policy.withPublicPolicy(policy),
+				provideOptionalAuth,
+				EffectRuntime.runPromise,
+			),
+	});
 
 	try {
-		await createNotification({
-			// Truthiness on purpose: the web client uses "" for top-level comments
-			// while other APIs use NULL.
-			type: data.parentCommentId ? "reply" : "comment",
-			videoId: data.videoId,
-			authorId: user.id,
-			comment: {
-				id: data.commentId,
-				// The label feeds notification emails; an empty string would ship a
-				// blank email body.
-				content:
-					content ||
-					(data.kind === "video" ? "🎥 Video comment" : "🎙️ Voice note"),
-			},
-			parentCommentId: data.parentCommentId,
-		});
+		if (inserted.created)
+			await createNotification({
+				// Truthiness on purpose: the web client uses "" for top-level comments
+				// while other APIs use NULL.
+				type: data.parentCommentId ? "reply" : "comment",
+				videoId: data.videoId,
+				authorId: user.id,
+				comment: {
+					id: data.commentId,
+					// The label feeds notification emails; an empty string would ship a
+					// blank email body.
+					content:
+						content ||
+						(data.kind === "video" ? "🎥 Video comment" : "🎙️ Voice note"),
+				},
+				parentCommentId: data.parentCommentId,
+			});
 	} catch (error) {
 		console.error("Failed to create notification:", error);
 	}

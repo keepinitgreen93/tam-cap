@@ -10,12 +10,17 @@ const video = { id: "video-1", ownerId: "owner-1" };
 const mediaKey = "owner-1/video-1/comments/comment-1/media.webm";
 const thumbnailKey = "owner-1/video-1/comments/comment-1/thumbnail.jpg";
 
-vi.mock("@cap/database", () => ({
+vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => ({
 		insert: () => ({ values: mocks.insert }),
 	}),
 }));
-vi.mock("@cap/database/schema", () => ({ comments: {} }));
+vi.mock("@/lib/comment-persistence", () => ({
+	insertComment: async (_database: unknown, value: unknown) => {
+		await mocks.insert(value);
+		return { created: true };
+	},
+}));
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => ({ id: "user-1", name: "User" }),
 }));

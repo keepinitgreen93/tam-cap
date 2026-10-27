@@ -6,28 +6,13 @@ import * as Db from "@cap/database/cloudflare/schema";
 import { CurrentUser, Organisation, Policy } from "@cap/web-domain";
 import * as Dz from "drizzle-orm";
 import { Effect, Array as EffectArray, Option } from "effect";
+import { Analytics } from "../Analytics/index.ts";
 import { CloudflareDatabase as Database } from "../CloudflareDatabase";
 import { ImageUploads } from "../ImageUploads";
 import { S3Buckets } from "../S3Buckets";
-import { Tinybird } from "../Tinybird";
 import { OrganisationsPolicy } from "./OrganisationsPolicy";
 
-const analyticsDatasources = [
-	"analytics_events",
-	"analytics_pages_mv",
-	"analytics_sessions_mv",
-] as const;
 const s3DeleteBatchSize = 1000;
-
-const escapeTinybirdLiteral = (value: string) =>
-	value.replace(/\\/g, "\\\\").replace(/'/g, "''");
-
-const tenantDeleteCondition = (tenantIds: ReadonlyArray<string>) => {
-	const uniqueTenantIds = [...new Set(tenantIds.filter(Boolean))];
-	return `tenant_id IN (${uniqueTenantIds
-		.map((tenantId) => `'${escapeTinybirdLiteral(tenantId)}'`)
-		.join(", ")})`;
-};
 
 export class Organisations extends Effect.Service<Organisations>()(
 	"Organisations",
@@ -37,7 +22,7 @@ export class Organisations extends Effect.Service<Organisations>()(
 			const policy = yield* OrganisationsPolicy;
 			const imageUploads = yield* ImageUploads;
 			const s3Buckets = yield* S3Buckets;
-			const tinybird = yield* Tinybird;
+			const analytics = yield* Analytics;
 
 			const update = Effect.fn("Organisations.update")(function* (
 				payload: Organisation.OrganisationUpdate,
@@ -78,7 +63,7 @@ export class Organisations extends Effect.Service<Organisations>()(
 
 				yield* Policy.withPolicy(policy.isOwner(id))(Effect.void);
 
-				const organisation = yield* db
+				yield* db
 					.use((db) =>
 						db
 							.select({
@@ -152,15 +137,7 @@ export class Organisations extends Effect.Service<Organisations>()(
 				);
 				yield* deleteS3Prefix(`organizations/${id}/`);
 
-				const deleteCondition = tenantDeleteCondition([
-					id,
-					organisation.ownerId,
-				]);
-				yield* Effect.forEach(
-					analyticsDatasources,
-					(datasource) => tinybird.deleteData(datasource, deleteCondition),
-					{ concurrency: 1 },
-				);
+				yield* analytics.deleteOrganization(id);
 
 				yield* db.use((database) =>
 					finishOrganizationDeletion(database, id, user.id),
@@ -171,7 +148,7 @@ export class Organisations extends Effect.Service<Organisations>()(
 		dependencies: [
 			ImageUploads.Default,
 			S3Buckets.Default,
-			Tinybird.Default,
+			Analytics.Default,
 			Database.Default,
 			OrganisationsPolicy.Default,
 		],

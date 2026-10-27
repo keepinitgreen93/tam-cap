@@ -1,15 +1,9 @@
 "use server";
-
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { nanoId } from "@cap/database/helpers";
-import { sharedVideos, spaceVideos, videos } from "@cap/database/schema";
+import { db } from "@cap/database/cloudflare/application";
 import type { Space, Video } from "@cap/web-domain";
-import { and, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-import { requireOrganizationSettingsManager } from "@/actions/organization/authorization";
-import { getSpaceAccess } from "@/actions/organization/space-authorization";
-
+import { mutateSharedVideos } from "@/lib/sharing-persistence";
 export async function addVideosToSpace(
 	spaceId: Space.SpaceIdOrOrganisationId,
 	videoIds: Video.VideoId[],
@@ -26,112 +20,21 @@ export async function addVideosToSpace(
 		}
 
 		const isAllSpacesEntry = user.activeOrganizationId === spaceId;
-
-		if (isAllSpacesEntry) {
-			await requireOrganizationSettingsManager(user.id, spaceId);
-		} else {
-			const access = await getSpaceAccess(user.id, spaceId);
-			if (!access?.canManage) {
-				throw new Error(
-					"You don't have permission to add videos to this space",
-				);
-			}
-		}
-
-		const userVideos = await db()
-			.select({ id: videos.id })
-			.from(videos)
-			.where(and(eq(videos.ownerId, user.id), inArray(videos.id, videoIds)));
-
-		const validVideoIds = userVideos.map((v) => v.id);
-
-		if (validVideoIds.length === 0) {
-			throw new Error("No valid videos found");
-		}
-
-		if (isAllSpacesEntry) {
-			const existingSharedVideos = await db()
-				.select({ videoId: sharedVideos.videoId })
-				.from(sharedVideos)
-				.where(
-					and(
-						eq(sharedVideos.organizationId, spaceId),
-						inArray(sharedVideos.videoId, validVideoIds),
-					),
-				);
-
-			const existingVideoIds = existingSharedVideos.map((v) => v.videoId);
-			const newVideoIds = validVideoIds.filter(
-				(id) => !existingVideoIds.includes(id),
-			);
-
-			if (existingVideoIds.length > 0) {
-				await db()
-					.update(sharedVideos)
-					.set({ folderId: null })
-					.where(
-						and(
-							eq(sharedVideos.organizationId, spaceId),
-							inArray(sharedVideos.videoId, existingVideoIds),
-						),
-					);
-			}
-
-			if (newVideoIds.length > 0) {
-				const sharedVideoEntries = newVideoIds.map((videoId) => ({
-					id: nanoId(),
-					videoId,
-					organizationId: spaceId,
-					sharedByUserId: user.id,
-				}));
-				await db().insert(sharedVideos).values(sharedVideoEntries);
-			}
-		} else {
-			const existingSpaceVideos = await db()
-				.select({ videoId: spaceVideos.videoId })
-				.from(spaceVideos)
-				.where(
-					and(
-						eq(spaceVideos.spaceId, spaceId),
-						inArray(spaceVideos.videoId, validVideoIds),
-					),
-				);
-
-			const existingVideoIds = existingSpaceVideos.map((v) => v.videoId);
-			const newVideoIds = validVideoIds.filter(
-				(id) => !existingVideoIds.includes(id),
-			);
-
-			if (existingVideoIds.length > 0) {
-				await db()
-					.update(spaceVideos)
-					.set({ folderId: null })
-					.where(
-						and(
-							eq(spaceVideos.spaceId, spaceId),
-							inArray(spaceVideos.videoId, existingVideoIds),
-						),
-					);
-			}
-
-			if (newVideoIds.length > 0) {
-				const spaceVideoEntries = newVideoIds.map((videoId) => ({
-					id: nanoId(),
-					videoId,
-					spaceId,
-					addedById: user.id,
-				}));
-
-				await db().insert(spaceVideos).values(spaceVideoEntries);
-			}
-		}
-
+		const { count } = await mutateSharedVideos(db(), {
+			userId: user.id,
+			destination: isAllSpacesEntry
+				? { type: "organization", id: user.activeOrganizationId }
+				: { type: "space", id: spaceId },
+			videoIds,
+			action: "add",
+			mode: "manager",
+		});
 		revalidatePath(`/dashboard/spaces/${spaceId}`);
 		revalidatePath("/dashboard/caps");
 
 		return {
 			success: true,
-			message: `${validVideoIds.length} video${validVideoIds.length === 1 ? "" : "s"} added to ${isAllSpacesEntry ? "organization" : "space"}`,
+			message: `${count} video${count === 1 ? "" : "s"} added to ${isAllSpacesEntry ? "organization" : "space"}`,
 		};
 	} catch (error) {
 		console.error("Error adding videos to space:", error);

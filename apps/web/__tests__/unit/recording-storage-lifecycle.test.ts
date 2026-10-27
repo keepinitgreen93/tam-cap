@@ -637,6 +637,7 @@ async function storageFixture(seed: Iterable<readonly [string, string]>) {
 	);
 	mocks.bucketAccess.mockReturnValue(Effect.succeed([access, Option.none()]));
 	return {
+		access,
 		objects,
 		sizes,
 		identities,
@@ -875,10 +876,61 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.unstubAllEnvs();
 	for (const client of clients.splice(0)) client.destroy();
 });
 
 describe("recording storage lifecycle", () => {
+	it("uses R2 PUT uploads with signed metadata and fresh-object preconditions", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		databaseFixture();
+		await storageFixture([]);
+		const [access] = await Storage.getAccessForVideo(recording()).pipe(
+			Effect.provide(Storage.Default),
+			Effect.runPromise,
+		);
+		const target = await Effect.runPromise(
+			access.createUploadTarget(`${prefix}new.mp4`, {
+				contentType: "video/mp4",
+				fields: { "x-amz-meta-userid": ownerId, "x-amz-meta-duration": "10" },
+				ifNoneMatch: "*",
+			}),
+		);
+		expect(target.type).toBe("put");
+		if (target.type !== "put") throw new Error("Expected a PUT target");
+		expect(target.headers).toEqual({
+			"Content-Type": "video/mp4",
+			"x-amz-meta-userid": ownerId,
+			"x-amz-meta-duration": "10",
+			"If-None-Match": "*",
+		});
+		const signed = new URL(target.url).searchParams.get("X-Amz-SignedHeaders");
+		for (const header of [
+			"content-type",
+			"if-none-match",
+			"x-amz-meta-userid",
+			"x-amz-meta-duration",
+		])
+			expect(signed).toContain(header);
+	});
+	it("preserves POST upload support for custom S3 providers", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		databaseFixture();
+		const fixture = await storageFixture([]);
+		mocks.bucketAccess.mockReturnValue(
+			Effect.succeed([fixture.access, Option.some({ id: "custom-bucket" })]),
+		);
+		const [access] = await Storage.getAccessForVideo(recording()).pipe(
+			Effect.provide(Storage.Default),
+			Effect.runPromise,
+		);
+		const target = await Effect.runPromise(
+			access.createUploadTarget(`${prefix}new.mp4`, {
+				contentType: "video/mp4",
+			}),
+		);
+		expect(target.type).toBe("s3Post");
+	});
 	it.each(["desktopMP4", "webMP4"] as const)(
 		"uses the published %s thumbnail without discovering older objects",
 		async (type) => {

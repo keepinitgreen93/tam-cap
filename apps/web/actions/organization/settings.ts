@@ -1,8 +1,10 @@
 "use server";
 
-import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
-import { organizations } from "@cap/database/schema";
+import { requireOrganizationManager } from "@cap/database/cloudflare/access";
+import { db } from "@cap/database/cloudflare/application";
+import { atomic } from "@cap/database/cloudflare/atomic";
+import { organizations } from "@cap/database/cloudflare/schema";
 import { userIsPro } from "@cap/utils";
 import {
 	AI_GENERATION_LANGUAGE_AUTO,
@@ -12,7 +14,6 @@ import {
 import { eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 import { normalizePlaybackSpeed } from "@/lib/playback-speed";
-import { requireOrganizationSettingsManager } from "./authorization";
 
 type OrganizationSettingsInput = {
 	disableSummary?: boolean;
@@ -85,35 +86,38 @@ export async function updateOrganizationSettings(
 		throw new Error("Organization not found");
 	}
 
-	const [organization] = await db()
-		.select()
-		.from(organizations)
-		.where(eq(organizations.id, user.activeOrganizationId));
+	const organizationId = user.activeOrganizationId;
+	const database = db();
+	await atomic(database, async (snapshot) => {
+		const { organization } = await requireOrganizationManager(
+			snapshot,
+			organizationId,
+			user.id,
+		);
+		const sanitizedSettings =
+			settings.defaultPlaybackSpeed !== undefined
+				? {
+						...settings,
+						defaultPlaybackSpeed: normalizePlaybackSpeed(
+							settings.defaultPlaybackSpeed,
+						),
+					}
+				: settings;
 
-	if (!organization) {
-		throw new Error("Organization not found");
-	}
+		const nextSettings = userIsPro(user)
+			? sanitizedSettings
+			: preserveProSettings(sanitizedSettings, organization.settings);
 
-	await requireOrganizationSettingsManager(user.id, user.activeOrganizationId);
-
-	const sanitizedSettings =
-		settings.defaultPlaybackSpeed !== undefined
-			? {
-					...settings,
-					defaultPlaybackSpeed: normalizePlaybackSpeed(
-						settings.defaultPlaybackSpeed,
-					),
-				}
-			: settings;
-
-	const nextSettings = userIsPro(user)
-		? sanitizedSettings
-		: preserveProSettings(sanitizedSettings, organization.settings);
-
-	await db()
-		.update(organizations)
-		.set({ settings: nextSettings })
-		.where(eq(organizations.id, user.activeOrganizationId));
+		return {
+			statements: [
+				database
+					.update(organizations)
+					.set({ settings: { ...organization.settings, ...nextSettings } })
+					.where(eq(organizations.id, organizationId)),
+			],
+			result: undefined,
+		};
+	});
 
 	revalidatePath("/dashboard/caps");
 	revalidatePath("/dashboard/settings/organization");

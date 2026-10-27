@@ -7,6 +7,7 @@
 	"scripts": {
 		"db:generate": "drizzle-kit generate --config=drizzle.config.ts",
 		"db:generate:cloudflare": "drizzle-kit generate --config=drizzle.cloudflare.config.ts",
+		"db:generate:analytics": "drizzle-kit generate --config=drizzle.analytics.config.ts",
 		"test:cloudflare": "node --test cloudflare/database.test.ts cloudflare/atomic.test.ts cloudflare/validation.test.ts",
 		"db:generate:cloudflare-concurrency": "node cloudflare/generate-concurrency-migration.ts",
 		"db:generate:cloudflare-validation": "node cloudflare/generate-validation-migration.ts",
@@ -65,6 +66,10 @@
 	"exports": {
 		".": "./index.ts",
 		"./cloudflare": "./cloudflare/index.ts",
+		"./cloudflare/analytics": "./cloudflare/analytics/index.ts",
+		"./cloudflare/analytics/application": "./cloudflare/analytics/application.ts",
+		"./cloudflare/analytics/repository": "./cloudflare/analytics/repository.ts",
+		"./cloudflare/analytics/schema": "./cloudflare/analytics/schema.ts",
 		"./cloudflare/schema": "./cloudflare/schema.ts",
 		"./cloudflare/atomic": "./cloudflare/atomic.ts",
 		"./cloudflare/bridge": "./cloudflare/bridge.ts",

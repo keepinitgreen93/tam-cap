@@ -7,7 +7,7 @@ import {
 } from "@cap/web-domain";
 import { QueryPromise } from "drizzle-orm/query-promise";
 import { Effect, Option } from "effect";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	databaseRevision,
 	snapshotGuard,
@@ -758,6 +758,7 @@ describe("DELETE /delete", () => {
 });
 
 describe("GET /create", () => {
+	afterEach(() => vi.unstubAllEnvs());
 	let app: typeof import("@/app/api/desktop/[...route]/video")["app"];
 
 	beforeEach(async () => {
@@ -769,7 +770,8 @@ describe("GET /create", () => {
 		app = mod.app;
 	});
 
-	it("provisions a personal org and creates the video there when the user has none", async () => {
+	it("provisions a personal org for the configured owner with no org", async () => {
+		vi.stubEnv("CAP_OWNER_EMAIL", "grant@cap.test");
 		mockGetCurrentUser.mockResolvedValue({
 			id: "user-1",
 			email: "grant@cap.test",
@@ -867,7 +869,8 @@ describe("GET /create", () => {
 		});
 	});
 
-	it("heals a dangling defaultOrgId when the user has no remaining orgs", async () => {
+	it("heals a dangling defaultOrgId for the configured owner", async () => {
+		vi.stubEnv("CAP_OWNER_EMAIL", "grant@cap.test");
 		mockGetCurrentUser.mockResolvedValue({
 			id: "user-1",
 			email: "grant@cap.test",
@@ -895,7 +898,8 @@ describe("GET /create", () => {
 		});
 	});
 
-	it("routes a stale explicit orgId to the provisioned org when the user has none", async () => {
+	it("routes a stale explicit orgId to the configured owner fallback org", async () => {
+		vi.stubEnv("CAP_OWNER_EMAIL", "grant@cap.test");
 		mockGetCurrentUser.mockResolvedValue({
 			id: "user-1",
 			email: "grant@cap.test",
