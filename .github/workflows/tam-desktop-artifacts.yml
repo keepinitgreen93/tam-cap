@@ -8,10 +8,6 @@ on:
         type: choice
         default: windows
         options: [windows, macos, both]
-  push:
-    branches: [codex/cloudflare-self-host]
-    paths:
-      - .github/workflows/tam-desktop-artifacts.yml
 
 permissions:
   contents: read
@@ -30,7 +26,7 @@ jobs:
         env:
           PLATFORM: ${{ github.event.inputs.platform || 'windows' }}
         run: |
-          node -e 'const fs = require("fs"); const p = process.env.PLATFORM; if (!["windows", "macos", "both"].includes(p)) throw Error("Invalid platform"); const all = [{name:"windows-x64",os:"windows-2022",target:"x86_64-pc-windows-msvc"},{name:"macos-arm64",os:"macos-14",target:"aarch64-apple-darwin"}]; const include = all.filter(x => p === "both" || x.name.startsWith(p)); fs.appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify({include}) + "\n");'
+          node -e 'const fs = require("fs"); const p = process.env.PLATFORM; if (!["windows", "macos", "both"].includes(p)) throw Error("Invalid platform"); const all = [{name:"windows-x64",os:"windows-2022",target:"x86_64-pc-windows-msvc"},{name:"macos-arm64",os:"macos-15",target:"aarch64-apple-darwin"}]; const include = all.filter(x => p === "both" || x.name.startsWith(p)); fs.appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify({include}) + "\n");'
 
   build:
     needs: prepare
