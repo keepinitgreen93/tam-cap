@@ -28,7 +28,7 @@ const schemaMocks = vi.hoisted(() => ({
 const videoRow = vi.hoisted(() => ({
 	id: "video-123",
 	ownerId: "user-456",
-	duration: 4,
+	duration: 4 as number | null,
 	settings: null,
 	source: { type: "webMP4" },
 	isScreenshot: false,
@@ -43,12 +43,22 @@ const videoRow = vi.hoisted(() => ({
 	},
 }));
 
-const state = vi.hoisted(() => ({ editRows: [] as unknown[] }));
+const state = vi.hoisted(() => ({
+	editRows: [] as unknown[],
+	cloudflare: false,
+}));
 
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({
 		ASSEMBLY_API_KEY: "test-assembly-api-key",
 		NEXTAUTH_SECRET: "test-secret-with-enough-entropy",
+		...(state.cloudflare
+			? {
+					TRANSCRIPTION_PROVIDER: "cloudflare",
+					CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+					CLOUDFLARE_AI_API_TOKEN: "test-token",
+				}
+			: {}),
 	}),
 }));
 
@@ -175,6 +185,7 @@ function pipeValue(value: unknown) {
 
 describe("transcribeVideoWorkflow", () => {
 	beforeEach(() => {
+		videoRow.duration = 4;
 		mocks.updates.length = 0;
 		state.editRows = [];
 		mocks.transcribe.mockResolvedValue({
@@ -247,6 +258,101 @@ describe("transcribeVideoWorkflow", () => {
 
 		expect(mocks.updates.at(-1)).toEqual({ transcriptionStatus: "COMPLETE" });
 	});
+
+	it.each([4, null, 0])(
+		"persists Cloudflare timing and content type with DB duration %s",
+		async (duration) => {
+			videoRow.duration = duration;
+			state.cloudflare = true;
+			const requests: Request[] = [];
+			vi.stubGlobal(
+				"fetch",
+				async (input: RequestInfo | URL, init?: RequestInit) => {
+					const request = new Request(input, init);
+					if (new URL(request.url).hostname === "storage.test") {
+						return new Response(new Uint8Array([1, 2, 3]), {
+							headers: { "Content-Type": "audio/mp4" },
+						});
+					}
+					requests.push(request);
+					return Response.json({
+						success: true,
+						result: {
+							metadata: { duration: 4 },
+							results: {
+								channels: [
+									{
+										alternatives: [
+											{
+												transcript: "Um, hello.",
+												words: [
+													{
+														word: "um",
+														punctuated_word: "Um,",
+														start: 0.1,
+														end: 0.3,
+													},
+													{
+														word: "hello",
+														punctuated_word: "hello.",
+														start: 0.5,
+														end: 1,
+													},
+												],
+											},
+										],
+									},
+								],
+							},
+						},
+					});
+				},
+			);
+			try {
+				const { transcribeVideoWorkflow } = await import(
+					"@/workflows/transcribe"
+				);
+				const result = await transcribeVideoWorkflow({
+					videoId: "video-123",
+					userId: "user-456",
+					aiGenerationEnabled: false,
+				});
+				expect(result.success).toBe(true);
+				expect(requests).toHaveLength(1);
+				expect(requests[0]?.headers.get("Content-Type")).toBe("audio/mp4");
+				expect(mocks.transcribe).not.toHaveBeenCalled();
+				const writes = new Map(
+					mocks.putObject.mock.calls.map((call) => [
+						call[0] as string,
+						call[1],
+					]),
+				);
+				const { decryptEditTranscriptObject } = await import(
+					"@/lib/edit-transcript-storage"
+				);
+				const stored = JSON.parse(
+					decryptEditTranscriptObject(
+						writes.get(
+							"user-456/video-123/transcription.edit.v3.json",
+						) as string,
+						"user-456",
+						"video-123",
+					) ?? "{}",
+				);
+				expect(stored.words[0]).toMatchObject({
+					text: "Um,",
+					startMs: 100,
+					endMs: 300,
+				});
+				expect(stored.durationMs).toBe(4000);
+				expect(writes.get("user-456/video-123/transcription.vtt")).toContain(
+					"hello.",
+				);
+			} finally {
+				state.cloudflare = false;
+			}
+		},
+	);
 
 	it("handles no-speech errors across workflow realms without retrying transcription", async () => {
 		const { FatalError } = await import("workflow");
@@ -327,6 +433,7 @@ describe("transcribeVideoWorkflow", () => {
 
 describe("backfillEditTranscriptWorkflow", () => {
 	beforeEach(() => {
+		videoRow.duration = 4;
 		state.editRows = [];
 		videoRow.metadata = {
 			editTranscriptBackfill: {
@@ -355,51 +462,57 @@ describe("backfillEditTranscriptWorkflow", () => {
 		);
 	});
 
-	it("transcribes the original media in the original timeline when edits exist", async () => {
-		state.editRows = [
-			{
-				sourceKey: "user-456/video-123/original.mp4",
-				editSpec: {
-					version: 1,
-					sourceDuration: 12,
-					keepRanges: [{ start: 0, end: 4 }],
+	it.each([
+		{ sourceDuration: 12, expectedDurationMs: 12_000 },
+		{ sourceDuration: 0, expectedDurationMs: 4_000 },
+	])(
+		"transcribes original media using saved or probed duration $sourceDuration",
+		async ({ sourceDuration, expectedDurationMs }) => {
+			state.editRows = [
+				{
+					sourceKey: "user-456/video-123/original.mp4",
+					editSpec: {
+						version: 1,
+						sourceDuration,
+						keepRanges: [{ start: 0, end: 4 }],
+					},
 				},
-			},
-		];
+			];
 
-		const { backfillEditTranscriptWorkflow } = await import(
-			"@/workflows/transcribe"
-		);
-		const result = await backfillEditTranscriptWorkflow({
-			videoId: "video-123",
-			userId: "user-456",
-			requestId: "request-1",
-		});
+			const { backfillEditTranscriptWorkflow } = await import(
+				"@/workflows/transcribe"
+			);
+			const result = await backfillEditTranscriptWorkflow({
+				videoId: "video-123",
+				userId: "user-456",
+				requestId: "request-1",
+			});
 
-		expect(result.success).toBe(true);
-		expect(mocks.getInternalSignedObjectUrl.mock.calls[0]?.[0]).toBe(
-			"user-456/video-123/original.mp4",
-		);
+			expect(result.success).toBe(true);
+			expect(mocks.getInternalSignedObjectUrl.mock.calls[0]?.[0]).toBe(
+				"user-456/video-123/original.mp4",
+			);
 
-		const { parseEditTranscript } = await import("@/lib/edit-transcript");
-		const { decryptEditTranscriptObject } = await import(
-			"@/lib/edit-transcript-storage"
-		);
-		const write = mocks.putObject.mock.calls.find(
-			(call) => call[0] === "user-456/video-123/transcription.edit.v3.json",
-		);
-		const decrypted = decryptEditTranscriptObject(
-			write?.[1] as string,
-			"user-456",
-			"video-123",
-		);
-		expect(parseEditTranscript(decrypted ?? "")).toMatchObject({
-			durationMs: 12_000,
-		});
-		expect(mocks.deleteObject).not.toHaveBeenCalledWith(
-			"user-456/video-123/transcription.edit.v3.status.json",
-		);
-	});
+			const { parseEditTranscript } = await import("@/lib/edit-transcript");
+			const { decryptEditTranscriptObject } = await import(
+				"@/lib/edit-transcript-storage"
+			);
+			const write = mocks.putObject.mock.calls.find(
+				(call) => call[0] === "user-456/video-123/transcription.edit.v3.json",
+			);
+			const decrypted = decryptEditTranscriptObject(
+				write?.[1] as string,
+				"user-456",
+				"video-123",
+			);
+			expect(parseEditTranscript(decrypted ?? "")).toMatchObject({
+				durationMs: expectedDurationMs,
+			});
+			expect(mocks.deleteObject).not.toHaveBeenCalledWith(
+				"user-456/video-123/transcription.edit.v3.status.json",
+			);
+		},
+	);
 
 	it("does not run a backfill after its database claim is replaced", async () => {
 		const { backfillEditTranscriptWorkflow } = await import(

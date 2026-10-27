@@ -14,9 +14,8 @@ import { isAiGenerationEnabledForUser } from "@/lib/ai-generation-entitlement";
 import {
 	ASSEMBLYAI_SPEECH_MODELS,
 	ASSEMBLYAI_SUPPORTED_LANGUAGES,
-	createAssemblyAIClient,
-	getAssemblyAITranscriptionOptions,
 } from "@/lib/assemblyai";
+import { CLOUDFLARE_SPEECH_MODEL } from "@/lib/cloudflare-transcription";
 import {
 	getEditTranscriptObjectKey,
 	serializeEditTranscript,
@@ -39,6 +38,8 @@ import {
 } from "@/lib/live-transcribe-core";
 import { downloadConcatenatedSegmentsToBuffer } from "@/lib/segments-audio-download";
 import { transcribeVideo } from "@/lib/transcribe";
+import { isTranscriptionConfigured } from "@/lib/transcription-config";
+import { transcribeAudio } from "@/lib/transcription-provider";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
@@ -210,8 +211,8 @@ async function initLiveTranscription(
 ): Promise<InitResult> {
 	"use step";
 
-	if (!serverEnv().ASSEMBLY_API_KEY) {
-		return { ok: false, reason: "missing ASSEMBLY_API_KEY" };
+	if (!isTranscriptionConfigured(serverEnv())) {
+		return { ok: false, reason: "missing transcription provider credentials" };
 	}
 
 	const [row] = await db()
@@ -284,7 +285,7 @@ async function processNextLiveChunk(options: {
 }): Promise<ChunkStepResult> {
 	"use step";
 
-	const { videoId, userId, lastProcessedIndex, targetSeconds } = options;
+	const { videoId, lastProcessedIndex, targetSeconds } = options;
 
 	const [video] = await db()
 		.select()
@@ -433,21 +434,21 @@ async function processNextLiveChunk(options: {
 		// ffmpeg — the binary doesn't exist in the serverless runtime.
 		const audioBuffer = await downloadConcatenatedSegmentsToBuffer(segmentUrls);
 
-		const client = createAssemblyAIClient();
 		const language = (
 			ASSEMBLYAI_SUPPORTED_LANGUAGES as readonly string[]
 		).includes(options.language)
 			? (options.language as AiGenerationLanguage)
 			: ("auto" as AiGenerationLanguage);
-		const transcript = await client.transcripts.transcribe({
-			audio: audioBuffer,
-			...getAssemblyAITranscriptionOptions(language),
-			disfluencies: true,
-		});
+		const transcript = await transcribeAudio(
+			audioBuffer,
+			language,
+			"audio/mp4",
+			decision.durationMs,
+		);
 
 		const noSpokenAudio = isNoSpokenAudioError(transcript);
 		if (transcript.status === "error" && !noSpokenAudio) {
-			throw new Error(transcript.error ?? "AssemblyAI chunk failed");
+			throw new Error(transcript.error ?? "Transcription chunk failed");
 		}
 
 		const words = noSpokenAudio
@@ -674,7 +675,9 @@ async function promoteLiveTranscript(
 							serializeEditTranscript(
 								liveTranscriptToEditTranscript(
 									artifact,
-									ASSEMBLYAI_SPEECH_MODELS[0],
+									serverEnv().TRANSCRIPTION_PROVIDER === "cloudflare"
+										? CLOUDFLARE_SPEECH_MODEL
+										: ASSEMBLYAI_SPEECH_MODELS[0],
 								),
 							),
 							video.ownerId,

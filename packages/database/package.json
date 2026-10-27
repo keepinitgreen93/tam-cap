@@ -6,6 +6,8 @@
 	"main": "index.js",
 	"scripts": {
 		"db:generate": "drizzle-kit generate --config=drizzle.config.ts",
+		"db:generate:cloudflare": "drizzle-kit generate --config=drizzle.cloudflare.config.ts",
+		"test:cloudflare": "node --test cloudflare/database.test.ts",
 		"db:push": "drizzle-kit push --config=drizzle.config.ts",
 		"db:check": "drizzle-kit check:mysql --config=drizzle.config.ts",
 		"db:up": "drizzle-kit up:mysql --config=drizzle.config.ts",
@@ -39,6 +41,7 @@
 		"zod": "^3"
 	},
 	"devDependencies": {
+		"@cloudflare/workers-types": "4.20260630.1",
 		"@cap/ui": "workspace:*",
 		"@cap/utils": "workspace:*",
 		"@types/node": "^20.10.0",
@@ -46,6 +49,7 @@
 		"@types/react-dom": "19.1.9",
 		"dotenv-cli": "latest",
 		"drizzle-kit": "0.31.0",
+		"miniflare": "4.20260415.0",
 		"nodemailer": "^6.9.8",
 		"react": "^19.1.1",
 		"react-dom": "^19.1.1",
@@ -58,6 +62,8 @@
 	},
 	"exports": {
 		".": "./index.ts",
+		"./cloudflare": "./cloudflare/index.ts",
+		"./cloudflare/schema": "./cloudflare/schema.ts",
 		"./auth/auth-options": "./auth/auth-options.ts",
 		"./auth/domain-utils": "./auth/domain-utils.ts",
 		"./auth/request-site": "./auth/request-site.ts",

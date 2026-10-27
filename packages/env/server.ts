@@ -129,6 +129,12 @@ function createServerEnv() {
 				),
 
 			/// AI providers
+			TRANSCRIPTION_PROVIDER: z.enum(["assemblyai", "cloudflare"]).optional(),
+			CLOUDFLARE_ACCOUNT_ID: z
+				.string()
+				.regex(/^[a-f0-9]{32}$/i)
+				.optional(),
+			CLOUDFLARE_AI_API_TOKEN: z.string().min(1).optional(),
 			ASSEMBLY_API_KEY: z.string().optional().describe("Audio transcription"),
 			ASSEMBLY_BASE_URL: z
 				.string()

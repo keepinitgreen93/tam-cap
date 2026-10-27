@@ -1,0 +1,9 @@
+{
+	"name": "@tam/cap-cloudflare-platform",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"test": "node --test worker.test.mjs",
+		"typecheck": "tsc -p tsconfig.json"
+	}
+}

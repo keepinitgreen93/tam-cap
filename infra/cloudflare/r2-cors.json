@@ -1,0 +1,13 @@
+{
+	"rules": [
+		{
+			"allowed": {
+				"origins": ["https://videos.trulyauthenticmarketing.com"],
+				"methods": ["GET", "HEAD", "PUT", "POST"],
+				"headers": ["*"]
+			},
+			"exposeHeaders": ["ETag"],
+			"maxAgeSeconds": 3000
+		}
+	]
+}

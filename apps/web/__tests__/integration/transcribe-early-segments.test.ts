@@ -50,12 +50,20 @@ const videoRow = vi.hoisted(() => ({
 const state = vi.hoisted(() => ({
 	editRows: [] as unknown[],
 	fakeAudioPath: "",
+	cloudflare: false,
 }));
 
 vi.mock("@cap/env", () => ({
 	serverEnv: () => ({
 		ASSEMBLY_API_KEY: "test-assembly-api-key",
 		NEXTAUTH_SECRET: "test-secret-with-enough-entropy",
+		...(state.cloudflare
+			? {
+					TRANSCRIPTION_PROVIDER: "cloudflare",
+					CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+					CLOUDFLARE_AI_API_TOKEN: "test-token",
+				}
+			: {}),
 	}),
 }));
 
@@ -363,6 +371,72 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		expect(mocks.transcribe).not.toHaveBeenCalled();
 		expect(mocks.updates).toContainEqual({ transcriptionStatus: "NO_AUDIO" });
 		expect(mocks.updates).not.toContainEqual({ transcriptionStatus: "ERROR" });
+	});
+
+	it("preserves segment duration for Cloudflare when the normal path has no muxed source", async () => {
+		state.cloudflare = true;
+		const previousFetch = globalThis.fetch;
+		vi.stubGlobal(
+			"fetch",
+			async (input: RequestInfo | URL, init?: RequestInit) => {
+				if (String(input).startsWith("https://api.cloudflare.com/")) {
+					return Response.json({
+						success: true,
+						result: {
+							results: {
+								channels: [
+									{
+										alternatives: [
+											{
+												transcript: "um hello",
+												words: [
+													{ word: "um", start: 0.1, end: 0.3 },
+													{ word: "hello", start: 0.5, end: 1 },
+												],
+											},
+										],
+									},
+								],
+							},
+						},
+					});
+				}
+				return previousFetch(input, init);
+			},
+		);
+		try {
+			const { transcribeVideoWorkflow } = await import(
+				"@/workflows/transcribe"
+			);
+			const result = await transcribeVideoWorkflow({
+				videoId: "video-123",
+				userId: "user-456",
+				aiGenerationEnabled: false,
+			});
+			expect(result.success).toBe(true);
+			const { decryptEditTranscriptObject } = await import(
+				"@/lib/edit-transcript-storage"
+			);
+			const write = mocks.putObject.mock.calls.find(
+				(call) => call[0] === "user-456/video-123/transcription.edit.v3.json",
+			);
+			const stored = JSON.parse(
+				decryptEditTranscriptObject(
+					write?.[1] as string,
+					"user-456",
+					"video-123",
+				) ?? "{}",
+			);
+			expect(stored.durationMs).toBe(4500);
+			expect(stored.words[0]).toMatchObject({
+				text: "um",
+				startMs: 100,
+				endMs: 300,
+			});
+			expect(mocks.transcribe).not.toHaveBeenCalled();
+		} finally {
+			state.cloudflare = false;
+		}
 	});
 
 	it("falls back to segment audio in the normal path when no muxed source exists", async () => {

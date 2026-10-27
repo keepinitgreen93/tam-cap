@@ -5,6 +5,7 @@ import type { Organisation, User, Video } from "@cap/web-domain";
 import { and, eq, sql } from "drizzle-orm";
 import { start } from "workflow/api";
 import { liveTranscribeWorkflow } from "@/workflows/live-transcribe";
+import { isTranscriptionConfigured } from "./transcription-config";
 
 const getAffectedRows = (result: unknown) => {
 	if (Array.isArray(result)) {
@@ -34,7 +35,7 @@ export async function maybeStartLiveTranscription({
 	orgId: Organisation.OrganisationId;
 }): Promise<LiveTranscriptionStart> {
 	try {
-		if (!serverEnv().ASSEMBLY_API_KEY) {
+		if (!isTranscriptionConfigured(serverEnv())) {
 			return "skipped";
 		}
 

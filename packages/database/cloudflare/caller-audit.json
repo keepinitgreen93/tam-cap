@@ -1,0 +1,5558 @@
+{
+	"scope": "Non-test TypeScript and JavaScript in apps and packages; line-based candidates require semantic review.",
+	"sourceFiles": 1907,
+	"summary": {
+		"databaseImports": {
+			"lines": 781,
+			"files": 298
+		},
+		"mysqlImports": {
+			"lines": 12,
+			"files": 11
+		},
+		"interactiveTransactions": {
+			"lines": 123,
+			"files": 62
+		},
+		"mysqlUpserts": {
+			"lines": 25,
+			"files": 16
+		},
+		"mysqlMutationResults": {
+			"lines": 117,
+			"files": 40
+		},
+		"rowLocks": {
+			"lines": 140,
+			"files": 42
+		},
+		"sqlDialectCandidates": {
+			"lines": 179,
+			"files": 48
+		}
+	},
+	"findings": {
+		"databaseImports": [
+			{
+				"path": "apps/web/actions/admin/replace-video.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/admin/replace-video.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/actions/admin/replace-video.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/actions/admin/reprocess-video.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/admin/reprocess-video.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/caps/share.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/caps/share.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/caps/share.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/caps/share.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/actions/collections/logo.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/collections/logo.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/collections/logo.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/collections/password.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/collections/visibility.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/collections/visibility.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/collections/visibility.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/add-domain.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/add-domain.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/add-domain.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/add-domain.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/developers/create-app.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/create-app.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/create-app.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/create-app.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/developers/create-app.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/actions/developers/delete-app.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/delete-app.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/delete-app.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/delete-video.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/delete-video.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/delete-video.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/regenerate-keys.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/regenerate-keys.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/regenerate-keys.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/regenerate-keys.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/developers/regenerate-keys.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/developers/remove-domain.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/remove-domain.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/remove-domain.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/update-app.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/update-app.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/update-app.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/developers/update-auto-topup.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/developers/update-auto-topup.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/developers/update-auto-topup.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/folders/add-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/folders/add-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/folders/add-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/folders/add-videos.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/actions/folders/get-folder-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/folders/get-folder-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/folders/get-folder-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/actions/folders/moveVideoToFolder.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/folders/remove-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/folders/remove-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/folders/remove-videos.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/actions/folders/require-personal-folder.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/actions/folders/require-personal-folder.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 8
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 9
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 18
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 16
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 17
+			},
+			{
+				"path": "apps/web/actions/messenger.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/messenger.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/messenger.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/actions/notifications/mark-as-read.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/notifications/mark-as-read.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/notifications/mark-as-read.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/notifications/update-preferences.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/notifications/update-preferences.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/notifications/update-preferences.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/authorization.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/actions/organization/authorization.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/actions/organization/check-domain.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/check-domain.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/check-domain.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/content-transfer.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/content-transfer.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/content-transfer.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/content-transfer.ts",
+				"line": 20
+			},
+			{
+				"path": "apps/web/actions/organization/create-space.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/create-space.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/create-space.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/create-space.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/create-space.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/organization/default-video-visibility.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/default-video-visibility.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/default-video-visibility.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/delete-space.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/delete-space.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/delete-space.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/actions/organization/get-organization-sso-data.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/get-organization-sso-data.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/get-organization-sso-data.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/actions/organization/get-organization-sso-data.ts",
+				"line": 14
+			},
+			{
+				"path": "apps/web/actions/organization/get-organization-sso-data.ts",
+				"line": 15
+			},
+			{
+				"path": "apps/web/actions/organization/get-subscription-details.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/get-subscription-details.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/get-subscription-details.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/manage-billing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/manage-billing.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/manage-billing.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/remove-domain.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/remove-domain.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/remove-domain.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/remove-invite.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/remove-invite.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/remove-invite.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/actions/organization/settings.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/settings.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/settings.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/shareable-link-icon.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/shareable-link-icon.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/shareable-link-icon.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/actions/organization/slack.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/space-authorization.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/space-authorization.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/actions/organization/sso.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/sso.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/sso.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/sso.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 15
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/update-details.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/update-details.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/update-details.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/update-domain.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/update-domain.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/update-domain.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/update-member-role.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/update-member-role.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/update-member-role.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/update-seat-quantity.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/update-seat-quantity.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/update-seat-quantity.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/actions/organization/update-space.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/update-space.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/update-space.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organization/update-space.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/organization/update-space.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/organization/upload-space-icon.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organization/upload-space-icon.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organization/upload-space-icon.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organizations/add-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organizations/add-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organizations/add-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organizations/add-videos.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/actions/organizations/get-organization-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organizations/get-organization-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organizations/get-organization-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/organizations/remove-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/organizations/remove-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/organizations/remove-videos.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/actions/send-download-link.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/send-download-link.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/spaces/add-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/spaces/add-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/spaces/add-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/spaces/add-videos.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/spaces/get-space-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/spaces/get-space-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/spaces/get-space-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/spaces/get-user-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/spaces/get-user-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/spaces/get-user-videos.ts",
+				"line": 15
+			},
+			{
+				"path": "apps/web/actions/spaces/remove-videos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/spaces/remove-videos.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/spaces/remove-videos.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/video/create-for-processing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/video/create-for-processing.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/video/create-for-processing.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/video/create-for-processing.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/video/create-for-processing.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/video/finalize-desktop-segments.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/video/trigger-instant-recording-processing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/video/trigger-instant-recording-processing.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/video/trigger-instant-recording-processing.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/video/trigger-processing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/video/trigger-processing.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/video/trigger-processing.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/videos/call-to-action.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/call-to-action.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/call-to-action.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/download.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/download.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/download.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/edit-ai-content.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/edit-ai-content.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/edit-ai-content.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/edit-date.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/edit-date.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/edit-date.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/edit-date.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/videos/edit-title.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/edit-title.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/edit-title.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/edit-transcript.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/edit-transcript.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/edit-transcript.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/get-analytics.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/get-analytics.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/get-available-translations.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/get-available-translations.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/videos/get-live-transcript.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/get-live-transcript.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/get-og-image.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/actions/videos/get-og-image.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/actions/videos/get-status.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/get-status.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/get-status.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/get-transcript.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/get-transcript.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/get-transcript.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/new-comment.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/new-comment.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/new-comment.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/new-comment.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/videos/new-media-comment.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/new-media-comment.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/new-media-comment.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/password.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/password.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/password.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/actions/videos/password.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/videos/settings.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/settings.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/settings.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/translate-transcript.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/translate-transcript.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/_components/Navbar/search.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/_components/Navbar/search.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/_components/Navbar/search.ts",
+				"line": 14
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/_components/Navbar/server.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/_components/Navbar/server.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/_components/Navbar/server.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/analytics/data.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/analytics/data.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/Caps.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/Caps.tsx",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/components/CapCard/CapCard.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/components/CapCard/CapCard.tsx",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/page.tsx",
+				"line": 13
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/dashboard-data.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/dashboard-data.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/dashboard-data.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/apps/[appId]/videos/VideosClient.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/apps/[appId]/videos/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/apps/[appId]/videos/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/apps/[appId]/videos/page.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/credits/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/credits/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/credits/page.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/developer-data.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/developer-data.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/developer-data.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/developer-data.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/developers/layout.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/folder/[id]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/layout.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/layout.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/layout.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/refer/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/account/server.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/account/server.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/account/server.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/account/server.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/organization/integrations/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/organization/layout.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/organization/security/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/SharedCaps.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/actions.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/actions.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/actions.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/actions.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/components/SharedCapCard.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/folder/[folderId]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/spaces/[spaceId]/page.tsx",
+				"line": 15
+			},
+			{
+				"path": "apps/web/app/(org)/invite/[inviteId]/InviteAccept.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/(org)/invite/[inviteId]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/invite/[inviteId]/page.tsx",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/(org)/invite/[inviteId]/page.tsx",
+				"line": 10
+			},
+			{
+				"path": "apps/web/app/(org)/login/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/onboarding/[...steps]/layout.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/onboarding/[...steps]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/onboarding/layout.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/signup/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/verify-otp/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/(org)/verify-otp/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/(site)/(seo)/migrate-from-loom/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/Layout/current-user.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/Layout/devtoolsServer.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/Layout/devtoolsServer.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/Layout/devtoolsServer.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/analytics/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/analytics/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/analytics/track/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/analytics/track/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/analytics/track/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/auth/[...nextauth]/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/auth/[...nextauth]/route.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/auth/[...nextauth]/route.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/app/api/cron/sync-loops/health/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/cron/sync-loops/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/cron/sync-loops/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/dashboard/analytics/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/organizationStorage.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/organizationStorage.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/root.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/root.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/root.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/root.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/root.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/root.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/s3Config.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/s3Config.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/s3Config.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/s3Config.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/session.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/session.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/session.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/session.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/storage.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/storage.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/storage.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/storage.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/app/api/dev-reset-transcript/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/dev-reset-transcript/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/dev-reset-transcript/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/dev-reset-transcript/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/developer/credits/checkout/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/developer/credits/checkout/route.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/video-create.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/video-create.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/video-create.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/developer/v1/[...route]/usage.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/developer/v1/[...route]/usage.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/developer/v1/[...route]/videos.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/developer/v1/[...route]/videos.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/integrations/slack/callback/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/integrations/slack/install/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/internal/loom-imports/csv/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/internal/loom-imports/csv/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/app/api/notifications/preferences/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/notifications/preferences/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/notifications/preferences/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/notifications/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/notifications/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/notifications/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/playlist/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/recording/prepare/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/baa/download/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/baa/download/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/baa/download/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/manage/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/manage/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/manage/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/manage/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/subscribe/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/subscribe/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/subscribe/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/subscribe/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/settings/billing/usage/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/settings/user/name/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/settings/user/name/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/settings/user/name/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/settings/user/name/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/thumbnail/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/thumbnail/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/comment-media.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/comment-media.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/comment-media.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/multipart.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/multipart.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/recording-complete.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/recording-complete.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/signed.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/signed.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/utils.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/utils.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/utils.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/utils.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/utils.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 14
+			},
+			{
+				"path": "apps/web/app/api/video/ai/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/video/ai/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/video/ai/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/video/ai/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/video/comment/delete/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/video/comment/delete/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/video/comment/delete/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/video/comment/delete/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/video/domain-info/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/video/domain-info/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/video/metadata/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/video/metadata/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/video/metadata/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/video/metadata/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/video/transcribe/status/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/video/transcribe/status/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/video/transcribe/status/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-ai/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-ai/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-ai/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-ai/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-ai/route.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-transcription/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-transcription/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-transcription/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/videos/[videoId]/retry-transcription/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/multipart/[action]/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/multipart/[action]/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/webhooks/stripe/route.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/api/webhooks/stripe/route.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/api/webhooks/stripe/route.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/api/webhooks/stripe/route.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/api/webhooks/stripe/route.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/app/api/webhooks/stripe/route.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/app/cli/authorize/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/cli/authorize/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/cli/authorize/page.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/cli/authorize/page.tsx",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/embed/[videoId]/_components/EmbedVideo.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/embed/[videoId]/_components/EmbedVideo.tsx",
+				"line": 4
+			},
+			{
+				"path": "apps/web/app/embed/[videoId]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/embed/[videoId]/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/embed/[videoId]/page.tsx",
+				"line": 12
+			},
+			{
+				"path": "apps/web/app/embed/[videoId]/page.tsx",
+				"line": 13
+			},
+			{
+				"path": "apps/web/app/mcp/authorize/actions.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/mcp/authorize/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/Share.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/ShareVideo.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/Sidebar.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/media-comment/media-comment-types.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/edit/TranscriptSidebar.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/edit/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/edit/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/edit/page.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/page.tsx",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/page.tsx",
+				"line": 2
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/page.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/page.tsx",
+				"line": 16
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/page.tsx",
+				"line": 17
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/types.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/app/utils/auth.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/components/PublicCapCard.tsx",
+				"line": 3
+			},
+			{
+				"path": "apps/web/components/forms/server.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/components/forms/server.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/components/forms/server.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/components/forms/server.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/instrumentation.node.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/lib/admin-access.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/agent-access-grant.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/agent-api-cleanup.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/agent-api-cleanup.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/lib/agent-api.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/agent-token.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/agent-token.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/ai-content-metadata.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/audio-level-publication.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/audio-level-publication.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/lib/baa/billing.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/baa/billing.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/cap-analytics-access.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/cap-analytics-access.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/lib/comment-reply-parent.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/comment-reply-parent.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/desktop-manifest-rebuild.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/desktop-manifest-rebuild.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-health.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-health.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-source.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-upload-status.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/desktop-reupload.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/desktop-reupload.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/lib/desktop-segments-finalization.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/desktop-segments-finalization.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/desktop-segments-recovery.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/desktop-segments-recovery.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/developer-credits.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/developer-credits.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/developer-credits.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/lib/edit-transcript.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/folder.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/google-drive-storage-quota-cache.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/google-drive-storage-quota-cache.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/google-drive-storage-quota.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/google-drive-storage-quota.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/google-drive-storage-quota.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 18
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 19
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/loom-file-cleanup.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-file-cleanup.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/lib/loom-import-redrive.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-import-redrive.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/lib/mcp-data.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/mcp-data.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/lib/media-comments.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/messenger/agent.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/messenger/constants.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/messenger/data.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/messenger/data.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/messenger/data.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/messenger/data.ts",
+				"line": 10
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/lib/org-pro.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/org-pro.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/organization-provisioning.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/organization-provisioning.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/organization-provisioning.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/lib/organization-provisioning.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/lib/password-cookie.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/public-collections.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/public-collections.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/public-collections.ts",
+				"line": 15
+			},
+			{
+				"path": "apps/web/lib/public-collections.ts",
+				"line": 16
+			},
+			{
+				"path": "apps/web/lib/public-share-video.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/public-share-video.ts",
+				"line": 9
+			},
+			{
+				"path": "apps/web/lib/queue-video-transcription.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/queue-video-transcription.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/share-call-to-action.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/share-dashboard-destination.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/share-dashboard-destination.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/lib/share-playback.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/share-web-url.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/share-web-url.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/shareable-link-quota.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/shareable-link-quota.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/sso/workos.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/sso/workos.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/sso/workos.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/sync-video-storage-names.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/sync-video-storage-names.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/transcribe.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/transcribe.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/video-download-permissions.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-download-permissions.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/lib/video-edit-progress.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-edit-progress.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/video-edits.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 7
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 8
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/lib/video-processing.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-processing.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/lib/video-storage.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-view-count.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/lib/video-view-count.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/proxy.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/proxy.ts",
+				"line": 4
+			},
+			{
+				"path": "apps/web/workflows/admin-reprocess-video.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/workflows/admin-reprocess-video.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/edit-video.ts",
+				"line": 6
+			},
+			{
+				"path": "apps/web/workflows/edit-video.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/workflows/edit-video.ts",
+				"line": 17
+			},
+			{
+				"path": "apps/web/workflows/finalize-desktop-recording.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/finalize-desktop-recording.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 3
+			},
+			{
+				"path": "apps/web/workflows/import-loom-video.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/import-loom-video.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/process-video.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/process-video.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 5
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 11
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 2
+			},
+			{
+				"path": "apps/web/workflows/video-processing-status.ts",
+				"line": 1
+			},
+			{
+				"path": "apps/web/workflows/video-processing-status.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/database/migrate.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/AgentAuth.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/AgentAuth.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/web-backend/src/AgentManagement.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Auth.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Auth.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Auth.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/web-backend/src/Auth.ts",
+				"line": 4
+			},
+			{
+				"path": "packages/web-backend/src/Database.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Extension/Extensions.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Folders/FoldersRepo.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Folders/FoldersRepo.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Folders/index.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Organisations/OrganisationsRepo.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Organisations/index.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Organisations/index.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/S3Buckets/S3BucketsRepo.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/S3Buckets/index.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Spaces/SpacesRepo.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Spaces/index.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 4
+			},
+			{
+				"path": "packages/web-backend/src/Storage/index.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Users/UsersOnboarding.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Users/UsersOnboarding.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Users/index.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/web-backend/src/Videos/index.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/web-backend/src/Videos/index.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/web-backend/src/Videos/index.ts",
+				"line": 3
+			}
+		],
+		"mysqlImports": [
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 65
+			},
+			{
+				"path": "apps/web/utils/sql.ts",
+				"line": 2
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 5
+			},
+			{
+				"path": "packages/database/auth/stripe-customer.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/database/index.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/database/index.ts",
+				"line": 4
+			},
+			{
+				"path": "packages/database/loops/health.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 5
+			},
+			{
+				"path": "packages/database/loops/queue.ts",
+				"line": 3
+			},
+			{
+				"path": "packages/database/loops/sources.ts",
+				"line": 1
+			},
+			{
+				"path": "packages/database/loops/worker.ts",
+				"line": 5
+			},
+			{
+				"path": "packages/database/schema.ts",
+				"line": 34
+			}
+		],
+		"interactiveTransactions": [
+			{
+				"path": "apps/web/actions/admin/replace-video.ts",
+				"line": 71
+			},
+			{
+				"path": "apps/web/actions/developers/create-app.ts",
+				"line": 32
+			},
+			{
+				"path": "apps/web/actions/developers/delete-app.ts",
+				"line": 27
+			},
+			{
+				"path": "apps/web/actions/developers/regenerate-keys.ts",
+				"line": 37
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 235
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 384
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 494
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 295
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 602
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 692
+			},
+			{
+				"path": "apps/web/actions/organization/content-transfer.ts",
+				"line": 624
+			},
+			{
+				"path": "apps/web/actions/organization/create-space.ts",
+				"line": 119
+			},
+			{
+				"path": "apps/web/actions/organization/delete-space.ts",
+				"line": 61
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 34
+			},
+			{
+				"path": "apps/web/actions/organization/send-invites.ts",
+				"line": 118
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 407
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 494
+			},
+			{
+				"path": "apps/web/actions/organization/storage.ts",
+				"line": 669
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 30
+			},
+			{
+				"path": "apps/web/actions/video/create-for-processing.ts",
+				"line": 93
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 237
+			},
+			{
+				"path": "apps/web/actions/video/upload.ts",
+				"line": 298
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 39
+			},
+			{
+				"path": "apps/web/actions/videos/edit-ai-content.ts",
+				"line": 66
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 188
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 99
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/settings/account/server.ts",
+				"line": 206
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 125
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/s3Config.ts",
+				"line": 105
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/storage.ts",
+				"line": 334
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/storage.ts",
+				"line": 500
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 147
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 221
+			},
+			{
+				"path": "apps/web/app/api/desktop/[...route]/video.ts",
+				"line": 314
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 205
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 41
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 37
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 463
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 613
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 681
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 2405
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/multipart.ts",
+				"line": 627
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/multipart.ts",
+				"line": 914
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 2365
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5853
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6302
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6729
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6797
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6898
+			},
+			{
+				"path": "apps/web/app/api/video/metadata/route.ts",
+				"line": 40
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 82
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 210
+			},
+			{
+				"path": "apps/web/lib/agent-token.ts",
+				"line": 63
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 208
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 298
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 343
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 417
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 546
+			},
+			{
+				"path": "apps/web/lib/audio-level-publication.ts",
+				"line": 213
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 254
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 450
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 539
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 579
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 611
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 698
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 736
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 794
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 848
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 934
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 975
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 194
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 504
+			},
+			{
+				"path": "apps/web/lib/developer-credits.ts",
+				"line": 29
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 35
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 313
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 473
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 663
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 192
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 281
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 27
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 97
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 158
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 232
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 280
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 56
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 53
+			},
+			{
+				"path": "apps/web/lib/organization-provisioning.ts",
+				"line": 43
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 308
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 494
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 567
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 594
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 106
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 159
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 200
+			},
+			{
+				"path": "apps/web/lib/video-edit-progress.ts",
+				"line": 25
+			},
+			{
+				"path": "apps/web/workflows/admin-reprocess-video.ts",
+				"line": 401
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 91
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 162
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 242
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 417
+			},
+			{
+				"path": "apps/web/workflows/import-loom-video.ts",
+				"line": 169
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 186
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 360
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 650
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 880
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 95
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 262
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 290
+			},
+			{
+				"path": "packages/database/auth/sso.ts",
+				"line": 190
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 96
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 107
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 122
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 133
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 143
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 154
+			},
+			{
+				"path": "packages/recorder-core/src/recording-spool.ts",
+				"line": 201
+			},
+			{
+				"path": "packages/web-backend/src/Organisations/index.ts",
+				"line": 159
+			},
+			{
+				"path": "packages/web-backend/src/Users/UsersOnboarding.ts",
+				"line": 91
+			},
+			{
+				"path": "packages/web-backend/src/Users/UsersOnboarding.ts",
+				"line": 289
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 66
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 97
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 136
+			},
+			{
+				"path": "packages/web-backend/src/Videos/index.ts",
+				"line": 588
+			}
+		],
+		"mysqlUpserts": [
+			{
+				"path": "apps/web/actions/admin/reprocess-video.ts",
+				"line": 43
+			},
+			{
+				"path": "apps/web/actions/videos/viewer-invites.ts",
+				"line": 82
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/multipart.ts",
+				"line": 161
+			},
+			{
+				"path": "apps/web/app/api/upload/[...route]/multipart.ts",
+				"line": 198
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 2463
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 3928
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5672
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5705
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6327
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 70
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 259
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 331
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 515
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 1065
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 48
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 80
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 105
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 64
+			},
+			{
+				"path": "apps/web/workflows/admin-reprocess-video.ts",
+				"line": 345
+			},
+			{
+				"path": "apps/web/workflows/edit-video.ts",
+				"line": 870
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 157
+			},
+			{
+				"path": "packages/database/loops/queue.ts",
+				"line": 19
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 340
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 436
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 83
+			}
+		],
+		"mysqlMutationResults": [
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 25
+			},
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 29
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 44
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 47
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 50
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 188
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 226
+			},
+			{
+				"path": "apps/web/actions/organization/remove-invite.ts",
+				"line": 42
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 85
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 61
+			},
+			{
+				"path": "apps/web/actions/organization/signed-baa.ts",
+				"line": 64
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 119
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 120
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 121
+			},
+			{
+				"path": "apps/web/actions/video/retry-processing.ts",
+				"line": 122
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 138
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 139
+			},
+			{
+				"path": "apps/web/app/api/cron/developer-storage/route.ts",
+				"line": 140
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 229
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 230
+			},
+			{
+				"path": "apps/web/app/api/developer/sdk/v1/[...route]/upload.ts",
+				"line": 231
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 147
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 151
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 3151
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 3152
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 207
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 209
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 210
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 1956
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 3981
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4144
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4982
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5313
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 457
+			},
+			{
+				"path": "apps/web/lib/agent-api-cleanup.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/lib/agent-api-cleanup.ts",
+				"line": 14
+			},
+			{
+				"path": "apps/web/lib/agent-api-cleanup.ts",
+				"line": 15
+			},
+			{
+				"path": "apps/web/lib/agent-api-cleanup.ts",
+				"line": 24
+			},
+			{
+				"path": "apps/web/lib/agent-token.ts",
+				"line": 20
+			},
+			{
+				"path": "apps/web/lib/agent-token.ts",
+				"line": 23
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 39
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 42
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 529
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 531
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 532
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 691
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 718
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 862
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 949
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 21
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 25
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 17
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 134
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 137
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 140
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 170
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 212
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 348
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 349
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 350
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 351
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 13
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 44
+			},
+			{
+				"path": "apps/web/lib/loom-import-redrive.ts",
+				"line": 22
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 130
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 131
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 132
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 133
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 150
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 151
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 152
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 153
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 50
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 51
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 52
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 53
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 72
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 74
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 86
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 36
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 163
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 179
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 181
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 259
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 307
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 14
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 24
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 34
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 45
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 61
+			},
+			{
+				"path": "apps/web/lib/mcp-cleanup.ts",
+				"line": 87
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 117
+			},
+			{
+				"path": "apps/web/lib/transcribe.ts",
+				"line": 37
+			},
+			{
+				"path": "apps/web/lib/transcribe.ts",
+				"line": 41
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 81
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 85
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 69
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 73
+			},
+			{
+				"path": "apps/web/lib/video-processing.ts",
+				"line": 16
+			},
+			{
+				"path": "apps/web/lib/video-processing.ts",
+				"line": 20
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 53
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 57
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 648
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 649
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 650
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 651
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 474
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 475
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 476
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 477
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 24
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 27
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 52
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 71
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 75
+			}
+		],
+		"rowLocks": [
+			{
+				"path": "apps/web/actions/admin/replace-video.ts",
+				"line": 80
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 257
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 281
+			},
+			{
+				"path": "apps/web/actions/folders/move-items.ts",
+				"line": 295
+			},
+			{
+				"path": "apps/web/actions/loom-concierge.tsx",
+				"line": 307
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 612
+			},
+			{
+				"path": "apps/web/actions/loom.ts",
+				"line": 702
+			},
+			{
+				"path": "apps/web/actions/organization/content-transfer.ts",
+				"line": 630
+			},
+			{
+				"path": "apps/web/actions/organization/delete-space.ts",
+				"line": 67
+			},
+			{
+				"path": "apps/web/actions/organization/remove-member.ts",
+				"line": 52
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 40
+			},
+			{
+				"path": "apps/web/actions/organization/toggle-pro-seat.ts",
+				"line": 63
+			},
+			{
+				"path": "apps/web/actions/videos/edit-ai-content.ts",
+				"line": 75
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 193
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 104
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 118
+			},
+			{
+				"path": "apps/web/actions/videos/save-edits.ts",
+				"line": 136
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 46
+			},
+			{
+				"path": "apps/web/app/api/invite/accept/route.ts",
+				"line": 111
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 42
+			},
+			{
+				"path": "apps/web/app/api/invite/decline/route.ts",
+				"line": 65
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 686
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 2003
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 2074
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 2139
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 2377
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 3798
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 3853
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 3918
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4026
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4309
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4637
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4713
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 4836
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5030
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5047
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5117
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5131
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5161
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5261
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5284
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5497
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5684
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 5965
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6066
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6175
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6389
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6740
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6908
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6934
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7056
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7070
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7192
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7343
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7440
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7531
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7589
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7644
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7711
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7764
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7789
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 7877
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8011
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8269
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8378
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8516
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8627
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8724
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8799
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8868
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 8928
+			},
+			{
+				"path": "apps/web/app/api/video/metadata/route.ts",
+				"line": 45
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 87
+			},
+			{
+				"path": "apps/web/lib/account-deletion-request.ts",
+				"line": 215
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 84
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 349
+			},
+			{
+				"path": "apps/web/lib/agent-write.ts",
+				"line": 585
+			},
+			{
+				"path": "apps/web/lib/audio-level-publication.ts",
+				"line": 218
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 264
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 269
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 460
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 544
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 584
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 616
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 703
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 746
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 799
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-jobs.ts",
+				"line": 980
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 199
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 509
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 525
+			},
+			{
+				"path": "apps/web/lib/desktop-reupload.ts",
+				"line": 37
+			},
+			{
+				"path": "apps/web/lib/desktop-reupload.ts",
+				"line": 42
+			},
+			{
+				"path": "apps/web/lib/desktop-reupload.ts",
+				"line": 67
+			},
+			{
+				"path": "apps/web/lib/integrations/installations.ts",
+				"line": 66
+			},
+			{
+				"path": "apps/web/lib/loom-csv-import.ts",
+				"line": 206
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 197
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 33
+			},
+			{
+				"path": "apps/web/lib/loom-migration-inventory.ts",
+				"line": 54
+			},
+			{
+				"path": "apps/web/lib/mcp-auth.ts",
+				"line": 115
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 80
+			},
+			{
+				"path": "apps/web/lib/messenger/support-email.ts",
+				"line": 58
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 147
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 315
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 332
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 504
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 574
+			},
+			{
+				"path": "apps/web/lib/sso/billing.ts",
+				"line": 604
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 112
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 118
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 123
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 164
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 169
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 205
+			},
+			{
+				"path": "apps/web/lib/video-edit-operation.ts",
+				"line": 210
+			},
+			{
+				"path": "apps/web/lib/video-edit-progress.ts",
+				"line": 30
+			},
+			{
+				"path": "apps/web/lib/video-edit-progress.ts",
+				"line": 44
+			},
+			{
+				"path": "apps/web/lib/video-edit-progress.ts",
+				"line": 59
+			},
+			{
+				"path": "apps/web/workflows/admin-reprocess-video.ts",
+				"line": 410
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 97
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 168
+			},
+			{
+				"path": "apps/web/workflows/agent-cap-operation.ts",
+				"line": 423
+			},
+			{
+				"path": "apps/web/workflows/import-loom-video.ts",
+				"line": 178
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 192
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 385
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 704
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 754
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 774
+			},
+			{
+				"path": "apps/web/workflows/transfer-organization-content.ts",
+				"line": 901
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 101
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 295
+			},
+			{
+				"path": "packages/database/auth/drizzle-adapter.ts",
+				"line": 300
+			},
+			{
+				"path": "packages/database/auth/sso.ts",
+				"line": 195
+			},
+			{
+				"path": "packages/database/auth/sso.ts",
+				"line": 200
+			},
+			{
+				"path": "packages/database/auth/sso.ts",
+				"line": 205
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 27
+			},
+			{
+				"path": "packages/database/pro-seat-subscription.ts",
+				"line": 25
+			},
+			{
+				"path": "packages/web-backend/src/Organisations/index.ts",
+				"line": 167
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 88
+			},
+			{
+				"path": "packages/web-backend/src/Videos/VideosRepo.ts",
+				"line": 106
+			}
+		],
+		"sqlDialectCandidates": [
+			{
+				"path": "apps/cli/skill/cap-demo/lib/scout-shoot.mjs",
+				"line": 269
+			},
+			{
+				"path": "apps/cli/skill/cap-demo/lib/scout-shoot.mjs",
+				"line": 290
+			},
+			{
+				"path": "apps/cli/skill/cap-demo/lib/scout-shoot.mjs",
+				"line": 294
+			},
+			{
+				"path": "apps/cli/skill/cap-demo/lib/scout-shoot.mjs",
+				"line": 333
+			},
+			{
+				"path": "apps/cli/skill/cap-demo/lib/scout-shoot.mjs",
+				"line": 334
+			},
+			{
+				"path": "apps/desktop/src/utils/automations.ts",
+				"line": 81
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 157
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 170
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 362
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 384
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 763
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 788
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 809
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1016
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1322
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1323
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1452
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1454
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1769
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1774
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1775
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1784
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1837
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1847
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1883
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1937
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1938
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1942
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 1976
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2051
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2054
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2060
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2244
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2260
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2300
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2309
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2404
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2420
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2440
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2867
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2886
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2889
+			},
+			{
+				"path": "apps/render-farm/src/coordinator.ts",
+				"line": 2891
+			},
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 73
+			},
+			{
+				"path": "apps/web/actions/analytics/track-user-signed-up.ts",
+				"line": 76
+			},
+			{
+				"path": "apps/web/actions/videos/call-to-action.ts",
+				"line": 46
+			},
+			{
+				"path": "apps/web/actions/videos/call-to-action.ts",
+				"line": 58
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 79
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 88
+			},
+			{
+				"path": "apps/web/actions/videos/delete-comment.ts",
+				"line": 97
+			},
+			{
+				"path": "apps/web/actions/videos/edit-ai-content.ts",
+				"line": 113
+			},
+			{
+				"path": "apps/web/actions/videos/edit-title.ts",
+				"line": 39
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 213
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 229
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 235
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 247
+			},
+			{
+				"path": "apps/web/actions/videos/get-edit-transcript.ts",
+				"line": 253
+			},
+			{
+				"path": "apps/web/actions/videos/settings.ts",
+				"line": 64
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/analytics/data.ts",
+				"line": 540
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/analytics/data.ts",
+				"line": 541
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/analytics/data.ts",
+				"line": 577
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/analytics/data.ts",
+				"line": 578
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/page.tsx",
+				"line": 192
+			},
+			{
+				"path": "apps/web/app/(org)/dashboard/caps/page.tsx",
+				"line": 193
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 695
+			},
+			{
+				"path": "apps/web/app/api/mobile/[...route]/route.ts",
+				"line": 3005
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6680
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6681
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6695
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6696
+			},
+			{
+				"path": "apps/web/app/api/v1/[...route]/route.ts",
+				"line": 6833
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 252
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 256
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 266
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 274
+			},
+			{
+				"path": "apps/web/app/api/webhooks/media-server/progress/route.ts",
+				"line": 286
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/playback-source.ts",
+				"line": 65
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/playback-source.ts",
+				"line": 198
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/playback/PlaybackContext.tsx",
+				"line": 104
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/playback/PlaybackContext.tsx",
+				"line": 111
+			},
+			{
+				"path": "apps/web/app/s/[videoId]/_components/playback/PlaybackContext.tsx",
+				"line": 118
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 145
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 194
+			},
+			{
+				"path": "apps/web/lib/Notification.ts",
+				"line": 208
+			},
+			{
+				"path": "apps/web/lib/ai-content-metadata.ts",
+				"line": 14
+			},
+			{
+				"path": "apps/web/lib/desktop-recording-publication.ts",
+				"line": 539
+			},
+			{
+				"path": "apps/web/lib/desktop-segments-recovery.ts",
+				"line": 285
+			},
+			{
+				"path": "apps/web/lib/folder.ts",
+				"line": 206
+			},
+			{
+				"path": "apps/web/lib/folder.ts",
+				"line": 207
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 92
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 119
+			},
+			{
+				"path": "apps/web/lib/generate-ai.ts",
+				"line": 124
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 53
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 60
+			},
+			{
+				"path": "apps/web/lib/live-transcribe.ts",
+				"line": 75
+			},
+			{
+				"path": "apps/web/lib/loom-concierge.ts",
+				"line": 201
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 64
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 65
+			},
+			{
+				"path": "apps/web/lib/loom-deferred-processing.ts",
+				"line": 66
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 175
+			},
+			{
+				"path": "apps/web/lib/loom-import-backfill.ts",
+				"line": 185
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 162
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 168
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 193
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 300
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 301
+			},
+			{
+				"path": "apps/web/lib/loom-import-reassign.ts",
+				"line": 302
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 118
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 119
+			},
+			{
+				"path": "apps/web/lib/loom-import-start.ts",
+				"line": 127
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 135
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 143
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 144
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 146
+			},
+			{
+				"path": "apps/web/lib/loom-import-upload.ts",
+				"line": 147
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 38
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 45
+			},
+			{
+				"path": "apps/web/lib/loom-media-dispatch.ts",
+				"line": 46
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 66
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 71
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 101
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 106
+			},
+			{
+				"path": "apps/web/lib/loom-preview-gif.ts",
+				"line": 120
+			},
+			{
+				"path": "apps/web/lib/media-processing-budget.ts",
+				"line": 67
+			},
+			{
+				"path": "apps/web/lib/public-share-video.ts",
+				"line": 83
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 152
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 153
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 314
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 376
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 403
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 437
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 439
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 442
+			},
+			{
+				"path": "apps/web/lib/video-pipeline-recovery.ts",
+				"line": 446
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 153
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 154
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 350
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 358
+			},
+			{
+				"path": "apps/web/lib/video-processing-recovery.ts",
+				"line": 469
+			},
+			{
+				"path": "apps/web/utils/sql.ts",
+				"line": 12
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 162
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 167
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 223
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 229
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 230
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 231
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 243
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 375
+			},
+			{
+				"path": "apps/web/workflows/generate-ai.ts",
+				"line": 417
+			},
+			{
+				"path": "apps/web/workflows/import-loom-video.ts",
+				"line": 763
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 552
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 558
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 731
+			},
+			{
+				"path": "apps/web/workflows/live-transcribe.ts",
+				"line": 813
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 371
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 377
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 970
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 976
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 1017
+			},
+			{
+				"path": "apps/web/workflows/transcribe.ts",
+				"line": 1023
+			},
+			{
+				"path": "packages/database/loops/activation.ts",
+				"line": 23
+			},
+			{
+				"path": "packages/database/loops/activation.ts",
+				"line": 24
+			},
+			{
+				"path": "packages/database/loops/activation.ts",
+				"line": 30
+			},
+			{
+				"path": "packages/database/loops/activation.ts",
+				"line": 31
+			},
+			{
+				"path": "packages/database/loops/activation.ts",
+				"line": 34
+			},
+			{
+				"path": "packages/database/loops/health.ts",
+				"line": 23
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 27
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 32
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 49
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 74
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 94
+			},
+			{
+				"path": "packages/database/loops/jobs.ts",
+				"line": 113
+			},
+			{
+				"path": "packages/database/loops/queue.ts",
+				"line": 16
+			},
+			{
+				"path": "packages/database/loops/queue.ts",
+				"line": 17
+			},
+			{
+				"path": "packages/database/loops/queue.ts",
+				"line": 22
+			},
+			{
+				"path": "packages/database/loops/queue.ts",
+				"line": 25
+			},
+			{
+				"path": "packages/database/loops/worker.ts",
+				"line": 315
+			},
+			{
+				"path": "packages/database/schema.ts",
+				"line": 482
+			},
+			{
+				"path": "packages/web-backend/src/Storage/StorageRepo.ts",
+				"line": 505
+			}
+		]
+	}
+}

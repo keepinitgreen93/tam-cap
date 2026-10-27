@@ -15,6 +15,7 @@ import {
 } from "@/lib/desktop-segments-finalization";
 import { startAiGeneration } from "@/lib/generate-ai";
 import * as EffectRuntime from "@/lib/server";
+import { isTranscriptionConfigured } from "@/lib/transcription-config";
 import { transcribeVideo } from "../../lib/transcribe";
 import { isAiGenerationEnabled } from "../../utils/flags";
 
@@ -62,7 +63,7 @@ export async function getVideoStatus(
 
 	const metadata: VideoMetadata = (video.metadata as VideoMetadata) || {};
 
-	if (!video.transcriptionStatus && serverEnv().ASSEMBLY_API_KEY) {
+	if (!video.transcriptionStatus && isTranscriptionConfigured(serverEnv())) {
 		const activeUpload = await db()
 			.select({
 				videoId: videoUploads.videoId,
