@@ -4396,6 +4396,14 @@ impl SettingsWindow {
 
     /// `UpdatesSection` -- `updateChannel`.
     fn render_updates(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if crate::distribution::SELF_HOSTED_BUILD {
+            return self.section(
+                "Organization-managed updates",
+                Some(crate::distribution::MANAGED_UPDATES_MESSAGE),
+                None,
+                vec![],
+            );
+        }
         let theme = self.theme;
         let current = self.settings.update_channel;
         let current_policy = self.settings.update_download_policy;

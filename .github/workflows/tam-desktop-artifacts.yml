@@ -1,0 +1,113 @@
+name: TAM Cap desktop artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Desktop packages to build
+        type: choice
+        default: windows
+        options: [windows, macos, both]
+  push:
+    branches: [codex/cloudflare-self-host]
+    paths:
+      - .github/workflows/tam-desktop-artifacts.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tam-desktop-${{ github.ref }}-${{ github.event.inputs.platform || 'windows' }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+    steps:
+      - id: platforms
+        env:
+          PLATFORM: ${{ github.event.inputs.platform || 'windows' }}
+        run: |
+          node -e 'const fs = require("fs"); const p = process.env.PLATFORM; if (!["windows", "macos", "both"].includes(p)) throw Error("Invalid platform"); const all = [{name:"windows-x64",os:"windows-2022",target:"x86_64-pc-windows-msvc"},{name:"macos-arm64",os:"macos-14",target:"aarch64-apple-darwin"}]; const include = all.filter(x => p === "both" || x.name.startsWith(p)); fs.appendFileSync(process.env.GITHUB_OUTPUT, "matrix=" + JSON.stringify({include}) + "\n");'
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    env:
+      RUST_TARGET_TRIPLE: ${{ matrix.target }}
+      CAP_GPUI_RUST_TOOLCHAIN: 1.95.0
+      CAP_SELF_HOSTED_BUILD: 'true'
+      CAP_INSTANCE_IDENTIFIER: com.trulyauthenticmarketing.cap
+      VITE_SERVER_URL: https://videos.trulyauthenticmarketing.com
+      VITE_ENVIRONMENT: production
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-js
+      - uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: ${{ matrix.target }}
+          prefix-key: tam-cap-desktop-v1
+          save-cache: true
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            apps/desktop-gpui -> target
+      - name: Prepare native dependencies
+        shell: bash
+        run: bun run cap-setup
+      - name: Increase Windows link headroom
+        if: runner.os == 'Windows'
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7f4a7b8708
+        with:
+          minimum-size: 16GB
+          maximum-size: 24GB
+          disk-root: 'D:'
+      - name: Build recorder sidecars
+        shell: bash
+        run: ./scripts/build-desktop-binaries.sh "$RUST_TARGET_TRIPLE"
+      - name: Build self-hosted desktop package
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then
+            node scripts/bundle-gpui.mjs "$RUST_TARGET_TRIPLE" --bundles nsis --config tauri.tam.conf.json
+          else
+            APPLE_SIGNING_IDENTITY=- node scripts/bundle-gpui.mjs "$RUST_TARGET_TRIPLE" --bundles app,dmg --config tauri.tam.conf.json
+          fi
+      - name: Verify packaged Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $capInstaller = @(Get-ChildItem "apps/desktop-gpui/target/$env:RUST_TARGET_TRIPLE/release/bundle/nsis/*-setup.exe")
+          if ($capInstaller.Count -ne 1) { throw 'Expected one TAM installer' }
+          $capExtract = Join-Path $env:RUNNER_TEMP 'tam-cap-desktop-probe'
+          New-Item -ItemType Directory -Path $capExtract -Force | Out-Null
+          & 7z x $capInstaller[0].FullName "-o$capExtract" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Installer extraction failed' }
+          $capBinary = @(Get-ChildItem -LiteralPath $capExtract -Recurse -Filter Cap.exe -File)
+          if ($capBinary.Count -ne 1) { throw 'Expected one packaged desktop executable' }
+          node scripts/cloudflare/verify-desktop-artifact.mjs $capBinary[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged desktop probe failed' }
+      - name: Verify packaged macOS executable
+        if: runner.os == 'macOS'
+        shell: bash
+        run: node scripts/cloudflare/verify-desktop-artifact.mjs "apps/desktop-gpui/target/$RUST_TARGET_TRIPLE/release/bundle/macos/TAM Cap.app/Contents/MacOS/Cap"
+      - name: Upload installer artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: tam-cap-${{ matrix.name }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            apps/desktop-gpui/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
+            apps/desktop-gpui/target/${{ matrix.target }}/release/bundle/dmg/*.dmg

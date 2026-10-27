@@ -60,6 +60,13 @@ struct UpdateRow {
 
 impl UpdateRow {
     fn of(status: &updates::UpdateStatus) -> Self {
+        if crate::distribution::SELF_HOSTED_BUILD {
+            return Self {
+                title: "Organization-managed updates",
+                enabled: true,
+                badge: None,
+            };
+        }
         use updates::UpdateStatus;
 
         let title = match status {

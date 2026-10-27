@@ -265,7 +265,7 @@ pub fn server_url() -> String {
 }
 
 pub fn is_server_url_custom() -> bool {
-    !has_same_origin(&server_url(), DEFAULT_SERVER_URL)
+    crate::distribution::SELF_HOSTED_BUILD || !has_same_origin(&server_url(), DEFAULT_SERVER_URL)
 }
 
 #[derive(Clone)]
@@ -669,7 +669,7 @@ fn deep_link_slot() -> &'static Mutex<Option<DeepLinkSlot>> {
 }
 
 pub fn should_use_local_server_session(configured: &str) -> bool {
-    if cfg!(debug_assertions) {
+    if cfg!(debug_assertions) || crate::distribution::SELF_HOSTED_BUILD {
         return true;
     }
     !has_same_origin(configured, DEFAULT_SERVER_URL)

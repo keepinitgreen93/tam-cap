@@ -1,0 +1,12 @@
+{
+	"productName": "TAM Cap",
+	"mainBinaryName": "Cap",
+	"identifier": "com.trulyauthenticmarketing.cap",
+	"plugins": {
+		"updater": null,
+		"deep-link": null
+	},
+	"bundle": {
+		"createUpdaterArtifacts": false
+	}
+}

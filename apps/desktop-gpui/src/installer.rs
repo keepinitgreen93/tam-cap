@@ -133,6 +133,7 @@ fn endpoint(platform: &str, channel: UpdateChannel, current: &Version) -> String
 }
 
 fn client() -> Result<reqwest::Client, String> {
+    crate::distribution::require_automatic_updates()?;
     reqwest::Client::builder()
         .user_agent(concat!("Cap/", env!("CARGO_PKG_VERSION")))
         .connect_timeout(CONNECT_TIMEOUT)
@@ -144,6 +145,7 @@ pub(crate) async fn fetch_release(
     channel: UpdateChannel,
     current: &Version,
 ) -> Result<Option<Release>, String> {
+    crate::distribution::require_automatic_updates()?;
     let platform = update_platform()?;
     let response = client()?
         .get(endpoint(&platform, channel, current))
@@ -275,6 +277,7 @@ pub(crate) async fn download(
     release: &Release,
     mut progress: impl FnMut(u64, Option<u64>) + Send,
 ) -> Result<PathBuf, String> {
+    crate::distribution::require_automatic_updates()?;
     download_into(
         &staging_root(),
         UPDATER_PUBLIC_KEY,
@@ -360,6 +363,7 @@ async fn stream_to_file(
 
 #[cfg(target_os = "macos")]
 pub(crate) fn install_app_bundle(archive: &Path, destination: &Path) -> Result<(), String> {
+    crate::distribution::require_automatic_updates()?;
     let parent = destination
         .parent()
         .ok_or_else(|| "The app has no parent folder".to_string())?;
@@ -531,6 +535,7 @@ fn replace_directory_with_privileges(new: &Path, destination: &Path) -> Result<(
 
 #[cfg(windows)]
 pub(crate) fn launch_installer(installer: &Path, arguments: &[&str]) -> Result<(), String> {
+    crate::distribution::require_automatic_updates()?;
     use std::os::windows::ffi::OsStrExt as _;
     use windows_sys::{
         Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
@@ -567,6 +572,7 @@ pub(crate) fn launch_installer(installer: &Path, arguments: &[&str]) -> Result<(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn install_deb(package: &Path) -> Result<(), String> {
+    crate::distribution::require_automatic_updates()?;
     let status = std::process::Command::new("pkexec")
         .arg("dpkg")
         .arg("-i")
@@ -582,6 +588,7 @@ pub(crate) fn install_deb(package: &Path) -> Result<(), String> {
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
 pub(crate) fn install_appimage(image: &Path, destination: &Path) -> Result<(), String> {
+    crate::distribution::require_automatic_updates()?;
     use std::os::unix::fs::PermissionsExt as _;
 
     let parent = destination

@@ -137,8 +137,33 @@ export function parseOptions(args) {
 	};
 }
 
+export function resolveBundleConfigs(args) {
+	const resolved = [...args];
+	const resolveConfig = (value) =>
+		value.trimStart().startsWith("{")
+			? value
+			: path.resolve(gpuiDirectory, value);
+	for (let index = 0; index < resolved.length; index++) {
+		if (resolved[index] === "--config" || resolved[index] === "-c") {
+			if (!resolved[index + 1])
+				throw new Error("Missing bundle configuration path");
+			resolved[index + 1] = resolveConfig(resolved[index + 1]);
+			index++;
+		} else if (resolved[index].startsWith("--config=")) {
+			resolved[index] =
+				`--config=${resolveConfig(resolved[index].slice("--config=".length))}`;
+		}
+	}
+	return resolved;
+}
+
 export async function bundleGpui(target, args, { env = process.env } = {}) {
-	const { skipBuild, noBundle, bundleArgs } = parseOptions(args);
+	const {
+		skipBuild,
+		noBundle,
+		bundleArgs: suppliedBundleArgs,
+	} = parseOptions(args);
+	const bundleArgs = resolveBundleConfigs(suppliedBundleArgs);
 	const platform = validate(target, bundleArgs);
 
 	if (!skipBuild) {

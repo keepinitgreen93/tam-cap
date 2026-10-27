@@ -22,6 +22,7 @@ mod deeplink;
 mod dev_restore;
 mod devices;
 mod diagnostics;
+mod distribution;
 mod doodle;
 mod draw_bench;
 mod editor_audio;
@@ -279,6 +280,18 @@ fn app_runtime() -> tokio::runtime::Runtime {
 }
 
 fn main() {
+    if std::env::args().any(|argument| argument == "--print-distribution") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "selfHosted": distribution::SELF_HOSTED_BUILD,
+                "serverUrl": distribution::DEFAULT_SERVER_URL,
+                "instanceIdentifier": distribution::INSTANCE_IDENTIFIER,
+                "automaticUpdates": !distribution::SELF_HOSTED_BUILD,
+            })
+        );
+        return;
+    }
     #[cfg(target_os = "linux")]
     if let Some(threads) = cap_utils::linux_runtime::llvmpipe_thread_count() {
         // Mesa counts host CPUs inside containers; apply the process limit before logging starts threads.
@@ -939,7 +952,9 @@ mod logging_tests {
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .with_writer(move || writer.clone())
-                .with_filter(tracing_subscriber::EnvFilter::new(super::DEFAULT_LOG_FILTER)),
+                .with_filter(tracing_subscriber::EnvFilter::new(
+                    super::DEFAULT_LOG_FILTER,
+                )),
         );
         tracing::subscriber::with_default(subscriber, || {
             tracing::warn!(target: "zbus::proxy", "Failed to populate properties cache");
@@ -948,9 +963,15 @@ mod logging_tests {
             tracing::info!(target: "cap_gpui::session", "recording started");
         });
         let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
-        assert!(!logged.contains("Failed to populate properties cache"), "{logged}");
+        assert!(
+            !logged.contains("Failed to populate properties cache"),
+            "{logged}"
+        );
         assert!(logged.contains("a zbus error still shows"), "{logged}");
-        assert!(logged.contains("other zbus warnings still show"), "{logged}");
+        assert!(
+            logged.contains("other zbus warnings still show"),
+            "{logged}"
+        );
         assert!(logged.contains("recording started"), "{logged}");
     }
 

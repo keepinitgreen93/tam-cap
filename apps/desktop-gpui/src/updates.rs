@@ -180,6 +180,10 @@ fn set_status(status: UpdateStatus, cx: &mut App) {
 }
 
 pub(crate) fn check_manually(cx: &mut App) {
+    if crate::distribution::SELF_HOSTED_BUILD {
+        managed_updates_alert(cx);
+        return;
+    }
     if !cx.has_global::<UpdateScheduler>() {
         return;
     }
@@ -223,6 +227,9 @@ pub(crate) fn check_manually(cx: &mut App) {
 }
 
 pub(crate) fn update_channel_changed(channel: UpdateChannel, cx: &mut App) {
+    if crate::distribution::SELF_HOSTED_BUILD {
+        return;
+    }
     if !cx.has_global::<UpdateScheduler>() {
         return;
     }
@@ -364,6 +371,9 @@ fn simulate_download(version: Version, cx: &mut App) {
 fn simulate_download(_version: Version, _cx: &mut App) {}
 
 pub(crate) fn schedule_startup_check(cx: &mut App) {
+    if crate::distribution::SELF_HOSTED_BUILD {
+        return;
+    }
     let (wake, requests) = flume::bounded(1);
     cx.set_global(UpdateScheduler {
         wake,
@@ -595,6 +605,9 @@ pub(crate) fn schedule_startup_check(cx: &mut App) {
 }
 
 pub(crate) fn update_download_policy_changed(policy: UpdateDownloadPolicy, cx: &mut App) {
+    if crate::distribution::SELF_HOSTED_BUILD {
+        return;
+    }
     if !cx.has_global::<UpdateScheduler>() {
         return;
     }
@@ -603,6 +616,10 @@ pub(crate) fn update_download_policy_changed(policy: UpdateDownloadPolicy, cx: &
 }
 
 fn start_download(release: Release, cx: &mut App) {
+    if crate::distribution::SELF_HOSTED_BUILD {
+        managed_updates_alert(cx);
+        return;
+    }
     let kind = match installer::update_platform()
         .and_then(|platform| ArtifactKind::for_platform(&platform))
     {
@@ -729,7 +746,21 @@ fn prompt_restart(cx: &mut App) {
     .detach();
 }
 
+fn managed_updates_alert(cx: &mut App) {
+    cx.spawn(async move |_| {
+        crate::platform::alert_dialog(
+            "Organization-managed updates",
+            crate::distribution::MANAGED_UPDATES_MESSAGE,
+        );
+    })
+    .detach();
+}
+
 pub(crate) fn install_and_relaunch(cx: &mut App) {
+    if crate::distribution::SELF_HOSTED_BUILD {
+        managed_updates_alert(cx);
+        return;
+    }
     if !cx.has_global::<UpdateScheduler>() {
         return;
     }
