@@ -7,6 +7,21 @@ const HANDLE_MS = 150;
 const MIN_QUIET_MS = 800;
 const MIN_PLAYABLE_MS = 50;
 
+export function matchesSilenceTimeline(
+	mediaDurationMs: number,
+	timelineDurationMs: number,
+	hasSourceRevision: boolean,
+) {
+	return (
+		Number.isFinite(mediaDurationMs) &&
+		Number.isFinite(timelineDurationMs) &&
+		mediaDurationMs > 0 &&
+		timelineDurationMs > 0 &&
+		Math.abs(mediaDurationMs - timelineDurationMs) <=
+			(hasSourceRevision ? 100 : 50)
+	);
+}
+
 function validRange(range: SilenceRange, durationMs: number) {
 	return (
 		Number.isFinite(range.startMs) &&

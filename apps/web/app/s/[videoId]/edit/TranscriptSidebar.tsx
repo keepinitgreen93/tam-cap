@@ -44,7 +44,11 @@ import {
 	planTranscriptCut,
 } from "@/lib/edit-transcript";
 import { scanVideoSilence } from "@/lib/silence-audio";
-import { planSilenceCuts, type SilenceRange } from "@/lib/silence-cuts";
+import {
+	matchesSilenceTimeline,
+	planSilenceCuts,
+	type SilenceRange,
+} from "@/lib/silence-cuts";
 import { useActiveTranscriptWordIndex } from "./use-active-transcript-word-index";
 
 type TranscriptResponse = Awaited<ReturnType<typeof getEditTranscript>>;
@@ -314,7 +318,13 @@ function SilenceCleanup({
 			setMessage("Wait for the video to finish loading before scanning.");
 			return;
 		}
-		if (Math.abs(video.duration * 1000 - durationMs) > 50) {
+		if (
+			!matchesSilenceTimeline(
+				video.duration * 1000,
+				durationMs,
+				Boolean(sourceRevision),
+			)
+		) {
 			setMessage(
 				"The transcript timing does not match the video. Reload before scanning.",
 			);
@@ -351,7 +361,11 @@ function SilenceCleanup({
 				if (response.status === "error") throw new Error(response.message);
 				if (
 					response.revision !== sourceRevision ||
-					Math.abs(response.result.durationMs - duration * 1000) > 50
+					!matchesSilenceTimeline(
+						duration * 1000,
+						response.result.durationMs,
+						true,
+					)
 				)
 					throw new Error(
 						"The video changed. Reload before applying silence cuts.",

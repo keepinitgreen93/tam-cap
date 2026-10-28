@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { planFillerCuts } from "@/lib/edit-transcript";
-import { detectPcmSilence, planSilenceCuts } from "@/lib/silence-cuts";
+import {
+	detectPcmSilence,
+	matchesSilenceTimeline,
+	planSilenceCuts,
+} from "@/lib/silence-cuts";
 import {
 	composeEditSpecs,
 	createTimelineHistory,
@@ -12,6 +16,20 @@ import {
 	redoTimelineHistory,
 	undoTimelineHistory,
 } from "@/lib/video-edits";
+
+describe("silence timeline compatibility", () => {
+	it("accepts the verified desktop AAC tail only for server-backed analysis", () => {
+		expect(matchesSilenceTimeline(25993.042, 25943, true)).toBe(true);
+		expect(matchesSilenceTimeline(25993.042, 25943, false)).toBe(false);
+		expect(matchesSilenceTimeline(26044, 25943, true)).toBe(false);
+	});
+
+	it("keeps browser fallback bounded and rejects invalid durations", () => {
+		expect(matchesSilenceTimeline(25993, 25943, false)).toBe(true);
+		expect(matchesSilenceTimeline(NaN, 25943, true)).toBe(false);
+		expect(matchesSilenceTimeline(25943, 0, true)).toBe(false);
+	});
+});
 
 describe("PCM silence candidates", () => {
 	it("retains handles around sustained quiet audio", () => {
