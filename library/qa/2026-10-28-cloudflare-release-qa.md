@@ -3,76 +3,53 @@
 **Plan document:** `docs/superpowers/plans/2026-10-27-cloudflare-cap.md`, with its accepted design and `EXECUTION_LEDGER.md`
 **Audit date:** 2026-10-28 UTC
 **Base:** `97c8d634430e8785efb824299938066ea4b17f72`
-**Application image source:** `04f7c07b02bd2742ff5183c53875e9647698a7e5`
-**Head:** `codex/cloudflare-self-host`, with coordinated runtime/restore-tool working changes
+**Application sources:** web `da9168de55d5e9138d6448569af5c56621854848`, media `b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7`
+**Head:** `codex/cloudflare-self-host`, including final release evidence and Chrome harness working changes
 **Auditor:** independent release QA, applying `quality-stinger`
-**State:** provisional source/evidence review; final production acceptance pending
+**State:** live release verified with explicit human-member and device acceptance qualifications
 
 ## Summary
 
-The implemented Cloudflare application and the coordinator's recorded live owner flows satisfy the core recording, transcription, editing, export, original-preservation and sharing behavior reviewed here. The independently reproduced release-generator defect is now fixed and passes actual Wrangler validation; the edited-snapshot restore receipt also verifies successfully. Release completion remains gated on the binding-update proof, longer chapter-producing recording, production hostname, member acceptance and native Chrome identity/capture; this report does not declare the application live or every criterion verified.
+The Cloudflare Cap site is live on the required hostname, and the supplied production owner flows verify recording, processing, transcription, AI chapters, filler/silence editing, export, original preservation and sharing. The generator and runtime recovery findings are closed; this auditor also checked the saved Chrome capture receipt and the post-edit restore receipt. No unresolved material application defect is confirmed by this bounded review; the invited human member has not accepted or recorded yet, so that part of the original vertical acceptance remains qualified rather than represented as tested.
 
-Security ran before this review. `library/qa/security/2026-10-28-release-security-review.md` records the closed source findings and the qualified Zod backport; newer runtime/tool changes require their own focused validation and final deployment evidence. Hindsight is unavailable in this agent's tools, so no shared-memory result was fabricated.
+Security ran before this review. `library/qa/security/2026-10-28-release-security-review.md` records the closed source findings and the qualified Zod backport; the advisory remains version-flagged. Hindsight is unavailable in this agent's tools, so no shared-memory result was fabricated.
 
 ## Scorecard
 
 | Category | Status | Notes |
 | --- | --- | --- |
-| Completeness | ⚠️ | Core application and distribution paths are implemented; production, member/client acceptance and final operational gates remain open. |
-| Correctness | ⚠️ | Recorded live Save/export/Restore and the edited-snapshot recovery pass support the behavior; revised rollout and longer transcription checks remain open. |
-| Alignment | ✅ | Infrastructure/provider scope and migration deferral match; corrected generated configs now pass the installed Wrangler contract. |
-| Gaps | ⚠️ | Final deployment identity, real member/native Chrome flows and remaining rollout/chapter evidence must be supplied before complete-release signoff. |
-| Detrimental | ✅ | The confirmed generated-config defect is corrected; no additional application access or data-integrity issue was confirmed. Security and coverage qualifications remain explicit. |
+| Completeness | ✅ | Application, Cloudflare services and client distribution are implemented; old-library migration is explicitly deferred. |
+| Correctness | ✅ | Recorded production owner flows, recovery, saved Chrome capture/playback and isolated restore support the tested behavior. |
+| Alignment | ✅ | Cloudflare plus Resend, private storage, controlled registration and user migration deferral match the approved scope. |
+| Gaps | ⚠️ | Human member acceptance/use remains unobserved; native hardware and a destructive rollback are not claimed. |
+| Detrimental | ✅ | Confirmed generator/recovery defects are closed; no further material application defect was confirmed in this bounded review. |
 
 ## Critical Issues (must fix)
 
-- [x] **Resolved: emit the supported native-container image object**, `scripts/cloudflare/write-release-config.mjs:148-151`
+None remain confirmed in the inspected application source and supplied release evidence.
 
-  The generator emits a digest string directly at `containers[].images.base`. Installed Wrangler 4.152 requires an object containing either `dockerfile` or `image` (`config-schema.json`, `DurableObjectContainerImage`, line6613). The exact generator output from the actual production manifest was rejected twice, once for each class, by `wrangler deploy --dry-run --containers-rollout none`; the previous working temporary configs used `{ "image": "...@sha256:..." }`. Emit that supported object and validate against Wrangler rather than only tests that mirror the generated string shape.
+Resolved findings retained for traceability:
 
-  ```javascript
-  container.images = {
-  	...record(container.images, "container images"),
-  	base: reference,
-  };
-  ```
-
-  Baseline evidence: `tmp/qa-generator-shape-validation.log`. The owner changed `base` to `{ image: reference }`, added complete installed-schema AJV coverage and a negative scalar control, and reported47 passing contract tests. This auditor regenerated from the same actual production manifest and reran actual Wrangler dry-run validation: exit0, both native classes recognized, default readiness/maintenance false, no deployment. Evidence: `tmp/qa-generator-shape-validation-fixed.log`. The baseline CLI subsequently hit a Windows cleanup assertion; the explicit image-shape rejection was the finding, not that secondary exit behavior.
-
-- [ ] **Complete the known production and client launch gates before claiming a live replacement**, `EXECUTION_LEDGER.md:16-24`, `infra/cloudflare/wrangler.runtime.jsonc:12-17`, `apps/chrome-extension/scripts/live-production-harness.mjs:126`
-
-  The application remains deliberately gated, and the coordinator has not yet supplied final public-host, member, or unmodified Chrome identity/capture evidence. This is an outstanding release requirement, not a defect in keeping an incomplete rollout private. Complete the approved vertical checks on the intended production image and record the resulting deployment and client receipts.
-
-  ```json
-  "CAP_RUNTIME_READY": "false",
-  "CAP_MAINTENANCE_ENABLED": "false"
-  ```
-
-- [ ] **Close the binding-update recovery gate without a diagnostic-tail workaround**, `docs/superpowers/plans/2026-10-27-cloudflare-cap.md:63-66`, `infra/cloudflare/runtime-worker.ts:141`
-
-  A binding-only restart exposed a stale-Durable-Object transition. Coordinated runtime code adds version-ordered actor refresh and must be validated on the live service, including a media callback after the update. The separate post-edit restore failure is resolved: this auditor read the final private receipt and verified52 tables/16 rows, matching schema, integrity/FK checks, two matching media samples and confirmed cleanup.
-
-  ```typescript
-  async fetch(request: Request): Promise<Response> {
-  	await this.configurationReady;
-  	const expected = request.headers.get(WEB_CONFIGURATION_HEADER);
-  	const fingerprint = await webConfigurationFingerprint(this.env);
-  ```
+- **Supported native-container image object**, `scripts/cloudflare/write-release-config.mjs:148-151`: the initial scalar image reference failed actual Wrangler4.152 validation. The corrected `{ image: reference }` representation passed47 generator contracts and independent actual Wrangler dry-run validation. Baseline/fixed logs: `tmp/qa-generator-shape-validation.log` and `tmp/qa-generator-shape-validation-fixed.log`.
+- **Public production/client evidence**, `infra/cloudflare/releases/production-b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7.json:20-25`: readiness and maintenance are enabled, `workers_dev=false`, and the exact public hostname serves the real Cap application. Native Chrome identity and completed capture/upload/playback are verified below; the human member qualification remains explicit.
+- **Binding-only recovery**, `infra/cloudflare/runtime-worker.ts:141-172`: the coordinator observed503 to200 with the latest expected Worker version in approximately12 seconds without diagnostic tail, then successful new media callback/processing. Ordered configuration fencing retains durable state and prevents an older callback from resetting newer accepted configuration.
 
 ## Warnings (should fix)
 
-- [ ] **Reconcile the final execution status with the final evidence**, `EXECUTION_LEDGER.md:10-24`, `packages/database/cloudflare/README.md:77`
+- [ ] **Complete human member acceptance before describing that user's login and recording as tested**, `docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md:27`, `EXECUTION_LEDGER.md:17-19`.
 
-  The ledger's current-status table still describes initial integration work while later progress notes record completed source ports and live flows. The database README also retains historical cutover-blocker language. Update current status cells and qualify historical notes at closure; preserve the history, and do not mark pending production/client checks verified prematurely.
-
-  ```markdown
-  | AC02 | Cloudflare metadata persistence replaces MySQL with equivalent ownership/concurrency behavior | IN PROGRESS | Database implementation wave |
-  | AC12 | Live application works at videos.trulyauthenticmarketing.com | OPEN | Production cutover after acceptance |
+  ```text
+  Before production: owner/member login, the built-in browser recording/upload flow,
+  desktop API contract checks, browser playback, unauthorized-access denial ... must pass.
   ```
+
+  Owner login, member/invitation authorization contracts, delivered ordinary-Member invitation and production owner recording pass. The intended invitee's acceptance, personal sign-in and recording have not been observed. This is an outstanding human acceptance observation, not a confirmed application failure; do not impersonate the invitee or silently promote contract coverage to that live claim.
+
+The prior documentation warning is closed: the ledger records current release status and the D1 README now labels the initial checklist as porting history with current cutover evidence.
 
 ## Suggestions (consider improving)
 
-None. Optional product improvements and broader Loom feature-parity work are outside this release audit.
+None. Broader proprietary Loom parity and optional product improvements are outside this audit.
 
 ## Plan Item Traceability
 
@@ -82,70 +59,78 @@ Statuses below distinguish implemented/tested source from outstanding live accep
 | --- | --- | --- | --- | --- |
 | G-01 | Cloudflare application hosting; Resend mail exception; no Railway/AWS hosting | ✅ | `infra/cloudflare/wrangler.runtime.jsonc:1`, `infra/cloudflare/runtime-env.ts:1`, `Dockerfile.cloudflare:1` | Private D1/analytics/workflow/media bindings and R2; AWS SDK naming does not establish AWS hosting. |
 | G-02 | Approximately $20 target with measured usage, no unverified cap | ✅ | `infra/cloudflare/COSTS.md:1` | Cap-filtered billing metrics and conditional forecasts are documented; not an invoice or hard spending cap. |
-| G-03 | Exact production hostname and owner | ⚠️ | `scripts/cloudflare/write-release-config.mjs:167`, `packages/database/cloudflare/team.ts:25` | Generator pins the required host; final public deployment is pending. |
+| G-03 | Exact production hostname and owner | ✅ | `scripts/cloudflare/write-release-config.mjs:167`, `packages/database/cloudflare/team.ts:25` | Public HTTPS login/downloads and owner real OTP/session pass at the exact required hostname; owner is hello@trulyauthenticmarketing.com. |
 | G-04 | Preserve originals, notices and desktop contracts | ✅ | `apps/web/actions/videos/save-edits.ts:121`, `apps/web/actions/videos/download.ts:87`, `infra/cloudflare/distribution/README.md:1` | Coordinator downloaded the pre-edit base with its unchanged SHA-256 after editing. Raw originals remain separate private objects. |
-| G-05 | Protected secrets and invite-controlled signup | ✅ | `scripts/cloudflare/runtime-secrets.ps1:1`, `packages/database/cloudflare/team.ts:27`, `packages/database/cloudflare/access.ts:145` | Real owner OTP/session is coordinator verified; live member completion remains below. |
+| G-05 | Protected secrets and invite-controlled signup | ✅ | `scripts/cloudflare/runtime-secrets.ps1:1`, `packages/database/cloudflare/team.ts:27`, `packages/database/cloudflare/access.ts:145` | Protected secrets and invite-controlled registration pass source/native contracts; owner production OTP/login and delivered ordinary-Member invitation are live verified. Human acceptance remains qualified. |
 | G-06 | Private bucket and existing TAM resources preserved | ✅ | `infra/cloudflare/wrangler.runtime.jsonc:107`, `infra/cloudflare/downloads.ts:1` | Dedicated buckets and allowlisted downloads; no whole-bucket publicity is required. |
 | G-07 | Imported source baseline retained | ✅ | `docs/superpowers/plans/2026-10-27-cloudflare-cap.md:21` | Git inventory is anchored to the specified upstream revision. |
 | RF-01 | Cross-user media/metadata denied absent explicit share | ✅ | `apps/web/app/api/storage/object/route.ts:196`, `apps/web/app/api/playlist/route.ts:184`, `apps/web/actions/videos/download.ts:87` | Independent security/native D1 boundaries pass; coordinator observed anonymous private playlist/editor denial and no summary in private HTML. |
-| RF-02 | Restart recovery with no duplicate import/edit publication | ⚠️ | `packages/workflow-cloudflare/index.mjs:49`, `infra/cloudflare/workflow-store.mjs:96`, `apps/web/workflows/edit-video.ts:110` | Native persistence/lease/replay tests exist; coordinator observed Restore complete after interruption. Final binding-only recovery proof remains in progress. |
+| RF-02 | Restart recovery with no duplicate import/edit publication | ✅ | `packages/workflow-cloudflare/index.mjs:49`, `infra/cloudflare/workflow-store.mjs:96`, `apps/web/workflows/edit-video.ts:110` | Native persistence/lease/replay tests, Restore across interruption, and no-tail ordered binding restart followed by successful media callback pass. Private-library live import remains deferred. |
 | RF-03 | Invalid/overlapping ASR timing cannot corrupt a timeline | ✅ | `apps/web/lib/cloudflare-transcription.ts:55`, `apps/web/lib/edit-transcript.ts:531`, `apps/web/lib/silence-cuts.ts:82` | Typed bounded timings, overlap rejection and protected quiet subranges. Live export re-transcription preserved 23 intended non-filler words. |
 | RF-04 | Deliberate MySQL-to-D1 semantic port | ✅ | `packages/database/cloudflare/atomic.ts:60`, `packages/database/cloudflare/index.ts:1`, `packages/database/cloudflare/schema.ts:1` | Native D1 race, rollback and caller tests; no interactive transaction emulation or SQL text rewriting. |
 | RF-05 | Failed migration/source exceptions retained | ✅ | `apps/web/lib/loom-import-start.ts:1`, `apps/web/workflows/import-loom-video.ts:1` | Source/import replay cases are covered by specialist evidence; private-library live migration is deferred. |
 | T1.1 | Fork/branch/upstream revision and license foundation | ✅ | `docs/superpowers/plans/2026-10-27-cloudflare-cap.md:21`, `infra/cloudflare/distribution/README.md:11` | Fork and source-offer branch exist; native packages retain upstream notices. |
-| T1.2 | Supported toolchain and frozen lockfile | ✅ | `package.json:74`, `Dockerfile.cloudflare:1`, `.github/workflows/tam-web-images.yml:30` | Node 24/Bun 1.4.4; both final application image jobs succeeded for the specified source. |
+| T1.2 | Supported toolchain and frozen lockfile | ✅ | `package.json:74`, `Dockerfile.cloudflare:1`, `.github/workflows/tam-web-images.yml:30` | Node24/Bun1.4.4; pinned web build and media-only workflow40619936877 succeed. Web paths are unchanged between da9168d and b117f8d. |
 | T1.3 | Dedicated D1 and private R2 identifiers | ✅ | `infra/cloudflare/wrangler.runtime.jsonc:85` | Metadata, analytics and media/download resources are separated. |
-| T1.4 | Infrastructure health is distinct from Cap readiness | ✅ | `infra/cloudflare/worker.ts:1`, `infra/cloudflare/runtime-worker.ts:1` | Infrastructure health is not counted as launch; the actual Cap UI has separate private acceptance. |
-| T1.5 | Build/type/isolated/deployed checks without early hostname change | ✅ | `Dockerfile.cloudflare:16`, `scripts/cloudflare/verify-workflows.mjs:1` | Full web suite and image builds pass; hostname remains gated until application checks. |
+| T1.4 | Infrastructure health is distinct from Cap readiness | ✅ | `infra/cloudflare/worker.ts:1`, `infra/cloudflare/runtime-worker.ts:1` | Infrastructure health is separate from actual public Cap UI, owner recording/editing and client acceptance. |
+| T1.5 | Build/type/isolated/deployed checks without early hostname change | ✅ | `Dockerfile.cloudflare:16`, `scripts/cloudflare/verify-workflows.mjs:1` | Full web suite and image builds pass; public routing was enabled after core application acceptance. Client/human qualifications are explicit. |
 | T2.1 | Explicit SQLite tables/types/indexes/FKs | ✅ | `packages/database/cloudflare/schema.ts:1`, `packages/database/cloudflare/README.md:1` | Encoding/collation limitations are documented; no claim of MySQL accent-insensitive collation equivalence. |
 | T2.2 | Generated migrations with reproducible artifacts | ✅ | `packages/database/drizzle.cloudflare.config.ts:1`, `packages/database/cloudflare/generate-concurrency-migration.ts:1`, `packages/database/cloudflare/generate-validation-migration.ts:1` | Controlled migration path; application startup does not run it. |
 | T2.3 | Schema/value/constraint and rollback tests | ✅ | `packages/database/cloudflare/database.test.ts:1` | Actual SQLite/D1 tests plus remote application behavior; package tests are distinct from the web-suite count. |
 | T2.4 | Reproducible caller/transaction inventory | ✅ | `scripts/cloudflare/database-audit.mjs:1` | Audit outputs are candidates, not a claim that every match is a live MySQL use. |
 | T2.5 | Equivalent ownership/concurrency across caller groups | ✅ | `packages/database/cloudflare/atomic.ts:60`, `packages/web-backend/src/Videos/persistence.ts:1` | Native D1 reservation, roster/source/lease races and publication rollback evidence across the ported groups. |
 | T2.6 | Canonical D1 cutover after affected tests | ✅ | `packages/database/index.ts:1`, `packages/database/schema.ts:1`, `packages/database/cloudflare/application.ts:6` | Canonical accessor fails closed without the Cloudflare/D1 runtime. |
-| T3.1 | Preserve filler words and valid timing in Cap transcript artifacts | ✅ | `apps/web/lib/cloudflare-transcription.ts:1`, `apps/web/__tests__/fixtures/cloudflare-whisper-response.ts:1` | Nova-3 was the initial candidate, not a fixed-model requirement. Measured drift led to Cloudflare-hosted Whisper; no guessed offset is applied. |
-| T3.2 | Explicit typed provider boundary | ✅ | `apps/web/lib/transcription-provider.ts:13`, `apps/web/lib/cloudflare-transcription.ts:129` | Cloudflare parser/provider/editor focused suite passed 64 cases. |
+| T3.1 | Preserve filler words and valid timing in Cap transcript artifacts | ✅ | `apps/web/lib/cloudflare-transcription.ts:1`, `apps/web/__tests__/fixtures/cloudflare-whisper-response.ts:1` | Measured Nova drift led to Cloudflare Whisper turbo with VAD enabled;25-word filler and200-second410-token fixtures pass without guessed offsets. |
+| T3.2 | Explicit typed provider boundary | ✅ | `apps/web/lib/transcription-provider.ts:13`, `apps/web/lib/cloudflare-transcription.ts:129` | Typed Cloudflare provider/parser/editor boundaries; final provider/VAD suite65 cases passes. |
 | T3.3 | Preserve non-Cloudflare transcription default | ✅ | `apps/web/lib/transcription-provider.ts:42` | AssemblyAI default branch remains outside this deployment's configured Cloudflare provider. |
 | T3.4 | Provider failure/retry and scoped checks | ✅ | `apps/web/lib/cloudflare-transcription.ts:175`, `apps/web/__tests__/unit/cloudflare-transcription.test.ts:1` | Invalid source/timings fail, transient HTTP failures retain retry classification. |
 | T4.1 | No request-startup migrations/provisioning | ✅ | `apps/web/instrumentation.node.ts:18` | Cloudflare validation/readiness returns before the legacy migration/bucket-publication path. |
-| T4.2 | Supported web/media packages and immutable pins | ✅ | `Dockerfile.cloudflare:1`, `scripts/cloudflare/write-release-config.mjs:133` | Image builds/pins pass; corrected generator output independently passes actual Wrangler dry-run validation. |
+| T4.2 | Supported web/media packages and immutable pins | ✅ | `Dockerfile.cloudflare:1`, `scripts/cloudflare/write-release-config.mjs:133` | Pinned composed production release uses unchanged da9168d web and b117f8d media; generated image objects independently pass Wrangler validation. |
 | T4.3 | Durable job ownership/retry state on Cloudflare | ✅ | `packages/workflow-cloudflare/index.mjs:49`, `infra/cloudflare/workflow-store.mjs:96` | Persisted outbox/lease/replay logic; media work is bounded rather than running MySQL/queues on ephemeral disks. |
-| T4.4 | Interrupted uploads/processing/edits/imports do not duplicate publication | ⚠️ | `infra/cloudflare/workflow-store.test.mjs:1`, `apps/web/__tests__/unit/desktop-recording-output-replacement.test.ts:1` | Native tests cover the paths; final operational binding-update checks remain open, and private Loom library migration is deferred. |
-| T5.1 | Cloudflare generation without outside fallback | ✅ | `apps/web/lib/ai/provider.ts:136` | Endpoint/account/model restrictions are present; real title/summary generation is coordinator verified. |
-| T5.2 | Resend login/invites with restricted membership | ⚠️ | `packages/database/cloudflare/team.ts:27`, `packages/database/auth/auth-options.ts:79` | Real owner delivered mail/login works; final member invitation/sign-in remains a launch gate. |
+| T4.4 | Interrupted uploads/processing/edits/imports do not duplicate publication | ✅ | `infra/cloudflare/workflow-store.test.mjs:1`, `apps/web/__tests__/unit/desktop-recording-output-replacement.test.ts:1` | Native interrupted-upload/processing/edit/import contracts pass; live Restore and ordered binding recovery pass. Private-library import E2E is user-deferred. |
+| T5.1 | Cloudflare generation without outside fallback | ✅ | `apps/web/lib/ai/provider.ts:136` | Cloudflare-only account/model endpoint restrictions; real title/summary and200-second recording with three chapters verified. |
+| T5.2 | Resend login/invites with restricted membership | ✅ | `packages/database/cloudflare/team.ts:27`, `packages/database/auth/auth-options.ts:79` | Production owner delivered OTP/login, native member/invitation policies and real delivered ordinary-Member invitation pass. Human invitee sign-in has not been observed. |
 | T5.3 | Filler/silence edits with preview/undo/original preservation | ✅ | `apps/web/lib/edit-transcript.ts:585`, `apps/web/lib/silence-cuts.ts:82`, `apps/web/actions/videos/save-edits.ts:337` | Actual UI cut selection/Undo/Redo, 10.8667-second export, semantic re-transcription and original hash preservation are recorded by root. |
-| T5.4 | Ownership, sharing, overlap/noise, failed processing and large media | ⚠️ | `apps/web/__tests__/unit/cloudflare-video-privacy.test.ts:1`, `apps/media-server/src/__tests__/lib/media-routes-real-world.integration.test.ts:1` | Native/scoped cases and short live synthetic recordings are meaningful coverage; they do not establish every long-duration/high-resolution hardware workload. |
-| T6.1 | Owner/member complete vertical flow | ⚠️ | `EXECUTION_LEDGER.md:16-18`, `apps/web/app/(org)/dashboard/caps/record/RecordVideoPage.tsx:1` | Owner and synthetic browser capture paths verified; member acceptance and final browser-processing closure remain coordinator owned. |
+| T5.4 | Ownership, sharing, overlap/noise, failed processing and large media | ✅ | `apps/web/__tests__/unit/cloudflare-video-privacy.test.ts:1`, `apps/media-server/src/__tests__/lib/media-routes-real-world.integration.test.ts:1` | Native ownership/overlap/noise/recovery tests plus live short browser recordings and200-second complete transcription/AI pass; no universal acoustic/hardware workload claim. |
+| T6.1 | Owner/member complete vertical flow | ⚠️ | `EXECUTION_LEDGER.md:16-18`, `apps/web/app/(org)/dashboard/caps/record/RecordVideoPage.tsx:1` | Owner production capture/upload/playback/edit completion passes; native member contracts and invitation delivery pass. Invitee acceptance/login/recording remains an explicit human observation gap. |
 | T6.2 | Measured usage, concurrency and notifications | ✅ | `infra/cloudflare/COSTS.md:35`, `infra/cloudflare/COSTS.md:64`, `infra/cloudflare/runtime-worker.ts:1` | Existing enabled native $10 account-wide budget alert was verified read-only and retained; not a new Cap-specific alert or delivery test. |
-| T6.3 | Backup/restore and rollback | ⚠️ | `scripts/cloudflare/backup-restore-drill.mjs:312`, `scripts/cloudflare/snapshot-import.mjs:15`, `infra/cloudflare/releasing.md:80` | Edited snapshot52 tables/16 rows, complete schema/row/media hashes and cleanup now pass. Pinned rollback/runbook safeguards do not prove an unreported live image rollback. |
-| T6.4 | Hostname only after acceptance | ⚠️ | `scripts/cloudflare/write-release-config.mjs:167` | Correct target and default closed gates; final routing/HTTPS/public checks pending. |
+| T6.3 | Backup/restore and rollback | ✅ | `scripts/cloudflare/backup-restore-drill.mjs:312`, `scripts/cloudflare/snapshot-import.mjs:15`, `infra/cloudflare/releasing.md:80` | Actual post-edit restore52 tables/16 rows, schema/row/media hashes, integrity/FK and cleanup pass. Current pins establish first production rollback baseline; no destructive downgrade or full-bucket DR claim. |
+| T6.4 | Hostname only after acceptance | ✅ | `scripts/cloudflare/write-release-config.mjs:167` | Public required hostname/root/login/download/owner application flows pass; workers.dev disabled. Human member observation remains qualified separately. |
 | T6.5 | Loom sample/batch migration and reconciliation | 🟦 | `EXECUTION_LEDGER.md:21`, `docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md:27` | Explicitly deferred by the user; preserve the old library and importer capability. |
-| T6.6 | Security before QA, resolve material findings | ⚠️ | `library/qa/security/2026-10-28-release-security-review.md:1`, this report | Ordering satisfied for reviewed application source; final deployment and operational deltas still need closure. |
+| T6.6 | Security before QA, resolve material findings | ✅ | `library/qa/security/2026-10-28-release-security-review.md:1`, this report | Independent security preceded QA; material confirmed source findings and generator/recovery defects closed. Dependency/human/device proof limits remain explicit. |
 | AC01 | Preserve upstream features, licenses and client contracts | ✅ | `infra/cloudflare/distribution/README.md:1`, `apps/desktop-gpui/src/distribution.rs:1` | Self-built client configuration and source/license offers are documented; no whole-Loom-parity claim. |
 | AC02 | Equivalent D1 ownership/concurrency persistence | ✅ | `packages/database/cloudflare/atomic.ts:60`, `packages/database/cloudflare/application.ts:6` | Native D1 caller/race/rollback evidence and actual owner flows support the cutover. |
 | AC03 | Private originals/derived assets and intentional sharing | ✅ | `apps/web/app/api/storage/object/route.ts:196`, `apps/web/actions/videos/download.ts:87` | Retained-original read/issuer fixes are independently reviewed; owner original hash and anonymous private-share denial are live verified by root. |
-| AC04 | Actual Cap application on Cloudflare, controlled migrations | ✅ | `apps/web/instrumentation.node.ts:18`, `infra/cloudflare/runtime-worker.ts:82` | Actual Cap UI/processing flows exist on the private runtime; infrastructure health is not substituted for them. |
-| AC05 | Durable processing/edit/import recovery without duplicate publication | ⚠️ | `infra/cloudflare/workflow-store.mjs:96`, `apps/web/workflows/edit-video.ts:110` | Native lease/replay coverage and recovered Restore are recorded; final no-tail binding-update proof pending. |
-| AC06 | Words, fillers, timestamps and media alignment | ✅ | `apps/web/lib/cloudflare-transcription.ts:55`, `apps/web/lib/edit-transcript.ts:129` | Live25-word source and23-word edited export preserve intended speech; no inferred time offset is applied. This is a synthetic fixture, not every acoustic condition. |
-| AC07 | Titles, summaries and chapters on Cloudflare | ⚠️ | `apps/web/workflows/generate-ai.ts:277` | Empty chapters are intentional for clips under 120 seconds. A longer live chapter check is being prepared by root; title/summary are already verified. |
-| AC08 | Owner/member mail, invitations and controlled registration | ⚠️ | `packages/database/cloudflare/team.ts:27`, `packages/database/auth/auth-options.ts:79` | Actual owner mail/session works; real first-member invitation/sign-in remains coordinator owned. |
-| AC09 | Filler/silence cleanup, preview, Undo, export and original | ✅ | `apps/web/actions/videos/save-edits.ts:337`, `apps/web/lib/silence-cuts.ts:82` | Live editor/export/original/Restore evidence is recorded; native D1 receipt race/rollback follow-up passes. |
-| AC10 | Owner/member recording, playback, sharing and denial | ⚠️ | `apps/web/app/(org)/dashboard/caps/record/RecordVideoPage.tsx:1`, `apps/web/actions/video/retry-processing.ts:50` | Synthetic browser recording/capture/upload/playback is demonstrated. Its final processing closure and the member path need final evidence. |
-| AC11 | Backup/restore, rollback, measured usage and bounded concurrency | ⚠️ | `scripts/cloudflare/backup-restore-drill.mjs:312`, `infra/cloudflare/COSTS.md:35`, `infra/cloudflare/releasing.md:80` | Edited snapshot and existing budget notification verified. Final rollout/rollback mechanism proof remains qualified. |
-| AC12 | Application works on the required public hostname | ⚠️ | `scripts/cloudflare/write-release-config.mjs:167` | Correct production image/config path exists; public routing/HTTPS acceptance pending. |
+| AC04 | Actual Cap application on Cloudflare, controlled migrations | ✅ | `apps/web/instrumentation.node.ts:18`, `infra/cloudflare/runtime-worker.ts:82` | Actual Cap UI, owner upload/edit/transcription and processing run on the public Cloudflare deployment; controlled migrations are separate. |
+| AC05 | Durable processing/edit/import recovery without duplicate publication | ✅ | `infra/cloudflare/workflow-store.mjs:96`, `apps/web/workflows/edit-video.ts:110` | Native lease/replay contracts, recovered Restore, and no-tail binding restart with subsequent media callback pass. Existing-library importer E2E is deferred. |
+| AC06 | Words, fillers, timestamps and media alignment | ✅ | `apps/web/lib/cloudflare-transcription.ts:55`, `apps/web/lib/edit-transcript.ts:129` | 25-word filler fixture and23-word edited export retain intended speech;200-second VAD fixture410 spoken tokens passes. Production browser capture is COMPLETE after output-duration publication fix. |
+| AC07 | Titles, summaries and chapters on Cloudflare | ✅ | `apps/web/workflows/generate-ai.ts:277` | Actual200-second clip3ard5ydjze241cs has COMPLETE transcript/AI and three chapters; clips below120 seconds intentionally omit chapters. |
+| AC08 | Owner/member mail, invitations and controlled registration | ✅ | `packages/database/cloudflare/team.ts:27`, `packages/database/auth/auth-options.ts:79` | Owner production OTP delivered and actual login passed; native member/registration contracts and delivered ordinary-Member production invitation pass. Human acceptance remains pending, not impersonated. |
+| AC09 | Filler/silence cleanup, preview, Undo, export and original | ✅ | `apps/web/actions/videos/save-edits.ts:337`, `apps/web/lib/silence-cuts.ts:82` | 17.133-second base to10.8667-second downloaded edit, all23 intended non-filler words, Undo/Redo/Listen/quiet cuts/original checksum/Restore pass. Production three-filler edit also completed. |
+| AC10 | Owner/member recording, playback, sharing and denial | ⚠️ | `apps/web/app/(org)/dashboard/caps/record/RecordVideoPage.tsx:1`, `apps/web/actions/video/retry-processing.ts:50` | Actual owner MediaRecorder upload/pause/resume/playback and automatic raw-to-published transition pass; sharing/denial/native member contracts pass. Human member recording is not yet observed. |
+| AC11 | Backup/restore, rollback, measured usage and bounded concurrency | ✅ | `scripts/cloudflare/backup-restore-drill.mjs:312`, `infra/cloudflare/COSTS.md:35`, `infra/cloudflare/releasing.md:80` | Post-edit52-table/16-row isolated restore with raw/edited hashes and cleanup; bounded runtime and Cap-only cost metrics verified. Existing account-wide alert retained; rollback baseline is pinned, not a destructive-downgrade test. |
+| AC12 | Application works on the required public hostname | ✅ | `scripts/cloudflare/write-release-config.mjs:167` | Public HTTPS root/dashboard redirect to login; login/download200, RPC404; owner session/record/process/transcribe/edit pass on the requested hostname. |
 | AC13 | Existing Loom inventory/import reconciliation | 🟦 | `EXECUTION_LEDGER.md:21` | Explicitly deferred by the user; not a launch blocker. |
-| AC14 | Security then QA with no unresolved material issue | ⚠️ | `library/qa/security/2026-10-28-release-security-review.md:1`, this report | Generator finding corrected; final operational/client/public gates still prevent complete-release signoff. |
-| AC15 | Cloudflare views and engagement analytics | ⚠️ | `packages/database/cloudflare/analytics/schema.ts:1`, `apps/web/app/s/[videoId]/Share.tsx:103` | Real guest view persisted and appeared in the dashboard; no claim of a live nonzero comment/reaction test from the supplied evidence. |
-| AC16 | Desktop downloads and Chrome self-hosted connection | ⚠️ | `apps/web/data/self-hosted-downloads.ts:3`, `.github/workflows/tam-desktop-artifacts.yml:41`, `apps/chrome-extension/scripts/live-production-harness.mjs:126` | Windows x64/Mac ARM packages and native load/configuration probes pass. Native hardware capture is optional per the accepted design; public native Chrome identity/capture remains required and pending. |
+| AC14 | Security then QA with no unresolved material issue | ✅ | `library/qa/security/2026-10-28-release-security-review.md:1`, this report | Security before QA; confirmed source/generator/recovery findings closed; late focused tests and production/client receipts reviewed. Human-member and dependency qualifications are retained. |
+| AC15 | Cloudflare views and engagement analytics | ✅ | `packages/database/cloudflare/analytics/schema.ts:1`, `apps/web/app/s/[videoId]/Share.tsx:103` | Real guest view persisted and displayed by country/browser; owner created a comment and reaction through UI. Separate D1 analytics and metadata engagement operate without Tinybird. |
+| AC16 | Desktop downloads and Chrome self-hosted connection | ✅ | `apps/web/data/self-hosted-downloads.ts:3`, `.github/workflows/tam-desktop-artifacts.yml:41`, `apps/chrome-extension/scripts/live-production-harness.mjs:126` | Public Windows x64/Mac ARM installers and manual Chrome ZIP pass package/configuration checks. Unmodified native Chrome identity plus synthetic tab capture/upload/processing/share playback pass. Native hardware remains device-side setup. |
 | NG-01 | No substitute upload portal or premature full-parity promise | ✅ | `docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md:9` | Actual Cap fork/UI is preserved. This QA does not equate it with every proprietary Loom feature. |
 | NG-02 | No public video bucket or destructive stored-state rollback | ✅ | `infra/cloudflare/downloads.ts:1`, `infra/cloudflare/releasing.md:80` | Allowlisted distribution is separate; runbooks preserve D1/R2/DO/queue state. |
 | NG-03 | No old-library migration during this launch | ✅ | `EXECUTION_LEDGER.md:21` | User deferral is honored; no private Loom connection is requested. |
 
 ### Verification scope
 
-This auditor inspected the plan, complete changed-file inventory, persistence/runtime entrypoints, provider/timeline boundaries, distribution/package configuration, operational controls and independent security/test handoffs. It did not re-audit all 712 changed files line by line or rerun the long unit suite. The coordinator owns the live browser/media evidence; the independent fullunit4 receipt records 386 files, 5,101 pass, zero fail and five intentional skips, with late security additions explicitly covered separately rather than silently added to that count.
+Final public Worker version: `1ff9ac47-6fe5-413d-8f32-5458606d23e3`. Component provenance is recorded in `infra/cloudflare/releases/b117f8d-component-provenance.json`: web digest `0a73f2e8dd8871b217995e350f5ff36259e73d801e3655b96e95449793798541`, media digest `e5a10f85f72b7fb7a0b6b7ff08807733e87dc6222836024e39628102faeaddee`. This auditor independently confirmed unchanged web source paths between the two pinned revisions and read the generated readiness/maintenance flags as true.
 
-No new paid inference, server, external write, email or deployment was made by this auditor. Native alert checks used three read-only Cloudflare endpoints and found the existing enabled $10 policy; no policy or recipient changed and no delivery was tested. Markdown is ignored by this repository's Biome configuration, so report/Markdown validation uses scoped diff/structure/link checks rather than claiming Biome formatted Markdown.
+The coordinator's unkeyed public checks report login/download200, root/dashboard307, RPC404; private playlist401, raw preview/editor/workflow/cron404, and all three installer HEADs200 with expected lengths. Production recording `jnyqnjkxtb1bb8t` automatically switched from raw playback to optimized19.255814-second MP4 without reload, completed transcription, then saved three filler removals to16.8185416667 seconds with no pending edit. Long clip `3ard5ydjze241cs` completed transcription/AI with three chapters.
+
+This auditor read `.secrets/extension-production-live/capture-attempt-4-verified.json`: unmodified native action on the synthetic tab, `actualCaptureCompleted=true`, processing complete, raw440,537B and processed168,369B both200, share200, playback readyState4 at1920x1080, duration5.074333 seconds, advancing currentTime0.649551 and no media error. Video `9vhr6hd37sdtts5` contains synthetic tone/canvas only; `NO_AUDIO` transcription classification is expected for the absence of speech, not proof of speech transcription. Native identity had already passed without a shim. The harness's page-context network observer missed offscreen traffic; the existing saved clip and playback receipt resolved that observation gap without a new capture or client ZIP change.
+
+Focused late checks reported by their owners: runtime49, generator47, transcription/VAD65, playback transition41, media route3 tests/31 assertions, and media workflow18. The media scoped typecheck retains three proven pre-existing diagnostics and introduced zero; it is not claimed as a wholly green media typecheck. No broad suite was repeated for this report.
+
+This auditor inspected the plan, complete changed-file inventory, persistence/runtime entrypoints, provider/timeline boundaries, distribution/package configuration, operational controls and independent security/test handoffs. It did not re-audit all changed files line by line or rerun the long unit suite. The coordinator owns the live browser/media evidence; the independent fullunit4 receipt records 386 files, 5,101 pass, zero fail and five intentional skips, with late security additions explicitly covered separately rather than silently added to that count.
+
+No new paid inference, server, external write, email or deployment was made by this final auditor. Earlier independent native alert checks used three read-only Cloudflare endpoints and found the existing enabled $10 policy; no policy or recipient changed and no delivery was tested. Markdown is ignored by this repository's Biome configuration, so report/Markdown validation uses scoped diff/structure/link checks rather than claiming Biome formatted Markdown.
 
 The corrected release generator was checked independently against actual Wrangler4.152 with the actual production manifest and both readiness gates false. The private post-edit recovery receipt `.secrets/backups/1f2919d2-d815-4cbc-aa68-aaa31f5edcc4/report.json` reports `verified=true`, `schemaMatches=true`, `integrityOk=true`, zero FK violations,52 tables/16 rows, two matching full media samples, and confirmed database/sample deletion. No SQL, credential, request header or signed transfer URL was printed during this review. The authoritative SQLite projection preserves values rather than rewriting SQL-looking text in user content.
 
@@ -153,12 +138,16 @@ The native Windows installer is unsigned; the Mac ARM package is ad hoc signed a
 
 ## Files Changed
 
-Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operations paths from the baseline diff and current working tree. Change-domain summaries below are an inventory, not a claim of independent line-by-line semantic review of every file. The audit report itself is excluded.
+Inventory snapshot: 2026-10-28T02:48:05+00:00; 731 unique implementation/operations paths from the baseline diff and current working tree. Change-domain summaries below are an inventory, not a claim of independent line-by-line semantic review of every file. The audit report itself is excluded.
 
 - `.dockerignore` (M), Fork configuration or build-input integration.
 - `.github/workflows/tam-desktop-artifacts.yml` (A), Fork-owned native/application image build workflow.
+- `.github/workflows/tam-media-image.yml` (A), Final production release, bounded regression coverage or operational evidence.
 - `.github/workflows/tam-web-images.yml` (A), Fork-owned native/application image build workflow.
 - `.gitignore` (M), Fork configuration or build-input integration.
+- `Dockerfile.cloudflare` (A), Native Node/Bun media application packaging and image build boundaries.
+- `Dockerfile.cloudflare.dockerignore` (A), Native Node/Bun media application packaging and image build boundaries.
+- `EXECUTION_LEDGER.md` (M), Approved plan, execution record, architecture or independent review evidence.
 - `apps/chrome-extension/e2e/overlay-ui.spec.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/chrome-extension/e2e/recording-upload.spec.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/chrome-extension/e2e/self-hosted-instance.spec.ts` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
@@ -166,8 +155,8 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/chrome-extension/package.json` (M), Self-hosted extension instance, recording, distribution or acceptance tooling.
 - `apps/chrome-extension/public/manifest.json` (M), Self-hosted extension instance, recording, distribution or acceptance tooling.
 - `apps/chrome-extension/scripts/build-self-hosted.mjs` (A), Self-hosted extension instance, recording, distribution or acceptance tooling.
-- `apps/chrome-extension/scripts/live-production-harness.mjs` (A), Self-hosted extension instance, recording, distribution or acceptance tooling.
-- `apps/chrome-extension/scripts/live-production-harness.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
+- `apps/chrome-extension/scripts/live-production-harness.mjs` (M), Self-hosted extension instance, recording, distribution or acceptance tooling.
+- `apps/chrome-extension/scripts/live-production-harness.test.mjs` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/chrome-extension/scripts/live-staging-harness.mjs` (A), Self-hosted extension instance, recording, distribution or acceptance tooling.
 - `apps/chrome-extension/scripts/live-staging-harness.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/chrome-extension/scripts/package-self-hosted.ps1` (A), Self-hosted extension instance, recording, distribution or acceptance tooling.
@@ -200,7 +189,9 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/media-server/bun.lock` (M), Bounded media processing, immutable outputs, callback or silence-analysis integration.
 - `apps/media-server/package.json` (M), Bounded media processing, immutable outputs, callback or silence-analysis integration.
 - `apps/media-server/patches/zod@3.25.76.patch` (A), Bounded media processing, immutable outputs, callback or silence-analysis integration.
+- `apps/media-server/src/__tests__/fixtures/browser-capture-duration.webm` (A), Final production release, bounded regression coverage or operational evidence.
 - `apps/media-server/src/__tests__/index.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
+- `apps/media-server/src/__tests__/lib/media-routes-real-world.integration.test.ts` (M), Final production release, bounded regression coverage or operational evidence.
 - `apps/media-server/src/__tests__/routes/process-idempotency.test.ts` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/media-server/src/__tests__/silence-analysis.test.ts` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/media-server/src/app.ts` (M), Bounded media processing, immutable outputs, callback or silence-analysis integration.
@@ -376,6 +367,7 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/web/__tests__/unit/transcript-sidebar-search.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/web/__tests__/unit/transcription-provider.test.ts` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/web/__tests__/unit/update-seat-quantity.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
+- `apps/web/__tests__/unit/upload-progress-tracker.test.ts` (M), Final production release, bounded regression coverage or operational evidence.
 - `apps/web/__tests__/unit/verification-token.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/web/__tests__/unit/video-analytics-access.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `apps/web/__tests__/unit/video-analytics-bulk.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
@@ -507,6 +499,7 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/web/app/(org)/verify-otp/form.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/(site)/download/page.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/(site)/layout.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
+- `apps/web/app/Layout/devtoolsServer.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/admin/replace-video/ReplaceVideoPanel.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/api/analytics/route.ts` (M), Application action/API persistence, authorization or publication integration.
 - `apps/web/app/api/analytics/track/route.ts` (M), Application action/API persistence, authorization or publication integration.
@@ -560,18 +553,19 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/web/app/api/webhooks/stripe/route.ts` (M), Application action/API persistence, authorization or publication integration.
 - `apps/web/app/cli/authorize/page.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/embed/[videoId]/page.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
-- `apps/web/app/Layout/devtoolsServer.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/s/[videoId]/_components/CapVideoPlayer.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
+- `apps/web/app/s/[videoId]/_components/ProgressCircle.tsx` (M), Final production release, bounded regression coverage or operational evidence.
 - `apps/web/app/s/[videoId]/_components/ShareHeader.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/s/[videoId]/_components/VideoDownloadMenu.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/s/[videoId]/edit/EditVideoClient.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
-- `apps/web/app/s/[videoId]/edit/page.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/s/[videoId]/edit/TranscriptSidebar.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
+- `apps/web/app/s/[videoId]/edit/page.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/app/s/[videoId]/page.tsx` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/components/forms/server.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/components/pages/SelfHostedDownloadPage.tsx` (A), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/data/self-hosted-downloads.ts` (A), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/instrumentation.node.ts` (M), Web application UI, data, provider or runtime integration for the fork.
+- `apps/web/lib/Notification.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/account-deletion-request.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/admin-access.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/admin-reprocess-state.ts` (A), Web application UI, data, provider or runtime integration for the fork.
@@ -642,7 +636,6 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/web/lib/messenger/self-hosted-prompt.ts` (A), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/messenger/supermemory.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/messenger/support-email.ts` (M), Web application UI, data, provider or runtime integration for the fork.
-- `apps/web/lib/Notification.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/org-pro.ts` (M), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/organization-invite-read.ts` (A), Web application UI, data, provider or runtime integration for the fork.
 - `apps/web/lib/organization-provisioning.ts` (M), Web application UI, data, provider or runtime integration for the fork.
@@ -702,22 +695,20 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `apps/web/workflows/transfer-organization-content.ts` (M), Cloudflare durable application job and publication integration.
 - `apps/web/workflows/video-processing-status.ts` (M), Cloudflare durable application job and publication integration.
 - `bun.lock` (M), Pinned dependency/toolchain or package contract changes.
-- `Dockerfile.cloudflare` (A), Native Node/Bun media application packaging and image build boundaries.
-- `Dockerfile.cloudflare.dockerignore` (A), Native Node/Bun media application packaging and image build boundaries.
 - `docs/superpowers/plans/2026-10-27-cloudflare-cap.md` (A), Approved plan, execution record, architecture or independent review evidence.
 - `docs/superpowers/reports/2026-10-27-cost-envelope.md` (A), Approved plan, execution record, architecture or independent review evidence.
 - `docs/superpowers/reports/2026-10-27-foundation-qa.md` (A), Approved plan, execution record, architecture or independent review evidence.
 - `docs/superpowers/reports/2026-10-27-runtime-recovery.md` (A), Approved plan, execution record, architecture or independent review evidence.
 - `docs/superpowers/reports/2026-10-27-security-review.md` (A), Approved plan, execution record, architecture or independent review evidence.
 - `docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md` (A), Approved plan, execution record, architecture or independent review evidence.
-- `EXECUTION_LEDGER.md` (A), Approved plan, execution record, architecture or independent review evidence.
+- `infra/cloudflare/COSTS.md` (M), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
+- `infra/cloudflare/README.md` (M), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/backup-restore.md` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/cap.env.example` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/configuration-refresh.md` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
-- `infra/cloudflare/COSTS.md` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
+- `infra/cloudflare/distribution/README.md` (M), Client artifact manifest, checksums or managed-distribution instructions.
 - `infra/cloudflare/distribution/checksums.txt` (A), Client artifact manifest, checksums or managed-distribution instructions.
 - `infra/cloudflare/distribution/manifest.json` (A), Client artifact manifest, checksums or managed-distribution instructions.
-- `infra/cloudflare/distribution/README.md` (A), Client artifact manifest, checksums or managed-distribution instructions.
 - `infra/cloudflare/downloads.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `infra/cloudflare/downloads.ts` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/evidence/2026-10-28-cap-container-usage.json` (A), Cap-filtered non-secret operational usage/restart evidence.
@@ -727,8 +718,11 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `infra/cloudflare/package-lock.json` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/package.json` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/r2-cors.json` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
-- `infra/cloudflare/README.md` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
+- `infra/cloudflare/releases/b117f8d-component-provenance.json` (A), Final production release, bounded regression coverage or operational evidence.
 - `infra/cloudflare/releases/production-04f7c07b02bd2742ff5183c53875e9647698a7e5-wrangler4152.json` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
+- `infra/cloudflare/releases/production-b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7.json` (A), Final production release, bounded regression coverage or operational evidence.
+- `infra/cloudflare/releases/production-da9168de55d5e9138d6448569af5c56621854848.json` (A), Final production release, bounded regression coverage or operational evidence.
+- `infra/cloudflare/releases/staging-da9168de55d5e9138d6448569af5c56621854848.json` (A), Final production release, bounded regression coverage or operational evidence.
 - `infra/cloudflare/releasing.md` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
 - `infra/cloudflare/request-headers.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `infra/cloudflare/request-headers.ts` (A), Cloudflare bindings, runtime controls, durable state, maintenance or operations guidance.
@@ -753,13 +747,14 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `packages/database/auth/session.ts` (M), Cloudflare-compatible authentication and membership behavior.
 - `packages/database/auth/sso.ts` (M), Cloudflare-compatible authentication and membership behavior.
 - `packages/database/auth/stripe-customer.ts` (M), Cloudflare-compatible authentication and membership behavior.
+- `packages/database/cloudflare/README.md` (M), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/access.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/ai-generation.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/application.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/index.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/migrations/0000_analytics_initial.sql` (A), D1 persistence, validation, authorization or atomic transport implementation.
-- `packages/database/cloudflare/analytics/migrations/meta/_journal.json` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/migrations/meta/0000_snapshot.json` (A), D1 persistence, validation, authorization or atomic transport implementation.
+- `packages/database/cloudflare/analytics/migrations/meta/_journal.json` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/repository.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/schema.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/analytics/test-runtime.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
@@ -778,14 +773,13 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `packages/database/cloudflare/migrations/0000_rare_robbie_robertson.sql` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
 - `packages/database/cloudflare/migrations/0001_d1_concurrency.sql` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
 - `packages/database/cloudflare/migrations/0002_d1_validation.sql` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
-- `packages/database/cloudflare/migrations/meta/_journal.json` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
 - `packages/database/cloudflare/migrations/meta/0000_snapshot.json` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
 - `packages/database/cloudflare/migrations/meta/0001_snapshot.json` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
 - `packages/database/cloudflare/migrations/meta/0002_snapshot.json` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
+- `packages/database/cloudflare/migrations/meta/_journal.json` (A), Generated Cloudflare schema, constraints or migration snapshot artifact.
 - `packages/database/cloudflare/mutation-counts.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/organization-delete.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/pro-seat.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
-- `packages/database/cloudflare/README.md` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/schema.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/team.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
 - `packages/database/cloudflare/test-runtime.ts` (A), D1 persistence, validation, authorization or atomic transport implementation.
@@ -827,31 +821,31 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `packages/web-backend/src/Folders/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Folders/persistence.ts` (A), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/ImageUploads/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/Organisations/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Organisations/OrganisationsPolicy.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Organisations/OrganisationsRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/Organisations/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Rpcs.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/S3Buckets/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/S3Buckets/S3BucketAccess.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/S3Buckets/S3BucketsRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/Spaces/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/S3Buckets/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Spaces/SpacesPolicy.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Spaces/SpacesRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/Spaces/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Storage/GoogleDrive.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/Storage/StorageRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Storage/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Storage/persistence.ts` (A), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Storage/recording-output.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/Storage/StorageRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/Users/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Users/UsersOnboarding.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Users/UsersRpcs.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/Users/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/Videos/VideosPolicy.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/Videos/VideosRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Videos/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Videos/persistence.test.ts` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `packages/web-backend/src/Videos/persistence.ts` (A), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-backend/src/Videos/snapshot-view-policy.ts` (A), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/Videos/VideosPolicy.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
-- `packages/web-backend/src/Videos/VideosRepo.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
+- `packages/web-backend/src/index.ts` (M), Backend service persistence/capability port for the Cloudflare runtime.
 - `packages/web-domain/src/Storage.ts` (M), Shared package/type/provider integration for the Cloudflare fork.
 - `packages/workflow-cloudflare/index.d.ts` (A), Durable Cloudflare workflow transport and runtime adapter.
 - `packages/workflow-cloudflare/index.mjs` (A), Durable Cloudflare workflow transport and runtime adapter.
@@ -862,6 +856,7 @@ Inventory snapshot: 2026-10-28T01:42:32.518Z; 721 unique implementation/operatio
 - `scripts/cloudflare/backup-restore-drill.mjs` (A), Reproducible build, audit, release, recovery or validation tooling.
 - `scripts/cloudflare/backup-restore-drill.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `scripts/cloudflare/database-audit.mjs` (A), Reproducible build, audit, release, recovery or validation tooling.
+- `scripts/cloudflare/media-image-workflow.test.mjs` (A), Final production release, bounded regression coverage or operational evidence.
 - `scripts/cloudflare/metadata-snapshot.ps1` (A), Reproducible build, audit, release, recovery or validation tooling.
 - `scripts/cloudflare/publish-build-credentials.ps1` (A), Reproducible build, audit, release, recovery or validation tooling.
 - `scripts/cloudflare/runtime-secrets.ps1` (A), Reproducible build, audit, release, recovery or validation tooling.

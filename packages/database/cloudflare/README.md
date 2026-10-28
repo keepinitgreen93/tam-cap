@@ -68,7 +68,9 @@ Apply migrations through controlled deployment tooling before using the primitiv
 
 The Node 24 test suite runs generated migrations in an isolated Miniflare D1 database and disposes it afterward. It checks every upstream table/column shape and index, nullable uniqueness, composite keys, date/JSON/boolean round trips, generated dates, foreign-key rejection and cascade, large counters, and atomic rollback when a batch fails. It does not use production data or credentials.
 
-## Remaining cutover blockers
+## Porting constraints and cutover history
+
+The initial porting checklist below records the constraints used during implementation. Canonical D1 cutover, generated validation migrations, production owner authentication and isolated post-edit backup/restore have since passed; current release evidence and remaining client qualifications are in `EXECUTION_LEDGER.md`. These local persistence tests alone do not establish native hardware recording or human invitee acceptance.
 
 1. SQLite `NOCASE` handles ASCII case only. The explicit identity policy above handles Unicode normalization and IDNA; all remaining grant/import callers must use it, and any existing data must pass collision reconciliation. Other text columns use SQLite binary collation unless a caller applies an explicit normalization policy. This is not an emulation of MySQL accent-insensitive collation.
 2. Field lengths, JSON syntax, numeric bounds, and logical booleans are now enforced by `0002_d1_validation`, including direct raw SQL writes. Run the generated `validation-preflight.sql` before applying it and require every `invalid_rows` count to be zero. Domain-level object shapes and authorization still belong to application validation. These triggers have passed local D1 tests but must be applied through the controlled migration process before application cutover.
@@ -76,7 +78,7 @@ The Node 24 test suite runs generated migrations in an isolated Miniflare D1 dat
 4. D1 does not support the existing interactive transaction and `SELECT ... FOR UPDATE` model. Do not replace transactions with unrelated statements. Redesign conditional claims, counters, quotas, idempotency, ownership transfers, and read-dependent writes with equivalent atomicity and concurrency tests.
 5. Replace MySQL upserts, result-array/`affectedRows` assumptions, MySQL date/JSON/string functions, auth adapters, and Effect MySQL services. Native MySQL drivers must not enter the Worker runtime. D1 parameter, query-size, transaction, and result limits need workload-specific checks.
 6. Generated custom creation dates are verified for ISO dates with or without milliseconds and invalid/missing-date fallback. Reconcile legacy metadata formats and timezone assumptions during import; SQLite's date parser is not a full emulation of MySQL `STR_TO_DATE`.
-7. Authentication/team callers are being ported explicitly; other caller groups and the canonical entrypoint still require coordinated cutover. Production authentication, the new concurrency migration, backup/restore, and end-to-end desktop flows have not been deployed or verified by the local persistence tests.
+7. Authentication/team callers and the canonical entrypoint use the coordinated D1 provider. Production authentication, generated migrations and backup/restore have separate live evidence; they are not inferred from local persistence tests. Desktop package configuration and API compatibility are verified separately from device-specific screen, camera and microphone permissions.
 
 ## Caller inventory
 

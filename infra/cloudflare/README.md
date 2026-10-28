@@ -1,6 +1,15 @@
 # TAM Cap Cloudflare infrastructure
 
-This directory contains the platform foundation and the separate guarded application runtime for the Cap fork. The platform health endpoint explicitly returns `applicationReady: false`; it is not application acceptance. The application is under private staging verification. No production hostname is attached yet.
+This directory contains the platform foundation and the application runtime for the Cap fork. The application is live at https://videos.trulyauthenticmarketing.com with production readiness and maintenance enabled. The separate platform health endpoint returns `applicationReady: false`; it is an infrastructure probe, not the application status. Current component digests are pinned in `releases/production-b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7.json`; `EXECUTION_LEDGER.md` records acceptance and its qualifications.
+
+## Start using Cap
+
+1. Open https://videos.trulyauthenticmarketing.com and sign in as `hello@trulyauthenticmarketing.com` using the Resend verification email.
+2. Record in the browser at `/dashboard/caps/record`. After processing, open Edit to review transcript-based filler removal and selected quiet cuts, then save and share the resulting link. Original downloads remain available to the owner.
+3. Optional clients are at `/download`: Windows x64, Apple Silicon macOS and a manually installed Chrome extension. The browser recorder requires no installation or local Docker. Desktop builds are unsigned/ad hoc signed, with manual updates and local operating-system permission setup; see `distribution/README.md`.
+4. The first ordinary-member invitation is delivered and awaiting the recipient's acceptance. Invite additional teammates from organization settings when needed.
+
+Existing Loom videos remain in Loom until the separately deferred migration. Costs are usage-based with a roughly $20 monthly target, not a hard cap; see `COSTS.md`.
 
 Resources are dedicated to this project:
 
@@ -15,9 +24,9 @@ Resources are dedicated to this project:
 
 The Cloudflare account and D1 identifiers in Wrangler configuration are identifiers, not credentials. R2 public access must remain disabled. Resend is the approved transactional email provider; configure its credentials through protected deployment secrets when the application is ready, never in this directory.
 
-`cap.env.example` records intended application configuration with blank secrets. It is not a bootable application configuration: the upstream app still requires MySQL until the D1 caller port is complete. Do not invent a MySQL URL or expose a half-configured deployment. The `CAP_AWS_*` variable names belong to upstream's S3-compatible interface; their destination here is Cloudflare R2, not AWS. The S3 endpoint is an authenticated API endpoint, not a public bucket URL. Omit other AI provider keys in the Cloudflare deployment to prevent external fallback. Model selection is provisional until real generation tests pass.
+`cap.env.example` records application configuration with blank secrets. The Cloudflare runtime uses the canonical D1 provider and does not require a MySQL server. The `CAP_AWS_*` variable names belong to upstream's S3-compatible interface; their destination here is Cloudflare R2, not AWS. The S3 endpoint is an authenticated API endpoint, not a public bucket URL. Omit other AI provider keys to prevent external fallback. Cloudflare transcription and text generation passed live acceptance.
 
-Resend's `updates.trulyauthenticmarketing.com` sending domain was verified through the connected account on 2026-10-27. This keeps the application owner at `hello@trulyauthenticmarketing.com`; Cap login messages use its existing `auth@RESEND_FROM_DOMAIN` convention. A restricted sending key is deployed. The user-approved verification email was delivered and the real owner sign-in succeeded; dashboard/recording acceptance remains separate.
+Resend's `updates.trulyauthenticmarketing.com` sending domain was verified through the connected account on 2026-10-27. The application owner is `hello@trulyauthenticmarketing.com`; Cap login messages use its existing `auth@RESEND_FROM_DOMAIN` convention. A restricted sending key is deployed. Production owner sign-in, recording, processing, editing and playback passed. The first member invitation was delivered; human acceptance is pending.
 
 Apply the browser-origin policy with `wrangler r2 bucket cors set tam-cap-videos --file infra/cloudflare/r2-cors.json`. CORS does not grant access: the bucket remains private and needs signed requests. Keep allowed origins explicit.
 
@@ -38,7 +47,7 @@ See `docs/superpowers/specs/2026-10-27-cloudflare-cap-design.md` and its impleme
 
 ## Application runtime
 
-`wrangler.runtime.jsonc` defines the separate `tam-cap-app` deployment. It remains closed with `CAP_RUNTIME_READY=false` until application persistence and end-to-end acceptance pass. The existing platform Worker is independent. Do not attach the production hostname or change the readiness flag based only on successful builds.
+`wrangler.runtime.jsonc` is the guarded template for the separate `tam-cap-app` deployment. Production uses the pinned release configuration with `CAP_RUNTIME_READY=true`. The existing platform Worker is independent. For future releases, verify application persistence and end-to-end behavior before changing readiness; successful builds alone are insufficient.
 
 `Dockerfile.cloudflare` builds the actual Next.js application and Bun media server as separate targets. Both image entrypoints use UID 1000. Cloudflare currently grants root-equivalent Linux capabilities to processes under the required `durable_object` policy, so this UID is not a deployed VM security boundary; retain scoped credentials and expose no arbitrary command execution. Web uses Node 24.22.1; media uses Bun 1.4.4 with FFmpeg. The account requires the `durable_object` scheduling policy. Each request routes to the fixed `primary` instance of its class; there is no user-selectable instance identifier. Both images start as `standard-1` (0.5 vCPU, 4 GiB RAM, 8 GB disk); media processing and direct conversion limits are one. This policy does not support a platform `max_instances` setting. Native startup selects the named image before the pinned Container SDK handles port readiness, outbound interception, monitoring and idle shutdown. Web sleeps after two minutes without activity. Media checks authenticated runtime activity before sleeping. These limits bound concurrency, not monthly spend.
 
@@ -49,10 +58,9 @@ npm ci --prefix infra/cloudflare --ignore-scripts
 node --test infra/cloudflare/worker.test.mjs infra/cloudflare/runtime.test.mjs infra/cloudflare/workflow-store.test.mjs
 node node_modules/typescript/bin/tsc -p infra/cloudflare/tsconfig.runtime.json
 wrangler deploy --config infra/cloudflare/wrangler.runtime.jsonc --dry-run --containers-rollout none
-docker build -f Dockerfile.cloudflare --target web --build-arg NEXT_PUBLIC_WEB_URL=https://tam-cap-app.ciglesia.workers.dev -t tam-cap-web:staging .
-docker build -f Dockerfile.cloudflare --target media -t tam-cap-media:staging .
-wrangler deploy --config infra/cloudflare/wrangler.runtime.jsonc
 ```
+
+Local Docker is unnecessary for operating the live site. Build images through the fork's GitHub Actions workflows, generate a release configuration from their verified manifests, and deploy that pinned configuration. Temporary registry build credentials were removed after the final build; provision fresh short-lived credentials for a later release.
 
 Set `CAP_WEB_ENV` as a Worker secret containing a JSON object of string application environment values. Required settings include matching HTTPS `WEB_URL` and `NEXTAUTH_URL`, `NEXTAUTH_SECRET`, R2 S3 credentials and endpoints, and the selected email/AI provider configuration. Set `MEDIA_SERVER_WEBHOOK_SECRET` separately. Runtime injection fixes D1 and the durable Cloudflare workflow adapter, and removes `NEXT_PUBLIC_IS_CAP` to preserve upstream self-hosted behavior. Change both the image's `NEXT_PUBLIC_WEB_URL` build argument and runtime origins together for production. Set `CAP_DEPLOYMENT_ID` to the released source revision; it must not remain `cloudflare-development` for a release.
 
@@ -60,7 +68,7 @@ For guarded staging verification, optionally set the `CAP_PREVIEW_KEY` Worker se
 
 Database, analytics, workflow and media calls use private container outbound handlers at `cap.database`, `cap.analytics`, `cap.workflow`, and `cap.media`. Media can call `cap.web` for callbacks. Public workflow execution, database RPC and cron paths are rejected, including percent-encoded variants. The underlying application still validates media webhook secrets and resource ownership. Geography headers are replaced with URI-encoded values from trusted Cloudflare request metadata.
 
-Cloudflare cron enqueues maintenance every fifteen minutes when `CAP_MAINTENANCE_ENABLED=true`. Recovery runs for stale desktop segments and failed processing; daily03:00UTC also runs agent credential cleanup, developer storage accounting and90-day analytics cleanup. Deliveries use the durable queue and authenticated internal requests with `CRON_SECRET` from the protected environment. Maintenance remains disabled until the coherent staging image is verified. It can wake the web container even without user traffic; account for that in costs.
+Cloudflare cron enqueues maintenance every fifteen minutes when `CAP_MAINTENANCE_ENABLED=true`. Recovery runs for stale desktop segments and failed processing; daily03:00UTC also runs agent credential cleanup, developer storage accounting and90-day analytics cleanup. Deliveries use the durable queue and authenticated internal requests with `CRON_SECRET` from the protected environment. Maintenance is enabled on the public release. It can wake the web container even without user traffic; account for that in costs.
 
 ## Durable workflow contract
 
@@ -70,7 +78,7 @@ Accepted deliveries and delayed retries are persisted before acknowledgement. An
 
 After twenty failed queue attempts the message remains in the failed queue; monitor and redrive that queue after resolving the cause. Do not purge it during deployment or rollback. Retain the workflow Durable Object namespace and its storage across releases. A deployment change still requires validating that pending workflows can execute against the new code; no automatic version-pinned routing has been claimed.
 
-Local tests cover native Durable Object persistence across restarts, hook-token races, nested rollback, stream pagination, duplicate delivery, stale lease rejection, ambiguous completion, and the installed SDK. They do not substitute for interrupting real media work and checking output ownership, live container networking, or the full recording/import/edit acceptance flow. D1 caller migration, private R2 application integration, live callbacks, and those end-to-end checks remain release gates.
+Local tests cover native Durable Object persistence across restarts, hook-token races, nested rollback, stream pagination, duplicate delivery, stale lease rejection, ambiguous completion, and the installed SDK. Separate live evidence covers D1 cutover, R2 application integration, callbacks, recording/editing and interrupted Restore recovery. Existing Loom-library migration is deferred by the user. Native hardware capture and human invitation acceptance are distinguished from source/package compatibility checks in the execution ledger.
 
 ## Configuration and authentication rotation
 

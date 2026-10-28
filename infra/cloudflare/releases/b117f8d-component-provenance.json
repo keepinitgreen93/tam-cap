@@ -1,0 +1,13 @@
+{
+	"webImage": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-web@sha256:0a73f2e8dd8871b217995e350f5ff36259e73d801e3655b96e95449793798541",
+	"webSourceRevision": "da9168de55d5e9138d6448569af5c56621854848",
+	"webSourcePathsUnchanged": [
+		"apps/web",
+		"packages",
+		"Dockerfile.cloudflare",
+		"bun.lock"
+	],
+	"mediaImage": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-media@sha256:e5a10f85f72b7fb7a0b6b7ff08807733e87dc6222836024e39628102faeaddee",
+	"mediaSourceRevision": "b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7",
+	"sourceRevision": "b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7"
+}

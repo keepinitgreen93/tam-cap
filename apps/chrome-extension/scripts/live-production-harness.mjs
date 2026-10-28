@@ -32,7 +32,14 @@ const safeSteps = new Set([
 	"upload",
 	"share",
 ]);
-const allowedOptions = new Set(["capture", "ownerEditPassed", "domainPublic"]);
+const allowedOptions = new Set([
+	"capture",
+	"ownerEditPassed",
+	"domainPublic",
+	"retryAfterZeroUploadFailure",
+	"instrumentedThirdStart",
+	"normalDeviceFourthStart",
+]);
 
 export function validateProductionOptions(options) {
 	if (
@@ -44,6 +51,20 @@ export function validateProductionOptions(options) {
 		throw Error("forbidden_production_option");
 	if (!options.ownerEditPassed || !options.domainPublic)
 		throw Error("production_release_prerequisites_required");
+	if (options.retryAfterZeroUploadFailure && !options.capture)
+		throw Error("production_retry_requires_capture");
+	if (
+		options.instrumentedThirdStart &&
+		(!options.capture || options.retryAfterZeroUploadFailure)
+	)
+		throw Error("production_third_start_requires_exclusive_capture");
+	if (
+		options.normalDeviceFourthStart &&
+		(!options.capture ||
+			options.instrumentedThirdStart ||
+			options.retryAfterZeroUploadFailure)
+	)
+		throw Error("production_fourth_start_requires_exclusive_capture");
 }
 export function parseProductionArguments(args) {
 	const allowed = new Set([
@@ -52,6 +73,9 @@ export function parseProductionArguments(args) {
 		"--capture",
 		"--owner-edit-passed",
 		"--domain-public",
+		"--retry-after-zero-upload-failure",
+		"--instrumented-third-start",
+		"--normal-device-fourth-start",
 	]);
 	if (
 		args.some((value) => !allowed.has(value)) ||
@@ -67,6 +91,11 @@ export function parseProductionArguments(args) {
 			capture: args.includes("--capture"),
 			ownerEditPassed: args.includes("--owner-edit-passed"),
 			domainPublic: args.includes("--domain-public"),
+			normalDeviceFourthStart: args.includes("--normal-device-fourth-start"),
+			instrumentedThirdStart: args.includes("--instrumented-third-start"),
+			retryAfterZeroUploadFailure: args.includes(
+				"--retry-after-zero-upload-failure",
+			),
 		},
 	};
 }
@@ -164,17 +193,241 @@ async function poll(check, timeoutMs = 30000) {
 	}
 	throw Error("bounded_wait_expired");
 }
-async function reserveCaptureBudget() {
+export function validateZeroUploadRetry(budget, failure, diagnostic) {
+	if (
+		budget?.attempts !== 1 ||
+		!budget.synthetic ||
+		!budget.tabOnly ||
+		failure?.failure !== "production_extension_failed_at_capture" ||
+		failure.forbiddenRequest ||
+		diagnostic?.recordingStarted !== false ||
+		diagnostic.mediaStreamConsumed !== false ||
+		diagnostic.putRequestsObserved !== 0 ||
+		diagnostic.state?.liveManifests !== 0 ||
+		diagnostic.state?.failedRecordings !== 0 ||
+		diagnostic.state?.capturedTabs !== 0 ||
+		diagnostic.before?.category !== "extension_action_not_invoked" ||
+		diagnostic.after?.permitted !== true
+	)
+		throw Error("zero_upload_retry_not_verified");
+}
+async function writeOnceOrMatch(file, bytes) {
+	try {
+		await writeFile(file, bytes, { flag: "wx" });
+	} catch (error) {
+		if (
+			error?.code !== "EEXIST" ||
+			!Buffer.from(await readFile(file)).equals(Buffer.from(bytes))
+		)
+			throw Error("private_history_preservation_failed");
+	}
+}
+export function recorderErrorEvidence(value) {
+	return String(value ?? "")
+		.replace(/(?:https?|chrome-extension):\/\/[^\s]+/g, "[url]")
+		.replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]")
+		.replace(/[A-Za-z0-9_-]{24,}/g, "[identifier]")
+		.replace(/\b\d{6,}\b/g, "[number]")
+		.slice(0, 500);
+}
+export function installStartResponseObserver() {
+	const original = chrome.runtime.sendMessage;
+	globalThis.__tamRecorderStartReply = null;
+	chrome.runtime.sendMessage = function (...args) {
+		if (
+			args[0]?.type !== "start-recording" ||
+			typeof args.at(-1) !== "function"
+		)
+			return original.apply(this, args);
+		const callback = args.at(-1);
+		args[args.length - 1] = (response) => {
+			globalThis.__tamRecorderStartReply = {
+				requestedMode: args[0].mode,
+				ok: Boolean(response?.ok),
+				error: String(response?.error ?? ""),
+				runtimeError: String(chrome.runtime.lastError?.message ?? ""),
+				phase: response?.status?.phase ?? null,
+			};
+			if (typeof globalThis.__tamCaptureStartObservation === "function")
+				void globalThis
+					.__tamCaptureStartObservation(globalThis.__tamRecorderStartReply)
+					.catch(() => undefined);
+			return callback(response);
+		};
+		return original.apply(this, args);
+	};
+}
+async function reserveCaptureBudget(options, liveState) {
+	const retry = options.retryAfterZeroUploadFailure;
+	if (options.normalDeviceFourthStart) {
+		const previous = JSON.parse(
+			await readFile(
+				path.join(
+					productionPaths.privateRoot,
+					"capture-attempt-3-instrumented.json",
+				),
+				"utf8",
+			),
+		);
+		const bytes = await readFile(
+			path.join(productionPaths.privateRoot, "failure.json"),
+		);
+		const failure = JSON.parse(bytes);
+		if (
+			previous.attempts !== 3 ||
+			failure.captureAttempt !== 3 ||
+			failure.uploadRequests !== 0 ||
+			failure.successfulUploads !== 0 ||
+			failure.uploadedBytesObserved !== 0 ||
+			failure.offscreen?.message !== "Requested device not found" ||
+			liveState.capturedTabs !== 0 ||
+			liveState.liveManifests !== 0 ||
+			liveState.failedRecordings !== 0
+		)
+			throw Error("fourth_start_zero_upload_prerequisite_failed");
+		await access(
+			path.join(productionPaths.privateRoot, "failure-attempt-1.json"),
+		);
+		await access(
+			path.join(productionPaths.privateRoot, "failure-attempt-2.json"),
+		);
+		await access(
+			path.join(productionPaths.privateRoot, "native-auth-result.json"),
+		);
+		await writeOnceOrMatch(
+			path.join(productionPaths.privateRoot, "failure-attempt-3.json"),
+			bytes,
+		);
+		await writeFile(
+			path.join(
+				productionPaths.privateRoot,
+				"capture-attempt-4-native-tab.json",
+			),
+			JSON.stringify({
+				attempts: 4,
+				instrumented: true,
+				synthetic: true,
+				tabOnly: true,
+				fakeDeviceFlags: false,
+				priorUploadRequests: 0,
+				liveState,
+				reservedAt: new Date().toISOString(),
+			}),
+			{ flag: "wx" },
+		);
+		return;
+	}
+	if (options.instrumentedThirdStart) {
+		const prior = JSON.parse(
+			await readFile(
+				path.join(productionPaths.privateRoot, "capture-attempt-2.json"),
+				"utf8",
+			),
+		);
+		const failureBytes = await readFile(
+			path.join(productionPaths.privateRoot, "failure.json"),
+		);
+		const failure = JSON.parse(failureBytes);
+		if (
+			prior.attempts !== 2 ||
+			failure.captureAttempt !== 2 ||
+			failure.uploadRequests !== 0 ||
+			failure.successfulUploads !== 0 ||
+			failure.uploadedBytesObserved !== 0 ||
+			failure.failure !== "production_extension_failed_at_capture" ||
+			liveState.capturedTabs !== 0 ||
+			liveState.liveManifests !== 0 ||
+			liveState.failedRecordings !== 0
+		)
+			throw Error("third_start_zero_upload_prerequisite_failed");
+		await access(
+			path.join(productionPaths.privateRoot, "failure-attempt-1.json"),
+		);
+		await access(
+			path.join(productionPaths.privateRoot, "native-auth-result.json"),
+		);
+		await writeOnceOrMatch(
+			path.join(productionPaths.privateRoot, "failure-attempt-2.json"),
+			failureBytes,
+		);
+		await writeFile(
+			path.join(
+				productionPaths.privateRoot,
+				"capture-attempt-3-instrumented.json",
+			),
+			JSON.stringify({
+				attempts: 3,
+				instrumented: true,
+				synthetic: true,
+				tabOnly: true,
+				priorUploadRequests: 0,
+				reservedAt: new Date().toISOString(),
+				liveState,
+			}),
+			{ flag: "wx" },
+		);
+		return;
+	}
+	if (retry) {
+		const budget = JSON.parse(
+			await readFile(
+				path.join(productionPaths.privateRoot, "capture-budget.json"),
+				"utf8",
+			),
+		);
+		const previousFailure = await readFile(
+			path.join(productionPaths.privateRoot, "failure.json"),
+		);
+		const diagnostic = JSON.parse(
+			await readFile(
+				path.join(productionPaths.privateRoot, "tab-permission-diagnosis.json"),
+				"utf8",
+			),
+		);
+		validateZeroUploadRetry(budget, JSON.parse(previousFailure), diagnostic);
+		await writeOnceOrMatch(
+			path.join(productionPaths.privateRoot, "failure-attempt-1.json"),
+			previousFailure,
+		);
+	}
 	await writeFile(
-		path.join(productionPaths.privateRoot, "capture-budget.json"),
+		path.join(
+			productionPaths.privateRoot,
+			retry ? "capture-attempt-2.json" : "capture-budget.json",
+		),
 		JSON.stringify({
-			attempts: 1,
+			attempts: retry ? 2 : 1,
 			reservedAt: new Date().toISOString(),
 			synthetic: true,
 			tabOnly: true,
+			...(retry
+				? { priorFailure: "failure-attempt-1.json", priorUploadRequests: 0 }
+				: {}),
 		}),
 		{ flag: "wx" },
 	);
+}
+export async function invokeProductionToolbar(context, target) {
+	const expected = `${productionOrigin}${syntheticPath}`;
+	if (target.url() !== expected)
+		throw Error("synthetic_action_target_required");
+	const protocol = await context.browser().newBrowserCDPSession();
+	try {
+		const { targetInfos } = await protocol.send("Target.getTargets", {
+			filter: [{ type: "tab", exclude: false }, { exclude: true }],
+		});
+		const matches = targetInfos.filter(
+			(info) => info.type === "tab" && info.url === expected,
+		);
+		if (matches.length !== 1)
+			throw Error("synthetic_browser_tab_target_ambiguous");
+		await protocol.send("Extensions.triggerAction", {
+			id: productionExtensionId,
+			targetId: matches[0].targetId,
+		});
+	} finally {
+		await protocol.detach();
+	}
 }
 
 export async function runProductionHarness(options = {}) {
@@ -212,8 +465,6 @@ export async function runProductionHarness(options = {}) {
 				`--load-extension=${productionPaths.package}`,
 				`--auto-select-tab-capture-source-by-title=${syntheticTitle}`,
 				"--autoplay-policy=no-user-gesture-required",
-				"--use-fake-device-for-media-stream",
-				"--use-fake-ui-for-media-stream",
 				"--disable-background-networking",
 			],
 		},
@@ -226,8 +477,25 @@ export async function runProductionHarness(options = {}) {
 	let uploadRequests = 0;
 	let successfulUploads = 0;
 	const statuses = [];
+	let recorderDiagnostic = null;
+	let activePanel = null;
+	let statusReader = null;
+	let observedStartReply = null;
 	try {
 		await context.setExtraHTTPHeaders({});
+		await context.exposeBinding(
+			"__tamCaptureStartObservation",
+			(source, reply) => {
+				if (
+					source.frame
+						.url()
+						.startsWith(
+							`chrome-extension://${productionExtensionId}/popup.html`,
+						)
+				)
+					observedStartReply = reply;
+			},
+		);
 		await context.addCookies(cookies);
 		await context.route("**/*", async (route) => {
 			const request = route.request();
@@ -274,6 +542,9 @@ export async function runProductionHarness(options = {}) {
 					"/api/extension/auth/start",
 					"/api/extension/auth/approve",
 					"/api/extension/bootstrap",
+					"/api/extension/instant-recordings",
+					"/api/upload/multipart/initiate",
+					"/api/upload/multipart/complete",
 				].includes(url.pathname)
 			)
 				statuses.push({ endpoint: url.pathname, status: response.status() });
@@ -312,6 +583,10 @@ export async function runProductionHarness(options = {}) {
 				prior.extensionId !== productionExtensionId
 			)
 				throw Error("fresh_native_auth_required");
+			await writeOnceOrMatch(
+				path.join(productionPaths.privateRoot, "native-auth-result.json"),
+				await readFile(path.join(productionPaths.privateRoot, "result.json")),
+			);
 		} else {
 			step = "identity_start";
 			const existingPages = new Set(context.pages());
@@ -403,18 +678,13 @@ export async function runProductionHarness(options = {}) {
 					}),
 				productionOrigin,
 			);
+			for (const existing of context.pages())
+				if (existing.url() === `${productionOrigin}${syntheticPath}`)
+					await existing.close();
 			const target = await context.newPage();
 			await target.goto(`${productionOrigin}${syntheticPath}`);
 			await target.bringToFront();
-			await popup.evaluate(
-				async () =>
-					new Promise((resolve) =>
-						chrome.runtime.sendMessage(
-							{ target: "service-worker", type: "open-recorder-panel" },
-							() => resolve(true),
-						),
-					),
-			);
+			await invokeProductionToolbar(context, target);
 			step = "synthetic_panel";
 			const panel = await poll(() =>
 				Promise.resolve(
@@ -434,15 +704,43 @@ export async function runProductionHarness(options = {}) {
 				return (
 					tabs.length === 1 &&
 					tabs[0].url === expected &&
-					state["cap-extension-settings"]?.capture?.recordingMode === "tab"
+					state["cap-extension-settings"]?.capture?.recordingMode === "tab" &&
+					state["cap-extension-settings"]?.webcam?.enabled === false &&
+					state["cap-extension-settings"]?.microphone?.enabled === false &&
+					state["cap-extension-settings"]?.systemAudio?.enabled === true
 				);
 			}, `${productionOrigin}${syntheticPath}`);
-			if (!safeTarget || forbiddenRequest)
+			if (
+				!safeTarget ||
+				forbiddenRequest ||
+				(await target.title()) !== syntheticTitle
+			)
 				throw Error("synthetic_tab_isolation_failed");
 			await panel
 				.getByRole("button", { name: /Start recording/ })
 				.waitFor({ state: "visible" });
-			await reserveCaptureBudget();
+			if (
+				!(await panel.getByRole("combobox").first().innerText()).includes(
+					"Current tab",
+				)
+			)
+				throw Error("synthetic_tab_ui_mode_required");
+			const liveState = await worker.evaluate(async () => {
+				const captured = await chrome.tabCapture.getCapturedTabs();
+				const stored = await chrome.storage.local.get([
+					"cap-extension-live-recordings",
+					"cap-extension-failed-recordings",
+				]);
+				return {
+					capturedTabs: captured.length,
+					liveManifests: stored["cap-extension-live-recordings"]?.length ?? 0,
+					failedRecordings:
+						stored["cap-extension-failed-recordings"]?.length ?? 0,
+				};
+			});
+			await panel.evaluate(installStartResponseObserver);
+			activePanel = panel;
+			await reserveCaptureBudget(options, liveState);
 			step = "capture";
 			await panel.getByRole("button", { name: /Start recording/ }).click();
 			const status = () =>
@@ -455,8 +753,46 @@ export async function runProductionHarness(options = {}) {
 							),
 						),
 				);
-			await poll(async () => (await status())?.phase === "recording");
-			await new Promise((resolve) => setTimeout(resolve, 3500));
+			statusReader = status;
+			await poll(async () => {
+				const current = await status();
+				const reply =
+					observedStartReply ??
+					(await panel
+						.evaluate(() => globalThis.__tamRecorderStartReply)
+						.catch(() => null));
+				const errors = await panel
+					.locator(".text-red-12, .cap-paper-error")
+					.allTextContents()
+					.catch(() => []);
+				recorderDiagnostic = {
+					phase: current?.phase ?? null,
+					statusMessage: recorderErrorEvidence(current?.message),
+					startReply: reply
+						? {
+								...reply,
+								error: recorderErrorEvidence(reply.error),
+								runtimeError: recorderErrorEvidence(reply.runtimeError),
+							}
+						: null,
+					popupErrors: errors.map(recorderErrorEvidence),
+				};
+				if (
+					(reply && (!reply.ok || reply.runtimeError)) ||
+					errors.some((value) => value.trim()) ||
+					current?.phase === "error"
+				)
+					throw Error("recorder_start_rejected");
+				return current?.phase === "recording";
+			});
+			await new Promise((resolve) =>
+				setTimeout(
+					resolve,
+					options.instrumentedThirdStart || options.normalDeviceFourthStart
+						? 5000
+						: 3500,
+				),
+			);
 			step = "upload";
 			const stopped = await popup.evaluate(
 				async () =>
@@ -523,7 +859,7 @@ export async function runProductionHarness(options = {}) {
 		}
 		await writeFile(
 			path.join(productionPaths.privateRoot, "result.json"),
-			`${JSON.stringify({ ...result, statuses }, null, "\t")}\n`,
+			`${JSON.stringify({ ...result, statuses, recorderDiagnostic }, null, "\t")}\n`,
 		);
 		completed = true;
 		console.log(
@@ -537,11 +873,77 @@ export async function runProductionHarness(options = {}) {
 		);
 		return result;
 	} catch {
+		if (activePanel && !observedStartReply) {
+			for (let attempt = 0; attempt < 8 && !observedStartReply; attempt++)
+				await new Promise((resolve) => setTimeout(resolve, 250));
+		}
+		const contexts = await worker
+			?.evaluate(async () => {
+				const entries = await chrome.runtime.getContexts({
+					contextTypes: ["OFFSCREEN_DOCUMENT"],
+				});
+				if (!entries.length) return { count: 0, phase: null, runtimeError: "" };
+				return new Promise((resolve) =>
+					chrome.runtime.sendMessage(
+						{ target: "offscreen", type: "get-recording-status" },
+						(response) =>
+							resolve({
+								count: entries.length,
+								phase: response?.status?.phase ?? null,
+								message: String(response?.status?.message ?? ""),
+								runtimeError: String(chrome.runtime.lastError?.message ?? ""),
+							}),
+					),
+				);
+			})
+			.catch(() => null);
+		if (activePanel) {
+			const reply =
+				observedStartReply ??
+				(await activePanel
+					.evaluate(() => globalThis.__tamRecorderStartReply)
+					.catch(() => null));
+			const errors = await activePanel
+				.locator(".text-red-12, .cap-paper-error")
+				.allTextContents()
+				.catch(() => []);
+			const current = await statusReader?.().catch(() => null);
+			recorderDiagnostic = {
+				phase: current?.phase ?? null,
+				statusMessage: recorderErrorEvidence(current?.message),
+				startReply: reply
+					? {
+							...reply,
+							error: recorderErrorEvidence(reply.error),
+							runtimeError: recorderErrorEvidence(reply.runtimeError),
+						}
+					: null,
+				popupErrors: errors.map(recorderErrorEvidence),
+			};
+		}
 		await writeFile(
 			path.join(productionPaths.privateRoot, "failure.json"),
 			JSON.stringify({
 				failure: safeProductionFailure(step),
 				forbiddenRequest,
+				uploadRequests,
+				successfulUploads,
+				uploadedBytesObserved: uploadedBytes,
+				captureAttempt: options.normalDeviceFourthStart
+					? 4
+					: options.instrumentedThirdStart
+						? 3
+						: options.retryAfterZeroUploadFailure
+							? 2
+							: 1,
+				recorderDiagnostic,
+				offscreen: contexts
+					? {
+							...contexts,
+							message: recorderErrorEvidence(contexts.message),
+							runtimeError: recorderErrorEvidence(contexts.runtimeError),
+						}
+					: null,
 				statuses,
 				completed: false,
 				timestamp: new Date().toISOString(),

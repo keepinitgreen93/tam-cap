@@ -16,7 +16,7 @@ Illustrative combined container running time, assuming the account allowances re
 | 150 | $5.18 | $4.95 | $0.25 | $10.38 |
 | 720 | $25.70 | $25.47 | $1.40 | $52.57 |
 
-Add the account's $5 Workers plan and other meters. Keeping both containers awake all month doubles the 720-hour running quantity. A fifteen-minute maintenance schedule alone can wake web for roughly96 hours in a30-day month, before overlap with real traffic; include that in estimates. Maintenance is disabled during private acceptance.
+Add the account's $5 Workers plan and other meters. Keeping both containers awake all month doubles the 720-hour running quantity. A fifteen-minute maintenance schedule alone can wake web for roughly96 hours in a30-day month, before overlap with real traffic; include that in estimates. Maintenance was disabled during private acceptance and is enabled on the public production release.
 
 ## Media and AI
 

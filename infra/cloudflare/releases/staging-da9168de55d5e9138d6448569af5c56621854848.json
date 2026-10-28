@@ -1,0 +1,105 @@
+{
+	"name": "tam-cap-app",
+	"main": "../runtime-worker.ts",
+	"account_id": "c1e96a4b36c73f3cf4ddf50a90082d94",
+	"compatibility_date": "2026-10-27",
+	"compatibility_flags": ["nodejs_compat"],
+	"version_metadata": {
+		"binding": "CF_VERSION_METADATA"
+	},
+	"workers_dev": true,
+	"preview_urls": false,
+	"triggers": {
+		"crons": ["*/15 * * * *"]
+	},
+	"vars": {
+		"CAP_RUNTIME_READY": "false",
+		"CAP_MAINTENANCE_ENABLED": "false",
+		"CAP_DEPLOYMENT_ID": "da9168de55d5e9138d6448569af5c56621854848",
+		"CAP_WEB_IMAGE_REVISION": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-web@sha256:2b7447d3cafc1ee32234a665e1286813488eba4741f039181e048ad3d7628b8a"
+	},
+	"containers": [
+		{
+			"class_name": "CapWeb",
+			"scheduling_policy": "durable_object",
+			"images": {
+				"base": {
+					"image": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-web@sha256:2b7447d3cafc1ee32234a665e1286813488eba4741f039181e048ad3d7628b8a"
+				}
+			}
+		},
+		{
+			"class_name": "CapMedia",
+			"scheduling_policy": "durable_object",
+			"images": {
+				"base": {
+					"image": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-media@sha256:1cc704d3a8050f270f801efc6ecc5eb67ad4161ee93e58ee353e264f1fd954fb"
+				}
+			}
+		}
+	],
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "CAP_WEB",
+				"class_name": "CapWeb"
+			},
+			{
+				"name": "CAP_MEDIA",
+				"class_name": "CapMedia"
+			},
+			{
+				"name": "CAP_WORKFLOW",
+				"class_name": "CapWorkflowStore"
+			}
+		]
+	},
+	"migrations": [
+		{
+			"tag": "v1",
+			"new_sqlite_classes": ["CapWeb", "CapMedia", "CapWorkflowStore"]
+		}
+	],
+	"queues": {
+		"producers": [
+			{
+				"binding": "WORKFLOW_QUEUE",
+				"queue": "tam-cap-workflows"
+			}
+		],
+		"consumers": [
+			{
+				"queue": "tam-cap-workflows",
+				"max_batch_size": 1,
+				"max_concurrency": 1,
+				"max_retries": 20,
+				"dead_letter_queue": "tam-cap-workflows-failed"
+			}
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "ANALYTICS_DB",
+			"database_name": "tam-cap-analytics",
+			"database_id": "8d68da95-cf03-49e1-81ff-0ef40007ce6d",
+			"migrations_dir": "../../../packages/database/cloudflare/analytics/migrations"
+		},
+		{
+			"binding": "DB",
+			"database_name": "tam-cap-metadata",
+			"database_id": "f5069a36-ac6e-4d1e-994e-3ba47e9d4545",
+			"migrations_dir": "../../../packages/database/cloudflare/migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "DOWNLOADS",
+			"bucket_name": "tam-cap-downloads"
+		},
+		{
+			"binding": "VIDEOS",
+			"bucket_name": "tam-cap-videos"
+		}
+	],
+	"routes": []
+}
