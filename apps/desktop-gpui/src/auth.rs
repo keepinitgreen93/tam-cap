@@ -7,8 +7,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use base64::Engine;
 use futures_util::future::{Either, select};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::store::{self, DEFAULT_SERVER_URL};
 
@@ -106,10 +108,13 @@ impl std::fmt::Display for AuthApiError {
 
 pub struct SignInSession {
     pub url: String,
+    server: String,
     id: u64,
     local: Option<flume::Receiver<AuthParams>>,
     deep: flume::Receiver<String>,
     callback: Arc<CallbackControl>,
+    device: Option<flume::Receiver<Result<AuthParams, SignInWaitError>>>,
+    device_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Default)]
@@ -121,12 +126,109 @@ struct CallbackControl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignInWaitError {
     TimedOut,
+    Failed(String),
 }
 
-/// Start one sign-in attempt: a loopback callback server, a deep-link slot,
-/// and the browser URL that leads back to either. Dropping the session tears
-/// both down.
-pub fn begin_sign_in() -> SignInSession {
+pub async fn begin_sign_in() -> Result<SignInSession, String> {
+    let server = server_url();
+    if crate::distribution::SELF_HOSTED_BUILD || !has_same_origin(&server, DEFAULT_SERVER_URL) {
+        return begin_device_sign_in(&server).await;
+    }
+    Ok(begin_legacy_sign_in())
+}
+
+async fn begin_device_sign_in(server: &str) -> Result<SignInSession, String> {
+    let origin = reqwest::Url::parse(server).map_err(|_| "Invalid server address")?;
+    if origin.scheme() != "https"
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.path() != "/"
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+    {
+        return Err("Secure desktop sign-in requires an HTTPS server origin".into());
+    }
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random).map_err(|_| "Could not create a secure sign-in request")?;
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(Sha256::digest(verifier.as_bytes()));
+    let client = api_client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|_| "Could not start secure sign-in")?;
+    let response = client
+        .post(format!("{server}/api/desktop/session/device/start"))
+        .json(&json!({ "codeChallenge": challenge }))
+        .send()
+        .await
+        .map_err(|_| "Could not contact your server. Try signing in again.")?;
+    if !response.status().is_success() {
+        return Err(
+            "Your server could not start sign-in. Update the app or try again shortly.".into(),
+        );
+    }
+    let data = response
+        .json::<Value>()
+        .await
+        .map_err(|_| "Invalid sign-in response")?;
+    let request_id = data
+        .get("requestId")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or("Invalid sign-in response")?
+        .to_string();
+    let callback = Arc::new(CallbackControl::default());
+    let (tx, rx) = flume::bounded(1);
+    let (deep_tx, deep) = flume::bounded(1);
+    drop(deep_tx);
+    let poll_url = format!("{server}/api/desktop/session/device/poll");
+    let url = format!("{server}/desktop/authorize?request={request_id}");
+    let device_task = tokio::spawn(async move {
+        let result = tokio::time::timeout(Duration::from_secs(10 * 60), async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let response = client.post(&poll_url).json(&json!({ "requestId": request_id, "verifier": verifier }))
+                    .send().await.map_err(|_| SignInWaitError::Failed("Could not finish sign-in. Try again from Cap.".into()))?;
+                if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                if !response.status().is_success() {
+                    return Err(SignInWaitError::Failed("This sign-in request expired or is no longer available. Start again from Cap.".into()));
+                }
+                let data = response.json::<Value>().await.map_err(|_| SignInWaitError::Failed("Invalid sign-in response".into()))?;
+                match data.get("status").and_then(Value::as_str) {
+                    Some("pending") => continue,
+                    Some("complete") => {
+                        let api_key = data.get("api_key").and_then(Value::as_str).filter(|value| value.len() == 36);
+                        let user_id = data.get("user_id").and_then(Value::as_str).filter(|value| !value.is_empty());
+                        if let (Some(api_key), Some(user_id)) = (api_key, user_id) {
+                            return Ok(AuthParams::ApiKey { api_key: api_key.to_string(), user_id: user_id.to_string() });
+                        }
+                        return Err(SignInWaitError::Failed("Invalid sign-in response".into()));
+                    }
+                    _ => return Err(SignInWaitError::Failed("Invalid sign-in response".into())),
+                }
+            }
+        }).await.unwrap_or(Err(SignInWaitError::TimedOut));
+        let _ = tx.send(result);
+    });
+    Ok(SignInSession {
+        url,
+        server: server.to_string(),
+        id: NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed),
+        local: None,
+        deep,
+        callback,
+        device: Some(rx),
+        device_task: Some(device_task),
+    })
+}
+
+fn begin_legacy_sign_in() -> SignInSession {
     let server = server_url();
     let local_only = should_use_local_server_session(&server);
     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
@@ -155,10 +257,13 @@ pub fn begin_sign_in() -> SignInSession {
 
     SignInSession {
         url: sign_in_request_url(&server, local.as_ref().map(|local| local.port), local_only),
+        server,
         id,
         local: local.map(|local| local.complete),
         deep: deep_rx,
         callback,
+        device: None,
+        device_task: None,
     }
 }
 
@@ -183,9 +288,16 @@ impl SignInSession {
         timeout: impl Future<Output = ()>,
     ) -> Result<AuthParams, SignInWaitError> {
         let local = async {
+            if let Some(device) = &self.device {
+                return device.recv_async().await.unwrap_or_else(|_| {
+                    Err(SignInWaitError::Failed(
+                        "Sign-in stopped. Try again from Cap.".into(),
+                    ))
+                });
+            }
             match &self.local {
                 Some(local) => match local.recv_async().await {
-                    Ok(params) => params,
+                    Ok(params) => Ok(params),
                     Err(_) => std::future::pending().await,
                 },
                 None => std::future::pending().await,
@@ -196,7 +308,7 @@ impl SignInSession {
                 match self.deep.recv_async().await {
                     Ok(url) => {
                         if let Some(params) = parse_auth_params(&url) {
-                            break params;
+                            break Ok(params);
                         }
                     }
                     Err(_) => std::future::pending::<()>().await,
@@ -206,10 +318,16 @@ impl SignInSession {
         let local = pin!(local);
         let deep = pin!(deep);
         let timeout = pin!(timeout);
-        match select(select(local, deep), timeout).await {
-            Either::Left((Either::Left((params, _)) | Either::Right((params, _)), _)) => Ok(params),
+        let result = match select(select(local, deep), timeout).await {
+            Either::Left((Either::Left((params, _)) | Either::Right((params, _)), _)) => params,
             Either::Right(_) => Err(SignInWaitError::TimedOut),
+        };
+        if result.is_ok() && !has_same_origin(&self.server, &server_url()) {
+            return Err(SignInWaitError::Failed(
+                "The server changed during sign-in. Start again from Cap.".into(),
+            ));
         }
+        result
     }
 
     pub fn mark_completed(&self) {
@@ -219,6 +337,9 @@ impl SignInSession {
 
 impl Drop for SignInSession {
     fn drop(&mut self) {
+        if let Some(task) = self.device_task.take() {
+            task.abort();
+        }
         if !self.callback.completed.load(Ordering::Acquire) {
             self.callback.stop.store(true, Ordering::Release);
         }
@@ -845,10 +966,13 @@ mod tests {
         let (old_tx, old_rx) = flume::bounded(1);
         let old = SignInSession {
             url: String::new(),
+            server: String::new(),
             id: u64::MAX - 1,
             local: None,
             deep: old_rx,
             callback: Arc::new(CallbackControl::default()),
+            device: None,
+            device_task: None,
         };
         drop(old_tx);
         let (new_tx, new_rx) = flume::bounded(1);

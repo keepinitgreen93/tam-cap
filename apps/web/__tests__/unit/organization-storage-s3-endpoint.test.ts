@@ -20,6 +20,15 @@ import { createTestDatabase } from "../../../../packages/database/cloudflare/tes
 const state = vi.hoisted(() => ({
 	buildEnv: { NEXT_PUBLIC_IS_CAP: "true" as string | undefined },
 	NODE_ENV: "production",
+	serverEnv: {
+		NEXTAUTH_SECRET: "synthetic-secret",
+		CAP_AWS_BUCKET: "synthetic-default",
+		CAP_AWS_REGION: "auto",
+		S3_INTERNAL_ENDPOINT: "https://synthetic.r2.cloudflarestorage.com",
+		GOOGLE_CLIENT_ID: "",
+		GOOGLE_CLIENT_SECRET: "",
+	},
+	driveAuthUrl: vi.fn(() => "https://accounts.google.com/synthetic"),
 	s3Configs: [] as Array<Record<string, unknown>>,
 	send: vi.fn(async () => ({})),
 	database: undefined as
@@ -34,7 +43,7 @@ vi.mock("@cap/env", () => ({
 	get NODE_ENV() {
 		return state.NODE_ENV;
 	},
-	serverEnv: () => ({ NEXTAUTH_SECRET: "synthetic-secret" }),
+	serverEnv: () => state.serverEnv,
 }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
@@ -65,7 +74,9 @@ vi.mock("@cap/database/crypto", () => ({
 }));
 
 vi.mock("@cap/utils", () => ({ userIsPro: () => true }));
-vi.mock("@cap/web-backend", () => ({}));
+vi.mock("@cap/web-backend", () => ({
+	getGoogleDriveAuthUrl: state.driveAuthUrl,
+}));
 vi.mock("@cap/web-domain", () => ({
 	S3Bucket: { S3BucketId: { make: (id: string) => id } },
 	Storage: { StorageIntegrationId: { make: (id: string) => id } },
@@ -77,6 +88,8 @@ vi.mock("@/actions/organization/authorization", () => ({
 }));
 
 import {
+	connectOrganizationGoogleDrive,
+	getOrganizationStorageSettings,
 	saveOrganizationS3Config,
 	testOrganizationS3Config,
 } from "@/actions/organization/storage";
@@ -114,7 +127,43 @@ describe("organization storage S3 endpoint policy", () => {
 		state.NODE_ENV = "production";
 		state.s3Configs.length = 0;
 		state.send.mockClear();
+		state.serverEnv.GOOGLE_CLIENT_ID = "";
+		state.serverEnv.GOOGLE_CLIENT_SECRET = "";
+		state.driveAuthUrl.mockClear();
 		await fixture.database.delete(s3Buckets);
+	});
+
+	it("reports the deployment's R2 separately from an optional organization bucket", async () => {
+		state.buildEnv.NEXT_PUBLIC_IS_CAP = undefined;
+		const settings = await getOrganizationStorageSettings(
+			input("").organizationId,
+		);
+		expect(settings).toMatchObject({
+			defaultStorage: { configured: true, provider: "Cloudflare R2" },
+			googleDriveConfigured: false,
+			s3: null,
+		});
+		expect(JSON.stringify(settings)).not.toContain("synthetic-default");
+		expect(JSON.stringify(settings)).not.toContain("synthetic-secret");
+	});
+
+	it("returns a setup message without starting OAuth when Drive credentials are missing", async () => {
+		await expect(
+			connectOrganizationGoogleDrive(input("").organizationId),
+		).resolves.toEqual({
+			error:
+				"Google Drive is not configured on this Cap deployment. Ask your administrator to configure Google OAuth.",
+		});
+		expect(state.driveAuthUrl).not.toHaveBeenCalled();
+		state.serverEnv.GOOGLE_CLIENT_ID = "synthetic-client";
+		await expect(
+			connectOrganizationGoogleDrive(input("").organizationId),
+		).resolves.toHaveProperty("error");
+		state.serverEnv.GOOGLE_CLIENT_SECRET = "synthetic-client-secret";
+		await expect(
+			connectOrganizationGoogleDrive(input("").organizationId),
+		).resolves.toEqual({ url: "https://accounts.google.com/synthetic" });
+		expect(state.driveAuthUrl).toHaveBeenCalledOnce();
 	});
 
 	it.each([
@@ -123,9 +172,9 @@ describe("organization storage S3 endpoint policy", () => {
 		"http://localhost:9000",
 		"http://[::1]:9000",
 	])("refuses to save %s on Cap Cloud", async (endpoint) => {
-		await expect(saveOrganizationS3Config(input(endpoint))).rejects.toThrow(
-			blockedS3EndpointMessage,
-		);
+		await expect(saveOrganizationS3Config(input(endpoint))).resolves.toEqual({
+			error: blockedS3EndpointMessage,
+		});
 		expect(await fixture.database.select().from(s3Buckets)).toHaveLength(0);
 	});
 
@@ -134,11 +183,46 @@ describe("organization storage S3 endpoint policy", () => {
 		"http://10.0.0.5",
 		"http://minio.localhost",
 	])("refuses to test %s on Cap Cloud", async (endpoint) => {
-		await expect(testOrganizationS3Config(input(endpoint))).rejects.toThrow(
-			blockedS3EndpointMessage,
-		);
+		await expect(testOrganizationS3Config(input(endpoint))).resolves.toEqual({
+			error: blockedS3EndpointMessage,
+		});
 		expect(state.s3Configs).toHaveLength(0);
 		expect(state.send).not.toHaveBeenCalled();
+	});
+
+	it("returns safe S3 validation and connection errors without throwing masked action errors", async () => {
+		await expect(
+			saveOrganizationS3Config({ ...input(""), bucketName: "" }),
+		).resolves.toEqual({ error: "Bucket name and region are required" });
+		await expect(
+			testOrganizationS3Config({ ...input(""), region: "" }),
+		).resolves.toEqual({ error: "Bucket name and region are required" });
+		const missingCredentials = {
+			...input("https://8.8.8.8"),
+			accessKeyId: "",
+			secretAccessKey: "",
+		};
+		await expect(saveOrganizationS3Config(missingCredentials)).resolves.toEqual(
+			{
+				error: "Access key ID and secret access key are required",
+			},
+		);
+		await expect(testOrganizationS3Config(missingCredentials)).resolves.toEqual(
+			{
+				error: "Access key ID and secret access key are required",
+			},
+		);
+		state.send.mockRejectedValueOnce(
+			Object.assign(new Error("synthetic provider secret"), {
+				name: "AccessDenied",
+			}),
+		);
+		await expect(
+			testOrganizationS3Config(input("https://8.8.8.8")),
+		).resolves.toEqual({
+			error:
+				"Access denied. Please check your credentials and bucket permissions.",
+		});
 	});
 
 	it("saves public and default endpoints on Cap Cloud", async () => {

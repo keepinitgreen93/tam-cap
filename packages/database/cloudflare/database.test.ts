@@ -71,8 +71,11 @@ test("every upstream table preserves its columns, application types, keys and in
 	const mysqlTables = Object.values(upstream).filter((value) =>
 		is(value, MySqlTable),
 	);
-	const sqliteTables = Object.values(schema).filter((value) =>
-		is(value, SQLiteTable),
+	const sqliteTables = Object.values(schema).filter(
+		(value) =>
+			is(value, SQLiteTable) &&
+			value !== schema.desktopSignInRequests &&
+			value !== schema.desktopSignInRateLimits,
 	);
 	assert.equal(sqliteTables.length, mysqlTables.length);
 	assert.equal(sqliteTables.length, 49);

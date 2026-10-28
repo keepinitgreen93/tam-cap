@@ -137,6 +137,7 @@ serde = { version = "1", features = ["derive"] }
 sanitize-filename = "0.6.0"
 semver = "1"
 base64 = "0.22"
+getrandom = "0.3"
 minisign-verify = "0.2.4"
 rfd = { version = "0.15", default-features = false, features = [
     "xdg-portal",

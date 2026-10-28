@@ -19,7 +19,7 @@ import {
 } from "@cap/database/cloudflare/schema";
 import { decrypt, encrypt } from "@cap/database/crypto";
 import { nanoId } from "@cap/database/helpers";
-import { serverEnv } from "@cap/env";
+import { buildEnv, serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import {
 	type GoogleDriveIntegrationConfig,
@@ -52,6 +52,11 @@ export type OrganizationStorageSettings = {
 		name: string;
 	};
 	activeProvider: OrganizationStorageProvider | null;
+	defaultStorage: {
+		configured: boolean;
+		provider: string;
+	} | null;
+	googleDriveConfigured: boolean;
 	googleOAuthClientId: string | null;
 	googlePickerApiKey: string | null;
 	s3: {
@@ -311,13 +316,14 @@ const getS3InputCredentials = async (input: S3ConfigInput) => {
 
 	const existingBucket = await getOrganizationBucket(input.organizationId);
 	if (!existingBucket) {
-		throw new Error("Access key ID and secret access key are required");
+		return { error: "Access key ID and secret access key are required" };
 	}
 
 	if (hasAccessKeyId || hasSecretAccessKey) {
-		throw new Error(
-			"Enter both access key ID and secret access key to change credentials",
-		);
+		return {
+			error:
+				"Enter both access key ID and secret access key to change credentials",
+		};
 	}
 
 	return {
@@ -365,6 +371,15 @@ export async function getOrganizationStorageSettings(
 	]);
 	const driveConfig = drive ? await parseDriveConfig(drive) : null;
 	const activeProvider = activeDrive ? "googleDrive" : bucket ? "s3" : null;
+	const env = serverEnv();
+	const defaultEndpoint =
+		env.S3_INTERNAL_ENDPOINT ??
+		process.env.CAP_AWS_ENDPOINT ??
+		env.S3_PUBLIC_ENDPOINT;
+	const isR2 =
+		defaultEndpoint &&
+		URL.canParse(defaultEndpoint) &&
+		new URL(defaultEndpoint).hostname.endsWith(".r2.cloudflarestorage.com");
 
 	return {
 		organization: {
@@ -372,7 +387,17 @@ export async function getOrganizationStorageSettings(
 			name: organization.name,
 		},
 		activeProvider,
-		googleOAuthClientId: process.env.GOOGLE_CLIENT_ID ?? null,
+		defaultStorage:
+			buildEnv.NEXT_PUBLIC_IS_CAP === "true"
+				? null
+				: {
+						configured: Boolean(env.CAP_AWS_BUCKET && env.CAP_AWS_REGION),
+						provider: isR2 ? "Cloudflare R2" : "S3-compatible storage",
+					},
+		googleDriveConfigured: Boolean(
+			env.GOOGLE_CLIENT_ID?.trim() && env.GOOGLE_CLIENT_SECRET?.trim(),
+		),
+		googleOAuthClientId: env.GOOGLE_CLIENT_ID ?? null,
 		googlePickerApiKey: process.env.NEXT_PUBLIC_GOOGLE_PICKER_API_KEY ?? null,
 		s3: bucket ? await decryptS3Config(bucket, false) : null,
 		googleDrive:
@@ -397,10 +422,14 @@ export async function saveOrganizationS3Config(input: S3ConfigInput) {
 	const { user } = await requireOrganizationStorageManagerPro(
 		input.organizationId,
 	);
+	if (!input.bucketName.trim() || !input.region.trim()) {
+		return { error: "Bucket name and region are required" };
+	}
 	if (await isDisallowedS3Endpoint(input.endpoint)) {
-		throw new Error(blockedS3EndpointMessage);
+		return { error: blockedS3EndpointMessage };
 	}
 	const credentials = await getS3InputCredentials(input);
+	if ("error" in credentials) return credentials;
 	const encryptedConfig = {
 		provider: input.provider,
 		accessKeyId: await encrypt(credentials.accessKeyId),
@@ -475,10 +504,14 @@ export async function removeOrganizationS3Config(
 }
 export async function testOrganizationS3Config(input: S3ConfigInput) {
 	await requireOrganizationStorageManagerPro(input.organizationId);
+	if (!input.bucketName.trim() || !input.region.trim()) {
+		return { error: "Bucket name and region are required" };
+	}
 	if (await isDisallowedS3Endpoint(input.endpoint)) {
-		throw new Error(blockedS3EndpointMessage);
+		return { error: blockedS3EndpointMessage };
 	}
 	const credentials = await getS3InputCredentials(input);
+	if ("error" in credentials) return credentials;
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), 5000);
 	const s3Client = new S3Client({
@@ -497,7 +530,7 @@ export async function testOrganizationS3Config(input: S3ConfigInput) {
 		});
 		return { success: true };
 	} catch (error) {
-		throw new Error(getS3ConnectionErrorMessage(error, input.bucketName));
+		return { error: getS3ConnectionErrorMessage(error, input.bucketName) };
 	} finally {
 		clearTimeout(timeoutId);
 	}
@@ -584,6 +617,13 @@ export async function connectOrganizationGoogleDrive(
 	organizationId: Organisation.OrganisationId,
 ) {
 	const { user } = await requireOrganizationStorageManagerPro(organizationId);
+	const env = serverEnv();
+	if (!env.GOOGLE_CLIENT_ID?.trim() || !env.GOOGLE_CLIENT_SECRET?.trim()) {
+		return {
+			error:
+				"Google Drive is not configured on this Cap deployment. Ask your administrator to configure Google OAuth.",
+		};
+	}
 	const state = createGoogleDriveState(user.id, organizationId);
 	return { url: getGoogleDriveAuthUrl({ state }) };
 }

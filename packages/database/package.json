@@ -85,6 +85,7 @@
 		"./cloudflare/pro-seat": "./cloudflare/pro-seat.ts",
 		"./cloudflare/organization-delete": "./cloudflare/organization-delete.ts",
 		"./cloudflare/access": "./cloudflare/access.ts",
+		"./cloudflare/desktop-sign-in": "./cloudflare/desktop-sign-in.ts",
 		"./cloudflare/transcript-publication": "./cloudflare/transcript-publication.ts",
 		"./cloudflare/editing-base": "./cloudflare/editing-base.ts",
 		"./cloudflare/transcription-state": "./cloudflare/transcription-state.ts",

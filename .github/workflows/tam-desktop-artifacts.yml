@@ -107,3 +107,10 @@ jobs:
           path: |
             apps/desktop-gpui/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
             apps/desktop-gpui/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+      - name: Preserve the resolved native dependency lockfile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tam-cap-native-lock-${{ matrix.name }}
+          path: apps/desktop-gpui/Cargo.lock
+          if-no-files-found: error

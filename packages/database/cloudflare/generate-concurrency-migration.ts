@@ -6,6 +6,7 @@ import * as schema from "./schema.ts";
 const tables = Object.values(schema)
 	.filter((value) => is(value, SQLiteTable))
 	.map((table) => getTableConfig(table).name)
+	.filter((table) => !table.startsWith("desktop_sign_in_"))
 	.sort();
 const identifier = (value: string) => `"${value.replaceAll('"', '""')}"`;
 const statements = [

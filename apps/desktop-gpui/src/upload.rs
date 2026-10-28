@@ -2443,25 +2443,7 @@ async fn upload_signed_bytes_inner(
     bytes: Vec<u8>,
     cancel: Option<&AtomicBool>,
 ) -> Result<(), AuthApiError> {
-    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-    let length = bytes.len() as u64;
-    let mut request = CLIENT
-        .get_or_init(upload_client)
-        .put(&target.url)
-        .header("Content-Length", length)
-        .header("Content-Type", upload_content_type(subpath))
-        .timeout(Duration::from_secs(5 * 60))
-        .body(bytes);
-    if is_google_drive_resumable_url(&target.url) && length > 0 {
-        request = request.header(
-            "Content-Range",
-            format!("bytes 0-{}/{}", length.saturating_sub(1), length),
-        );
-    }
-    for (name, value) in target.headers {
-        request = request.header(name, value);
-    }
+    let request = signed_bytes_upload_request(target, subpath, bytes);
     let response = optional_upload_step(cancel, || async {
         send_upload_request(request).await.map_err(|error| {
             if error.is_timeout() {
@@ -2480,6 +2462,39 @@ async fn upload_signed_bytes_inner(
         ));
     }
     Ok(())
+}
+
+fn signed_bytes_upload_request(
+    target: SignedUploadTarget,
+    subpath: &str,
+    bytes: Vec<u8>,
+) -> reqwest::RequestBuilder {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+    let length = bytes.len() as u64;
+    let mut request = CLIENT
+        .get_or_init(upload_client)
+        .put(&target.url)
+        .header("Content-Length", length)
+        .timeout(Duration::from_secs(5 * 60))
+        .body(bytes);
+    if !target
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("content-type"))
+    {
+        request = request.header("Content-Type", upload_content_type(subpath));
+    }
+    if is_google_drive_resumable_url(&target.url) && length > 0 {
+        request = request.header(
+            "Content-Range",
+            format!("bytes 0-{}/{}", length.saturating_sub(1), length),
+        );
+    }
+    for (name, value) in target.headers {
+        request = request.header(name, value);
+    }
+    request
 }
 
 fn upload_client() -> reqwest::Client {
@@ -3136,6 +3151,45 @@ mod tests {
             upload_content_type("screenshot/screen-capture.png"),
             "image/png"
         );
+    }
+
+    #[test]
+    fn signed_upload_content_type_is_not_duplicated() {
+        for name in ["Content-Type", "content-type", "CONTENT-TYPE"] {
+            let request = signed_bytes_upload_request(
+                SignedUploadTarget {
+                    url: "https://storage.example.com/thumbnail".into(),
+                    headers: HashMap::from([
+                        (name.into(), "image/png".into()),
+                        ("x-amz-meta-userid".into(), "owner".into()),
+                    ]),
+                },
+                SCREENSHOT_SUBPATH,
+                vec![1, 2, 3],
+            )
+            .build()
+            .unwrap();
+            assert_eq!(request.headers().get_all("content-type").iter().count(), 1);
+            assert_eq!(request.headers()["content-type"], "image/png");
+            assert_eq!(request.headers()["x-amz-meta-userid"], "owner");
+            assert_eq!(request.headers()["content-length"], "3");
+        }
+    }
+
+    #[test]
+    fn signed_upload_uses_media_content_type_when_not_supplied() {
+        let request = signed_bytes_upload_request(
+            SignedUploadTarget {
+                url: "https://storage.example.com/thumbnail".into(),
+                headers: HashMap::new(),
+            },
+            SCREENSHOT_SUBPATH,
+            vec![1, 2, 3],
+        )
+        .build()
+        .unwrap();
+        assert_eq!(request.headers().get_all("content-type").iter().count(), 1);
+        assert_eq!(request.headers()["content-type"], "image/jpeg");
     }
 
     #[test]

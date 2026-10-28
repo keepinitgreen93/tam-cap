@@ -83,17 +83,46 @@ impl SignIn {
     pub fn start(&mut self, origin: SignInOrigin, cx: &mut Context<Self>) {
         if let Some(attempt) = self.attempt.as_mut() {
             attempt.origin = origin;
-            cx.open_url(&attempt.url);
+            if !attempt.url.is_empty() {
+                cx.open_url(&attempt.url);
+            }
             cx.notify();
             return;
         }
 
-        let session = auth::begin_sign_in();
-        let url = session.url.clone();
         let id = self.next_id;
         self.next_id += 1;
         let timeout = cx.background_executor().timer(auth::SIGN_IN_TIMEOUT);
         let task = cx.spawn(async move |this, cx| {
+            let session = match gpui_tokio::Tokio::spawn(cx, auth::begin_sign_in()).await {
+                Ok(Ok(session)) => session,
+                result => {
+                    let error = match result {
+                        Ok(Err(error)) => error,
+                        Err(_) => "Could not start sign-in. Please try again.".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    if let Ok(Some(origin)) = this.update(cx, |this, cx| {
+                        this.finish(id, SignInOutcome::Failed(error.clone()), cx)
+                    }) && !matches!(origin, SignInOrigin::Overlay(_))
+                    {
+                        platform::alert_dialog("Sign in failed", &error);
+                    }
+                    return;
+                }
+            };
+            let opened = this.update(cx, |this, cx| {
+                let Some(attempt) = this.attempt.as_mut().filter(|attempt| attempt.id == id) else {
+                    return false;
+                };
+                attempt.url = session.url.clone();
+                cx.open_url(&attempt.url);
+                cx.notify();
+                true
+            });
+            if !matches!(opened, Ok(true)) {
+                return;
+            }
             let outcome = match session.wait(timeout).await {
                 Ok(params) => match auth::process_auth_data(params) {
                     Ok(()) => {
@@ -103,6 +132,7 @@ impl SignIn {
                     Err(error) => SignInOutcome::Failed(error),
                 },
                 Err(auth::SignInWaitError::TimedOut) => SignInOutcome::TimedOut,
+                Err(auth::SignInWaitError::Failed(error)) => SignInOutcome::Failed(error),
             };
             drop(session);
 
@@ -134,18 +164,19 @@ impl SignIn {
             .ok();
         });
 
-        cx.open_url(&url);
         self.attempt = Some(Attempt {
             id,
             origin,
-            url,
+            url: String::new(),
             task,
         });
         cx.notify();
     }
 
     pub fn reopen(&mut self, cx: &mut Context<Self>) {
-        if let Some(attempt) = &self.attempt {
+        if let Some(attempt) = &self.attempt
+            && !attempt.url.is_empty()
+        {
             cx.open_url(&attempt.url);
         }
     }

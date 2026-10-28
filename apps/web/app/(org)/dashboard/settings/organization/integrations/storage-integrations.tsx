@@ -135,7 +135,11 @@ export function OrganizationStorageIntegrations({
 
 		startTransition(async () => {
 			try {
-				await action();
+				const result = await action();
+				if (result && typeof result === "object" && "error" in result) {
+					toast.error(String(result.error));
+					return;
+				}
 				toast.success(successMessage);
 				router.refresh();
 			} catch (error) {
@@ -181,8 +185,9 @@ export function OrganizationStorageIntegrations({
 
 	const connectDrive = () =>
 		runMutation(async () => {
-			const { url } = await connectOrganizationGoogleDrive(organizationId);
-			window.location.href = url;
+			const result = await connectOrganizationGoogleDrive(organizationId);
+			if ("error" in result) return result;
+			window.location.href = result.url;
 		}, "Opening Google Drive authorization");
 
 	const disconnectDrive = () =>
@@ -271,8 +276,6 @@ export function OrganizationStorageIntegrations({
 		});
 
 	const toggleExpand = (integration: "s3" | "googleDrive") => {
-		if (!requirePro()) return;
-
 		setExpandedIntegration((prev) =>
 			prev === integration ? null : integration,
 		);
@@ -299,6 +302,27 @@ export function OrganizationStorageIntegrations({
 					and owners can manage integrations.
 				</p>
 			</div>
+
+			{settings.defaultStorage && (
+				<div className="rounded-xl border border-gray-3 px-3.5 py-3">
+					<div className="flex items-center gap-3">
+						<DatabaseIcon className="size-4 shrink-0 text-gray-10" />
+						<span className="flex-1 text-[13px] font-medium text-gray-12">
+							Default recording storage · {settings.defaultStorage.provider}
+						</span>
+						<span className="text-[11px] text-gray-10">
+							{settings.defaultStorage.configured
+								? "Configured"
+								: "Setup required"}
+						</span>
+					</div>
+					<p className="mt-2 text-[12px] text-gray-10">
+						{settings.defaultStorage.configured
+							? "Managed by your administrator. Used when no organization storage integration is enabled."
+							: "Ask your administrator to configure recording storage for this deployment."}
+					</p>
+				</div>
+			)}
 
 			{bothConfigured && (
 				<div className="flex items-center justify-between px-3 py-2.5 rounded-lg border border-gray-3 bg-gray-2">
@@ -340,7 +364,7 @@ export function OrganizationStorageIntegrations({
 				>
 					<DatabaseIcon className="size-4 shrink-0 text-gray-10" />
 					<span className="flex-1 text-[13px] font-medium text-gray-12">
-						S3-Compatible Storage
+						Custom S3-Compatible Storage (optional)
 					</span>
 					<StatusBadge
 						configured={!!settings.s3?.configured}
@@ -746,14 +770,15 @@ export function OrganizationStorageIntegrations({
 						) : (
 							<div className="flex items-center justify-between gap-3">
 								<p className="text-[12px] text-gray-10">
-									Link your Google account to store uploads in a "Cap" folder in
-									your Drive. You can change the location after connecting.
+									{settings.googleDriveConfigured
+										? "Link your Google account to store uploads in a Cap folder in your Drive. You can change the location after connecting."
+										: "Google Drive is not configured on this Cap deployment. Ask your administrator to configure Google OAuth before connecting."}
 								</p>
 								<Button
 									type="button"
 									size="xs"
 									onClick={connectDrive}
-									disabled={isPending}
+									disabled={isPending || !settings.googleDriveConfigured}
 								>
 									Connect
 								</Button>

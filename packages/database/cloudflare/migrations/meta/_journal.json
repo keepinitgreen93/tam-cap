@@ -22,6 +22,34 @@
       "when": 1793123960955,
       "tag": "0002_d1_validation",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1793194374777,
+      "tag": "0003_narrow_the_liberteens",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1793194457090,
+      "tag": "0004_desktop_sign_in_concurrency",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1793194570399,
+      "tag": "0005_glorious_ender_wiggin",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1793194571145,
+      "tag": "0006_desktop_sign_in_rate_concurrency",
+      "breakpoints": true
     }
   ]
 }

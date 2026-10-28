@@ -75,6 +75,11 @@ export function SelfHostedDownloadPage() {
 					Updates for these team builds are managed by your administrator.
 				</p>
 				<p className="text-sm text-gray-10">
+					<a href="/downloads/manifest.json" className="underline">
+						Release details and download checksums
+					</a>
+				</p>
+				<p className="text-sm text-gray-10">
 					Built from our Cap fork.{" "}
 					<a
 						href="https://github.com/keepinitgreen93/tam-cap/tree/codex/cloudflare-self-host"

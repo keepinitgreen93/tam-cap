@@ -93,3 +93,12 @@ No placeholder portal or health endpoint counts as the app. No dropping transact
 - The first ordinary-member invitation was delivered on production. Acceptance, member login and member recording await that person's action and are not claimed as live-tested. Existing Loom-library migration remains user-deferred. Windows/Mac package checks and Chrome tab capture do not establish every hardware recording mode or Chrome Web Store publication.
 - Ordered binding restart recovered503 to200 in approximately12 seconds without diagnostic tail; a subsequent media callback completed. The isolated post-edit restore verified52 tables/16 rows, matching schema/row/media hashes, clean integrity/FKs and removal of temporary resources. This is not a full-bucket disaster-recovery or destructive database-downgrade claim.
 - Independent final QA is recorded in `library/qa/2026-10-28-cloudflare-release-qa.md`. Temporary GitHub registry username/password secrets were deleted after remote builds; runtime credentials are unaffected. Local Docker repair/builds were stopped at the user's direction. Current disk check reports approximately198GiB free on C; no project recordings or Docker data were deleted for cleanup.
+
+## 2026-10-28 focused repair wave
+
+User authorized fixing live integration errors and the prior desktop sign-in handoff; minimize usage and use scoped checks rather than full suites. Existing production remains available during remote builds.
+
+- FIX01 OPEN: Reproduce and fix Google Drive/S3 settings server errors; show default Cloudflare R2 storage separately from optional replacement integrations, and show the deployed domain accurately. Owner: integration specialist, Sol High.
+- FIX02 OPEN: Desktop sign-in remains on the HTTPS instance domain, exchanges credentials privately using an expiring one-use device handoff with proof of possession, and no reusable key enters browser URLs. Owner: auth specialist, Sol High. Generate any D1 migration rather than hand-writing generated schema artifacts.
+- FIX03 OPEN: Measure cold/warm sign-in behavior and remove avoidable delay without silently committing to always-on hosting costs. Owner: coordinator.
+- FIX04 OPEN: One combined web release and Windows client update built remotely, targeted regressions/type checks and live owner/settings/callback verification; no local Docker or broad test reruns. Owner: coordinator. Existing Loom migration remains deferred.

@@ -41,6 +41,7 @@ const FRAME_PROTECTED_PATHS = [
 	"/invite",
 	"/cli/authorize",
 	"/mcp/authorize",
+	"/desktop/authorize",
 	"/admin",
 	"/signup",
 	"/verify-otp",
@@ -56,7 +57,9 @@ const setFrameHeaders = (response: NextResponse) => {
 	response.headers.set("X-Frame-Options", "SAMEORIGIN");
 	response.headers.set(
 		"Content-Security-Policy",
-		"frame-ancestors https://cap.so",
+		buildEnv.NEXT_PUBLIC_IS_CAP === "true"
+			? "frame-ancestors https://cap.so"
+			: "frame-ancestors 'self'",
 	);
 	return response;
 };
@@ -102,6 +105,7 @@ async function route(request: NextRequest) {
 				path.startsWith("/c/") ||
 				path.startsWith("/cli/") ||
 				path.startsWith("/mcp/") ||
+				path.startsWith("/desktop/") ||
 				path.startsWith("/middleware") ||
 				path.startsWith("/dashboard") ||
 				path.startsWith("/onboarding") ||

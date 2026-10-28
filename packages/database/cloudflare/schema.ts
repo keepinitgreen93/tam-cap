@@ -1023,6 +1023,30 @@ export const authApiKeys = sqliteTable(
 		),
 	}),
 );
+export const desktopSignInRequests = sqliteTable(
+	"desktop_sign_in_requests",
+	{
+		id: text("id").notNull().primaryKey(),
+		codeChallenge: text("codeChallenge").notNull(),
+		userId: text("userId").$type<User.UserId>(),
+		expiresAt: integer("expiresAt", { mode: "timestamp_ms" }).notNull(),
+		lastPolledAt: integer("lastPolledAt", { mode: "timestamp_ms" }),
+	},
+	(table) => [
+		index("desktop_sign_in_requests_expires_at_idx").on(table.expiresAt),
+	],
+);
+export const desktopSignInRateLimits = sqliteTable(
+	"desktop_sign_in_rate_limits",
+	{
+		windowId: text("windowId").notNull().primaryKey(),
+		requests: integer("requests").notNull(),
+		expiresAt: integer("expiresAt", { mode: "timestamp_ms" }).notNull(),
+	},
+	(table) => [
+		index("desktop_sign_in_rate_limits_expires_at_idx").on(table.expiresAt),
+	],
+);
 export const agentApiKeys = sqliteTable(
 	"agent_api_keys",
 	{

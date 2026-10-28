@@ -480,7 +480,6 @@ async function AuthorizedContent({
 		user?.id === video.owner.id &&
 		!video.isScreenshot &&
 		video.source?.type === "desktopSegments" &&
-		!video.hasActiveUpload &&
 		serverEnv().MEDIA_SERVER_URL
 	) {
 		try {

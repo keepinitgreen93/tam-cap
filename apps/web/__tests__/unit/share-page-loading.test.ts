@@ -29,6 +29,8 @@ const mocks = vi.hoisted(() => ({
 		NEXT_PUBLIC_IS_CAP: undefined as string | undefined,
 	},
 	quota: vi.fn(),
+	recoverSegments: vi.fn(),
+	mediaServerUrl: undefined as string | undefined,
 	user: vi.fn(),
 	authenticated: false,
 	ownerIsPro: false,
@@ -45,7 +47,7 @@ vi.mock("@cap/database/cloudflare/application", () => ({
 vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.user }));
 vi.mock("@cap/env", () => ({
 	buildEnv: mocks.buildEnv,
-	serverEnv: () => ({}),
+	serverEnv: () => ({ MEDIA_SERVER_URL: mocks.mediaServerUrl }),
 }));
 vi.mock("@cap/ui", () => ({ Logo: () => null }));
 vi.mock("@cap/utils", () => ({ userIsPro: () => mocks.ownerIsPro }));
@@ -103,7 +105,7 @@ vi.mock("@/app/(org)/dashboard/dashboard-data", () => ({
 }));
 vi.mock("@/lib/ai/provider", () => ({ isAiConfigured: () => false }));
 vi.mock("@/lib/desktop-segments-recovery", () => ({
-	completeDesktopSegmentsManifestAndQueue: vi.fn(),
+	completeDesktopSegmentsManifestAndQueue: mocks.recoverSegments,
 }));
 vi.mock("@/lib/Notification", () => ({ createNotification: vi.fn() }));
 vi.mock("@/lib/public-share-video", () => ({ getPublicShareVideo: vi.fn() }));
@@ -173,7 +175,10 @@ function arrangeRows(rows: ReturnType<typeof createVideo>[]) {
 			from: () => query,
 			leftJoin: () => query,
 			innerJoin: () => query,
-			where: () => Promise.resolve(result),
+			where: () =>
+				Object.assign(Promise.resolve(result), {
+					limit: () => Promise.resolve(result),
+				}),
 		};
 		return query;
 	});
@@ -223,7 +228,31 @@ describe("share page loading", () => {
 		mocks.authenticated = false;
 		mocks.ownerIsPro = false;
 		mocks.sharedOrganizations = [];
+		mocks.mediaServerUrl = undefined;
+		mocks.recoverSegments.mockReset();
 		arrangeRows([createVideo()]);
+	});
+
+	it("recovers completed desktop segments despite a stale active upload row", async () => {
+		mocks.mediaServerUrl = "https://media.example.com";
+		mocks.user.mockResolvedValue({ id: "owner" });
+		mocks.recoverSegments.mockResolvedValue({ status: "source-committing" });
+		arrangeRows([
+			{
+				...createVideo(),
+				source: { type: "desktopSegments" },
+				hasActiveUpload: true,
+			},
+		]);
+
+		const content = await renderAuthorizedContent();
+
+		expect(mocks.recoverSegments).toHaveBeenCalledExactlyOnceWith({
+			videoId: "video",
+			userId: "owner",
+		});
+		expect(content.props.children.props.data.hasActiveUpload).toBe(true);
+		expect(mocks.playbackUrl).not.toHaveBeenCalled();
 	});
 
 	it.each([false, true])(

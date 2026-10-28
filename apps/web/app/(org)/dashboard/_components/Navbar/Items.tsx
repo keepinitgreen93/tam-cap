@@ -203,6 +203,21 @@ const AdminNavItems = ({ toggleMobileNav }: Props) => {
 	const isDomainSetupVerified =
 		activeOrg?.organization.customDomain &&
 		activeOrg?.organization.domainVerified;
+	const deploymentUrl =
+		buildEnv.NEXT_PUBLIC_IS_CAP !== "true"
+			? new URL(buildEnv.NEXT_PUBLIC_WEB_URL)
+			: null;
+	const domainHref = deploymentUrl
+		? deploymentUrl.origin
+		: isDomainSetupVerified
+			? `https://${activeOrg.organization.customDomain}`
+			: "/dashboard/settings/organization";
+	const domainLabel =
+		deploymentUrl?.hostname ??
+		(isDomainSetupVerified
+			? activeOrg.organization.customDomain
+			: "No custom domain set");
+	const hasDomain = Boolean(deploymentUrl || isDomainSetupVerified);
 
 	return (
 		<Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
@@ -275,29 +290,17 @@ const AdminNavItems = ({ toggleMobileNav }: Props) => {
 												</div>
 												{!sidebarCollapsed && (
 													<Link
-														href={
-															isDomainSetupVerified
-																? `https://${activeOrg.organization.customDomain}`
-																: "/dashboard/settings/organization"
-														}
-														rel={
-															isDomainSetupVerified
-																? "noopener noreferrer"
-																: undefined
-														}
-														target={isDomainSetupVerified ? "_blank" : "_self"}
+														href={domainHref}
+														rel={hasDomain ? "noopener noreferrer" : undefined}
+														target={hasDomain ? "_blank" : "_self"}
 														className="flex truncate w-full overflow-hidden flex-1 gap-1.5 items-center self-start"
 													>
 														<FontAwesomeIcon
-															icon={
-																isDomainSetupVerified ? faLink : faCircleInfo
-															}
+															icon={hasDomain ? faLink : faCircleInfo}
 															className="duration-200 size-3 text-gray-10"
 														/>
 														<p className="w-full text-[11px] flex-1 duration-200 truncate leading-0 text-gray-11">
-															{isDomainSetupVerified
-																? activeOrg?.organization.customDomain
-																: "No custom domain set"}
+															{domainLabel}
 														</p>
 													</Link>
 												)}

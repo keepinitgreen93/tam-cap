@@ -978,7 +978,7 @@ export function TranscriptSidebar({
 							{transcript.words.length} words
 						</p>
 					</div>
-					{availableFillerCount > 0 && (
+					{availableFillerCount > 0 ? (
 						<button
 							type="button"
 							onClick={deleteFillers}
@@ -993,6 +993,10 @@ export function TranscriptSidebar({
 								{availableFillerCount}
 							</span>
 						</button>
+					) : (
+						<span className="text-[11px] text-gray-9">
+							No filler words detected
+						</span>
 					)}
 				</div>
 
