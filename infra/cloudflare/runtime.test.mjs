@@ -9,6 +9,7 @@ import {
 	webConfigurationFingerprint,
 	webConfigurationRequest,
 	webEnvironment,
+	workerVersionTimestamp,
 } from "./runtime-env.ts";
 
 test("container environment fixes private providers and preserves self-hosted mode", () => {
@@ -154,6 +155,11 @@ test("named-image startup coalesces concurrent requests and configures private e
 		},
 	};
 	const env = {
+		CF_VERSION_METADATA: {
+			id: "version-one",
+			tag: "",
+			timestamp: "2026-10-28T00:00:00.000Z",
+		},
 		CAP_WEB_ENV: JSON.stringify({
 			WEB_URL: "https://cap.example",
 			NEXTAUTH_URL: "https://cap.example",
@@ -228,6 +234,11 @@ function webConfigurationFixture(running = false) {
 		},
 	};
 	const env = {
+		CF_VERSION_METADATA: {
+			id: "version-one",
+			tag: "",
+			timestamp: "2026-10-28T00:00:00.000Z",
+		},
 		CAP_WEB_ENV: JSON.stringify({
 			WEB_URL: "https://cap.example",
 			NEXTAUTH_URL: "https://cap.example",
@@ -561,6 +572,7 @@ test("new edge configuration rejects an old DO and overrides forged caller finge
 	assert.equal(fixture.calls.stops, 1);
 	assert.equal(fixture.calls.forwards, 1);
 	assert.equal(forwarded.headers.get(WEB_CONFIGURATION_HEADER), null);
+	assert.equal(forwarded.headers.get("x-cap-runtime-worker-version"), null);
 });
 
 test("a missing internal fingerprint never reaches the Node process", async () => {
@@ -599,6 +611,7 @@ test("private media callbacks attach current configuration and strip the fence b
 	);
 	assert.equal(response.status, 200);
 	assert.equal(forwarded.headers.get(WEB_CONFIGURATION_HEADER), null);
+	assert.equal(forwarded.headers.get("x-cap-runtime-worker-version"), null);
 	assert.equal(
 		forwarded.headers.get("x-media-server-secret"),
 		"existing-pending-job-secret",
@@ -673,4 +686,486 @@ test("workflow and maintenance queue deliveries use the same fence without losin
 					"Bearer synthetic-cron-secret",
 			),
 	);
+});
+
+test(
+	"same DO reconciles changed live bindings once before forwarding concurrent requests",
+	{ timeout: 5000 },
+	async () => {
+		const CapWeb = await loadWebContainerContract();
+		const fixture = webConfigurationFixture();
+		const starts = [];
+		fixture.container.start = function (options) {
+			fixture.calls.starts++;
+			starts.push(options);
+			this.running = true;
+		};
+		const app = new CapWeb(fixture.ctx, fixture.env);
+		const previousRequest = await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		);
+		await app.fetch(previousRequest);
+		const previousFingerprint = fixture.storage.get("cap.runtime.web-config");
+		assert.equal(fixture.calls.forwards, 1);
+		let enteredStop;
+		const stopped = new Promise((resolve) => {
+			enteredStop = resolve;
+		});
+		fixture.ctx.stop = async () => {
+			fixture.calls.stops++;
+			enteredStop();
+		};
+		fixture.env.CAP_WEB_ENV = JSON.stringify({
+			...JSON.parse(fixture.env.CAP_WEB_ENV),
+			NEXTAUTH_SECRET: "updated-live-binding-secret",
+			CAP_RESTART_GENERATION: "operator-generation",
+		});
+		fixture.env.CAP_WEB_IMAGE_REVISION = "sha256:updated-image";
+		fixture.container.images.base = "registry.test/image@sha256:updated-image";
+		const nextRequest = await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		);
+		const requests = [
+			app.fetch(nextRequest),
+			app.fetch(new Request(nextRequest)),
+		];
+		await stopped;
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(fixture.calls.stops, 1);
+		assert.equal(fixture.calls.forwards, 1);
+		assert.equal(
+			fixture.storage.get("cap.runtime.web-config"),
+			previousFingerprint,
+		);
+		fixture.container.running = false;
+		assert.deepEqual(
+			(await Promise.all(requests)).map((response) => response.status),
+			[200, 200],
+		);
+		assert.equal(fixture.calls.starts, 2);
+		assert.equal(fixture.calls.forwards, 3);
+		assert.equal(starts[1].env.NEXTAUTH_SECRET, "updated-live-binding-secret");
+		assert.equal(starts[1].env.CAP_RESTART_GENERATION, "operator-generation");
+		assert.equal(starts[1].image, "registry.test/image@sha256:updated-image");
+		assert.equal(
+			fixture.storage.get("cap.runtime.web-config"),
+			await webConfigurationFingerprint(fixture.env),
+		);
+		assert.notEqual(
+			fixture.storage.get("cap.runtime.web-config"),
+			previousFingerprint,
+		);
+		assert.equal((await app.fetch(new Request(nextRequest))).status, 200);
+		assert.equal((await app.fetch(new Request(previousRequest))).status, 503);
+		assert.equal(fixture.calls.stops, 1);
+		assert.equal(fixture.calls.starts, 2);
+		assert.equal(fixture.calls.forwards, 4);
+	},
+);
+
+const versionHeader = "x-cap-runtime-worker-version";
+const metadataAt = (timestamp) => ({
+	id: `version-${timestamp}`,
+	tag: "",
+	timestamp,
+});
+function changedConfiguration(env, timestamp, nonce) {
+	return {
+		...env,
+		CF_VERSION_METADATA: metadataAt(timestamp),
+		CAP_RUNTIME_READY: "true",
+		CAP_WEB_ENV: JSON.stringify({
+			...JSON.parse(env.CAP_WEB_ENV),
+			CAP_RESTART_GENERATION: nonce,
+		}),
+	};
+}
+
+test("newer Worker resets a stale actor and retry reconstructs current bindings without deleting state", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	await app.fetch(
+		await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		),
+	);
+	fixture.storage.set("pending-restore", "retained");
+	const prior = fixture.storage.get("cap.runtime.web-config");
+	const before = fixture.calls.forwards;
+	let aborts = 0;
+	fixture.ctx.abort = () => {
+		aborts++;
+		throw new Error("Synthetic actor reset");
+	};
+	const next = changedConfiguration(
+		fixture.env,
+		"2026-10-28T00:02:00.000Z",
+		"nonce-two",
+	);
+	const response = await runtime.fetch(
+		new Request("https://cap.example/login", {
+			headers: { [versionHeader]: "2099-01-01T00:00:00.000Z" },
+		}),
+		{ ...next, CAP_WEB: { fetch: (request) => app.fetch(request) } },
+	);
+	assert.equal(response.status, 503);
+	assert.equal(response.headers.get("Retry-After"), "1");
+	assert.equal(response.headers.get("Cache-Control"), "no-store");
+	assert.equal(aborts, 1);
+	assert.equal(fixture.calls.forwards, before);
+	assert.equal(fixture.storage.get("cap.runtime.web-config"), prior);
+	assert.equal(fixture.storage.get("pending-restore"), "retained");
+	let forwarded;
+	fixture.ctx.forward = (request) => {
+		fixture.calls.forwards++;
+		forwarded = request;
+	};
+	const recreated = new CapWeb(fixture.ctx, next);
+	assert.equal(
+		(
+			await runtime.fetch(new Request("https://cap.example/login"), {
+				...next,
+				CAP_WEB: { fetch: (request) => recreated.fetch(request) },
+			})
+		).status,
+		200,
+	);
+	assert.equal(fixture.calls.stops, 1);
+	assert.equal(fixture.storage.get("pending-restore"), "retained");
+	assert.notEqual(fixture.storage.get("cap.runtime.web-config"), prior);
+	assert.equal(forwarded.headers.get(versionHeader), null);
+	assert.equal(forwarded.headers.get(WEB_CONFIGURATION_HEADER), null);
+	assert.equal(forwarded.headers.get("x-cap-runtime-worker-version"), null);
+	assert.equal(recreated.envVars.CAP_RESTART_GENERATION, "nonce-two");
+	assert.equal(
+		recreated.envVars.NEXTAUTH_SECRET,
+		JSON.parse(fixture.env.CAP_WEB_ENV).NEXTAUTH_SECRET,
+	);
+});
+
+test("old media callbacks cannot reset a newer actor on configuration mismatch", async () => {
+	const { CapWeb, CapMedia } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	const old = { ...fixture.env };
+	const next = changedConfiguration(
+		fixture.env,
+		"2026-10-28T00:03:00.000Z",
+		"nonce-three",
+	);
+	const app = new CapWeb(fixture.ctx, next);
+	await app.fetch(
+		await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			next,
+		),
+	);
+	let aborts = 0;
+	fixture.ctx.abort = () => {
+		aborts++;
+		throw new Error("Unexpected reset");
+	};
+	const fingerprint = fixture.storage.get("cap.runtime.web-config");
+	const forwards = fixture.calls.forwards;
+	const response = await CapMedia.outboundByHost["cap.web"](
+		new Request("http://cap.web/api/webhooks/media-server/progress", {
+			method: "POST",
+			headers: {
+				"x-media-server-secret": "pending-job-secret",
+				[versionHeader]: "2099-01-01T00:00:00.000Z",
+			},
+			body: "{}",
+		}),
+		{ ...old, CAP_WEB: { fetch: (request) => app.fetch(request) } },
+	);
+	assert.equal(response.status, 503);
+	assert.equal(aborts, 0);
+	assert.equal(fixture.calls.forwards, forwards);
+	assert.equal(fixture.storage.get("cap.runtime.web-config"), fingerprint);
+});
+
+test("missing and invalid version headers fail closed without aborting or starting Node", async () => {
+	const CapWeb = await loadWebContainerContract();
+	for (const timestamp of [
+		undefined,
+		"not-a-timestamp",
+		"2026-02-30T00:00:00Z",
+		"2026-10-28T24:00:00Z",
+		"1761609600000",
+	]) {
+		const fixture = webConfigurationFixture();
+		let aborts = 0;
+		fixture.ctx.abort = () => {
+			aborts++;
+			throw new Error("Unexpected reset");
+		};
+		const request = await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		);
+		const headers = new Headers(request.headers);
+		if (timestamp === undefined) headers.delete(versionHeader);
+		else headers.set(versionHeader, timestamp);
+		assert.equal(
+			(
+				await new CapWeb(fixture.ctx, fixture.env).fetch(
+					new Request(request, { headers }),
+				)
+			).status,
+			503,
+		);
+		assert.equal(aborts, 0);
+		assert.equal(fixture.calls.starts, 0);
+		assert.equal(fixture.calls.forwards, 0);
+	}
+});
+
+test("missing actor metadata and malformed fingerprints never authorize an abort", async () => {
+	const CapWeb = await loadWebContainerContract();
+	for (const missingActorVersion of [false, true]) {
+		const fixture = webConfigurationFixture();
+		if (missingActorVersion) delete fixture.env.CF_VERSION_METADATA;
+		let aborts = 0;
+		fixture.ctx.abort = () => {
+			aborts++;
+			throw new Error("Unexpected reset");
+		};
+		const headers = new Headers({
+			[WEB_CONFIGURATION_HEADER]: "forged",
+			[versionHeader]: "2099-01-01T00:00:00Z",
+		});
+		assert.equal(
+			(
+				await new CapWeb(fixture.ctx, fixture.env).fetch(
+					new Request("https://cap.example/login", { headers }),
+				)
+			).status,
+			503,
+		);
+		assert.equal(aborts, 0);
+	}
+});
+
+test("configuration version stamps are authoritative and removed when the binding is missing or invalid", async () => {
+	const fixture = webConfigurationFixture();
+	const incoming = new Request("https://cap.example/login", {
+		headers: { [versionHeader]: "2099-01-01T00:00:00.000Z" },
+	});
+	const stamped = await webConfigurationRequest(incoming, fixture.env);
+	assert.equal(
+		stamped.headers.get(versionHeader),
+		fixture.env.CF_VERSION_METADATA.timestamp,
+	);
+	for (const metadata of [undefined, metadataAt("invalid")]) {
+		const request = await webConfigurationRequest(incoming, {
+			...fixture.env,
+			CF_VERSION_METADATA: metadata,
+		});
+		assert.equal(request.headers.get(versionHeader), null);
+	}
+});
+
+test("successful fresh-env reconciliation advances the actor version floor before old callbacks", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	const old = { ...fixture.env };
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	await app.fetch(
+		await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		),
+	);
+	let aborts = 0;
+	fixture.ctx.abort = () => {
+		aborts++;
+		throw new Error("Synthetic reset");
+	};
+	Object.assign(
+		fixture.env,
+		changedConfiguration(
+			fixture.env,
+			"2026-10-28T00:03:00.000Z",
+			"fresh-nonce",
+		),
+	);
+	assert.equal(
+		(
+			await app.fetch(
+				await webConfigurationRequest(
+					new Request("https://cap.example/login"),
+					fixture.env,
+				),
+			)
+		).status,
+		200,
+	);
+	const intermediate = changedConfiguration(
+		old,
+		"2026-10-28T00:02:00.000Z",
+		"intermediate-nonce",
+	);
+	assert.equal(
+		(
+			await runtime.fetch(new Request("https://cap.example/login"), {
+				...intermediate,
+				CAP_WEB: { fetch: (request) => app.fetch(request) },
+			})
+		).status,
+		503,
+	);
+	assert.equal(aborts, 0);
+	const future = changedConfiguration(
+		fixture.env,
+		"2026-10-28T00:04:00.000Z",
+		"future-nonce",
+	);
+	assert.equal(
+		(
+			await runtime.fetch(new Request("https://cap.example/login"), {
+				...future,
+				CAP_WEB: { fetch: (request) => app.fetch(request) },
+			})
+		).status,
+		503,
+	);
+	assert.equal(aborts, 1);
+});
+
+test("equal upload timestamps do not reset a current actor for a different fingerprint", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	await app.fetch(
+		await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		),
+	);
+	let aborts = 0;
+	fixture.ctx.abort = () => {
+		aborts++;
+		throw new Error("Unexpected reset");
+	};
+	const changed = changedConfiguration(
+		fixture.env,
+		fixture.env.CF_VERSION_METADATA.timestamp,
+		"equal-time-nonce",
+	);
+	assert.equal(
+		(
+			await runtime.fetch(new Request("https://cap.example/login"), {
+				...changed,
+				CAP_WEB: { fetch: (request) => app.fetch(request) },
+			})
+		).status,
+		503,
+	);
+	assert.equal(aborts, 0);
+});
+
+test("an actor without valid constructor metadata never aborts for a valid newer fingerprint", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	delete fixture.env.CF_VERSION_METADATA;
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	let aborts = 0;
+	fixture.ctx.abort = () => {
+		aborts++;
+		throw new Error("Unexpected reset");
+	};
+	const next = changedConfiguration(
+		fixture.env,
+		"2026-10-28T00:03:00.000Z",
+		"new-nonce",
+	);
+	assert.equal(
+		(
+			await runtime.fetch(new Request("https://cap.example/login"), {
+				...next,
+				CAP_WEB: { fetch: (request) => app.fetch(request) },
+			})
+		).status,
+		503,
+	);
+	assert.equal(aborts, 0);
+	assert.equal(fixture.calls.forwards, 0);
+});
+
+test("version ordering preserves submillisecond precision and normalizes UTC offsets", () => {
+	assert.equal(
+		workerVersionTimestamp("2026-10-28T00:00:00.123456789Z") + 1n,
+		workerVersionTimestamp("2026-10-28T00:00:00.123456790Z"),
+	);
+	assert.equal(
+		workerVersionTimestamp("2026-10-28T01:00:00.123456789+01:00"),
+		workerVersionTimestamp("2026-10-28T00:00:00.123456789Z"),
+	);
+	for (const value of [
+		"",
+		null,
+		"tomorrow",
+		"2026-02-30T00:00:00Z",
+		"2026-10-28T00:00:00+24:00",
+		"2026-10-28T24:00:00Z",
+	])
+		assert.equal(workerVersionTimestamp(value), undefined);
+});
+
+test("workflow delivery retries after a newer configuration abort without acknowledging work", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	await app.fetch(
+		await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		),
+	);
+	let aborts = 0,
+		acknowledgements = 0,
+		retries = 0;
+	fixture.ctx.abort = () => {
+		aborts++;
+		throw new Error("Synthetic reset");
+	};
+	const next = changedConfiguration(
+		fixture.env,
+		"2026-10-28T00:05:00.000Z",
+		"queued-next-nonce",
+	);
+	await runtime.queue(
+		{
+			messages: [
+				{
+					body: { messageId: "retained-delivery" },
+					attempts: 1,
+					ack: () => acknowledgements++,
+					retry: () => retries++,
+				},
+			],
+		},
+		{
+			...next,
+			CAP_WEB: { fetch: (request) => app.fetch(request) },
+			CAP_WORKFLOW: {
+				getByName: () => ({
+					fetch: async () =>
+						Response.json({
+							value: encode({
+								queueName: "_wkf_step_test",
+								runId: "retained-run",
+							}),
+						}),
+				}),
+			},
+		},
+	);
+	assert.equal(aborts, 1);
+	assert.equal(acknowledgements, 0);
+	assert.equal(retries, 1);
+	assert.equal(fixture.calls.forwards, 1);
 });

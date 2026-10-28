@@ -167,7 +167,7 @@ export async function transcribeWithCloudflare(
 			body: JSON.stringify({
 				audio: Buffer.from(audio).toString("base64"),
 				task: "transcribe",
-				vad_filter: false,
+				vad_filter: true,
 				...(language === "auto" ? {} : { language }),
 			}),
 			redirect: "error",

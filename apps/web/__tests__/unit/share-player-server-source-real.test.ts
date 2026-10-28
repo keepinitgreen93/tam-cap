@@ -31,6 +31,7 @@ vi.mock("@cap/ui", async (importOriginal) => ({
 
 const uploadState = vi.hoisted(() => ({
 	progress: null as UploadProgress | null,
+	notify: undefined as ((progress: UploadProgress | null) => void) | undefined,
 }));
 vi.mock("next/dynamic", () => ({
 	default: () =>
@@ -40,7 +41,11 @@ vi.mock("next/dynamic", () => ({
 			onChange: (progress: UploadProgress | null) => void;
 		}) {
 			useEffect(() => {
+				uploadState.notify = onChange;
 				queueMicrotask(() => onChange(uploadState.progress));
+				return () => {
+					if (uploadState.notify === onChange) uploadState.notify = undefined;
+				};
 			}, [onChange]);
 			return null;
 		},
@@ -226,9 +231,11 @@ describe("share MP4 source rendered on the server, with the real player", () => 
 	});
 
 	it("hydrates media that loaded first into the player controls", async () => {
-		vi.stubGlobal("fetch", vi.fn<typeof fetch>());
+		const fetchImpl = vi.fn<typeof fetch>();
+		vi.stubGlobal("fetch", fetchImpl);
 		vi.stubGlobal("ResizeObserver", NoopResizeObserver);
-		const { props, videoRef } = playerProps();
+		const onUploadComplete = vi.fn();
+		const { props, videoRef } = playerProps({ onUploadComplete });
 		const player = await hydratePlayer(props, (video) => {
 			setMediaState(video, { readyState: 3 });
 			Object.defineProperty(video, "duration", {
@@ -238,6 +245,8 @@ describe("share MP4 source rendered on the server, with the real player", () => 
 		});
 		try {
 			expect(player.recoverableErrors).toEqual([]);
+			expect(onUploadComplete).not.toHaveBeenCalled();
+			expect(fetchImpl).not.toHaveBeenCalled();
 			expect(videoRef.current).toBe(player.serverVideo);
 			const seek = player.container.querySelector('[role="slider"]');
 			expect(seek?.getAttribute("aria-valuemax")).toBe("95");
@@ -254,6 +263,97 @@ describe("share MP4 source rendered on the server, with the real player", () => 
 			player.client.clear();
 		}
 	});
+	it.each([true, false])(
+		"switches loaded raw playback to the published source once after completion (owner=%s)",
+		async (isOwner) => {
+			const rawUrl = "https://media.example.test/owner/video/raw-upload.mp4";
+			const publishedUrl =
+				"https://media.example.test/owner/video/.recording/outputs/completed/result.mp4";
+			let publish: ((response: Response) => void) | undefined;
+			const fetchImpl = vi
+				.fn<typeof fetch>()
+				.mockResolvedValueOnce(response(SERVER_URL, 404))
+				.mockResolvedValueOnce(response(rawUrl, 206, true))
+				.mockImplementationOnce(
+					() =>
+						new Promise((resolve) => {
+							publish = resolve;
+						}),
+				);
+			vi.stubGlobal("fetch", fetchImpl);
+			vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+			uploadState.progress = {
+				status: "processing",
+				lastUpdated: new Date(),
+				progress: 90,
+				message: "Processing video...",
+			};
+			const onUploadComplete = vi.fn();
+			const { props, videoRef } = playerProps({
+				initialPlaybackUrl: undefined,
+				serverPlaybackUrl: null,
+				rawFallbackSrc: "/api/playlist?videoType=raw-preview",
+				hasActiveUpload: true,
+				canRetryProcessing: isOwner,
+				showPlaybackStatusBadge: true,
+				onUploadComplete,
+			});
+			const player = await hydratePlayer(props);
+			try {
+				await act(async () => {
+					await vi.waitFor(() =>
+						expect(videoRef.current?.getAttribute("src")).toBe(rawUrl),
+					);
+					if (!videoRef.current) throw new Error("Missing raw video");
+					setMediaState(videoRef.current, { readyState: 3 });
+					videoRef.current.dispatchEvent(new Event("loadeddata"));
+				});
+				expect(onUploadComplete).not.toHaveBeenCalled();
+				await act(async () => uploadState.notify?.(null));
+				await settleFetch(fetchImpl, 3);
+				expect(videoRef.current?.getAttribute("src")).toBe(rawUrl);
+				expect(loadingOverlay(player.container)?.className).toContain(
+					"opacity-0",
+				);
+				expect(
+					player.container.querySelector(
+						'[data-slot="media-player-play-button"]',
+					),
+				).not.toBeNull();
+				expect(onUploadComplete).toHaveBeenCalledOnce();
+				await act(async () => {
+					publish?.(response(publishedUrl, 206, true));
+					await waitForQueryNotification();
+				});
+				await act(async () => {
+					await vi.waitFor(() =>
+						expect(videoRef.current?.getAttribute("src")).toBe(publishedUrl),
+					);
+				});
+				expect(player.container.textContent).not.toContain("Optimizing video");
+				expect(retryVideoProcessing).not.toHaveBeenCalled();
+				await act(async () =>
+					player.root?.render(
+						tree(player.client, {
+							...props,
+							hasActiveUpload: false,
+							serverPlaybackUrl: publishedUrl,
+							onUploadComplete: () => onUploadComplete(),
+						}),
+					),
+				);
+				await act(async () => {
+					await waitForQueryNotification();
+				});
+				expect(onUploadComplete).toHaveBeenCalledOnce();
+				expect(fetchImpl).toHaveBeenCalledTimes(3);
+				expect(player.recoverableErrors).toEqual([]);
+			} finally {
+				await act(async () => player.root?.unmount());
+				player.client.clear();
+			}
+		},
+	);
 
 	it("recovers through the playlist route when the media failed before hydration", async () => {
 		const freshUrl = "https://v.cap.so/owner/video/result.mp4?Signature=fresh";

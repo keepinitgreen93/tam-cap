@@ -737,32 +737,49 @@ export function CapVideoPlayer({
 	const prevUploadProgress =
 		useRef<typeof uploadProgressRaw>(uploadProgressRaw);
 	useEffect(() => {
+		const previous = prevUploadProgress.current;
+		prevUploadProgress.current = uploadProgressRaw;
 		if (
-			shouldReloadPlaybackAfterUploadCompletes(
-				prevUploadProgress.current,
-				uploadProgressRaw,
-			)
+			shouldReloadPlaybackAfterUploadCompletes(previous, uploadProgressRaw, {
+				includeFetching: trackUploadProgress,
+			})
 		) {
-			setVideoLoaded(false);
 			setHasError(false);
-			void queryClient.invalidateQueries({
-				queryKey: [
-					"resolvedSrc",
-					videoSrc,
-					rawFallbackSrc,
-					enableCrossOrigin,
-					preferredSource,
-				],
-			});
+			setHasTriedRawFallback(false);
+			initialPlaybackUrlUsed.current = initialPlaybackUrl;
+			const publishedSourceKey = [
+				"resolvedSrc",
+				videoSrc,
+				rawFallbackSrc,
+				enableCrossOrigin,
+				"mp4",
+			];
+			if (resolvedSrc.data)
+				queryClient.setQueryData(publishedSourceKey, resolvedSrc.data);
+			setPreferredSource("mp4");
+			void queryClient
+				.fetchQuery({
+					queryKey: publishedSourceKey,
+					queryFn: () =>
+						resolvePlaybackSource({
+							videoSrc,
+							rawFallbackSrc,
+							enableCrossOrigin,
+							preferredSource: "mp4",
+						}),
+					staleTime: 0,
+				})
+				.catch(() => undefined);
 			onUploadComplete?.();
 		}
-		prevUploadProgress.current = uploadProgressRaw;
 	}, [
 		enableCrossOrigin,
+		initialPlaybackUrl,
 		onUploadComplete,
-		preferredSource,
 		queryClient,
 		rawFallbackSrc,
+		resolvedSrc.data,
+		trackUploadProgress,
 		uploadProgressRaw,
 		videoSrc,
 	]);

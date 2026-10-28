@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import type { Video } from "@cap/web-domain";
+import { Effect, Option } from "effect";
 import { act, createElement, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
@@ -8,9 +9,18 @@ import type { UploadProgress } from "@/app/s/[videoId]/_components/upload-progre
 
 const mocks = vi.hoisted(() => ({
 	progress: null as (() => UploadProgress | null) | null,
+	actualHook: undefined as (() => UploadProgress | null) | undefined,
+	queryData: null as Record<string, unknown> | null,
 }));
 vi.mock("@/app/s/[videoId]/_components/ProgressCircle", () => ({
-	useUploadProgress: () => mocks.progress?.() ?? null,
+	useUploadProgress: () =>
+		mocks.actualHook ? mocks.actualHook() : (mocks.progress?.() ?? null),
+}));
+vi.mock("@/lib/EffectRuntime", () => ({
+	useRpcClient: () => ({
+		GetUploadProgress: () => Effect.succeed(Option.none()),
+	}),
+	useEffectQuery: () => ({ isPending: false, data: mocks.queryData }),
 }));
 
 import UploadProgressTracker from "@/app/s/[videoId]/_components/UploadProgressTracker";
@@ -55,11 +65,41 @@ const uploading = (progress: number): (() => UploadProgress) => {
 };
 
 beforeEach(() => {
+	mocks.actualHook = undefined;
+	mocks.queryData = null;
 	vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
 	container = document.createElement("div");
 	document.body.append(container);
 	root = createRoot(container);
 	received = [];
+});
+
+test("the real hook forwards a completed receipt as terminal once while genuine thumbnail work remains active", async () => {
+	const { useUploadProgress } = await vi.importActual<
+		typeof import("@/app/s/[videoId]/_components/ProgressCircle")
+	>("@/app/s/[videoId]/_components/ProgressCircle");
+	mocks.actualHook = () => useUploadProgress(videoId, true);
+	mocks.queryData = {
+		phase: "generating_thumbnail",
+		processingProgress: 100,
+		updatedAt: new Date(),
+		uploaded: 100,
+		total: 100,
+		automaticRetry: false,
+		hasRawFallback: true,
+		processingError: Option.none(),
+		processingMessage: Option.none(),
+	};
+	await act(async () => root.render(createElement(Host)));
+	expect(received.at(-1)).toMatchObject({
+		status: "generating_thumbnail",
+		progress: 100,
+	});
+	mocks.queryData = { ...mocks.queryData, phase: "complete" };
+	await act(async () => rerenderHost());
+	expect(received.at(-1)).toBeNull();
+	for (let i = 0; i < 3; i++) await act(async () => rerenderHost());
+	expect(received).toHaveLength(2);
 });
 
 afterEach(() => {

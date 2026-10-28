@@ -2,9 +2,10 @@ import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, resolve, sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { projectSnapshot } from "./snapshot-import.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const account = "c1e96a4b36c73f3cf4ddf50a90082d94";
@@ -69,11 +70,12 @@ export function assertSampleTarget(key, prefix, createdKeys) {
 	)
 		throw Error("Restore sample cleanup boundary rejected");
 }
-function snapshot(sql) {
+function snapshot(sql, enforceForeignKeys = false) {
 	const database = new DatabaseSync(":memory:", {
-		enableForeignKeyConstraints: false,
+		enableForeignKeyConstraints: enforceForeignKeys,
 	});
 	try {
+		if (enforceForeignKeys) database.exec("BEGIN");
 		database.exec(sql);
 		const schema = database.prepare(schemaSql).all();
 		const tables = schema
@@ -92,6 +94,7 @@ function snapshot(sql) {
 			foreignKeys.length
 		)
 			throw Error("Snapshot integrity failed");
+		if (enforceForeignKeys) database.exec("COMMIT");
 		return { schema, tables, rows };
 	} finally {
 		database.close();
@@ -172,16 +175,67 @@ async function api(
 	if (!value.success) throw Error("Cloudflare API operation rejected");
 	return value.result;
 }
-async function poll(operation) {
+export function snapshotFailureDiagnostic(value) {
+	const detail = JSON.stringify({
+		error: value?.error,
+		errors: value?.errors,
+		messages: value?.messages,
+	});
+	const categories = [
+		["durable_object_reset", /D1_RESET_DO/],
+		["missing_table", /no such table/i],
+		["missing_column", /no such column/i],
+		["foreign_key_constraint", /foreign.?key/i],
+		["unique_constraint", /unique constraint/i],
+		["check_constraint", /check constraint/i],
+		["not_null_constraint", /not null/i],
+		["schema_already_exists", /already exists/i],
+		["sql_syntax", /syntax/i],
+		["statement_size", /too (?:large|long)|SQLITE_TOOBIG|statement.*limit/i],
+		["transaction", /transaction/i],
+		["bookmark", /bookmark/i],
+		["busy", /busy|locked/i],
+	];
+	return {
+		category:
+			categories.find(([, pattern]) => pattern.test(detail))?.[0] ??
+			"unclassified",
+		status:
+			typeof value?.status === "string" && /^[a-z_]+$/.test(value.status)
+				? value.status
+				: "missing",
+		success: value?.success === true,
+		hasBookmark: Boolean(value?.at_bookmark),
+		detailSha256: createHash("sha256").update(detail).digest("hex"),
+	};
+}
+export async function pollSnapshot(
+	operation,
+	onProgress = async () => {},
+	delayMs = 1000,
+) {
 	let value = await operation();
-	for (let attempt = 0; value.status !== "complete"; attempt++) {
-		if (value.status === "error" || attempt >= 120 || !value.at_bookmark)
-			throw Error("D1 snapshot operation did not complete");
-		await new Promise((resolvePromise) => setTimeout(resolvePromise, 1000));
+	for (let attempt = 0; ; attempt++) {
+		await onProgress(value);
+		if (value.status === "complete" && value.success !== false) return value;
+		if (
+			value.status === "error" ||
+			value.success === false ||
+			attempt >= 120 ||
+			!value.at_bookmark
+		) {
+			const diagnostic = snapshotFailureDiagnostic(value);
+			const error = new Error(
+				`D1 snapshot operation failed (${diagnostic.category})`,
+			);
+			error.diagnostic = diagnostic;
+			throw error;
+		}
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs));
 		value = await operation(value.at_bookmark);
 	}
-	return value;
 }
+
 function signedUrl(value) {
 	const url = new URL(value);
 	if (
@@ -255,7 +309,7 @@ export function sampleKeys(video) {
 	return { raw, derived };
 }
 
-export async function runDrill(sampleVideo, snapshotPath) {
+export async function runDrill(sampleVideo, snapshotPath, resumeReceiptPath) {
 	if (process.platform !== "win32")
 		throw Error("This protected snapshot drill requires Windows DPAPI");
 	if (!/^[a-z0-9]{15}$/.test(sampleVideo))
@@ -288,7 +342,7 @@ export async function runDrill(sampleVideo, snapshotPath) {
 		if (snapshotPath) {
 			sql = await protectSnapshot("Unprotect", resolve(snapshotPath));
 		} else {
-			const exported = await poll((bookmark) =>
+			const exported = await pollSnapshot((bookmark) =>
 				api(token, `/d1/database/${sourceDatabase}/export`, {
 					output_format: "polling",
 					...(bookmark ? { current_bookmark: bookmark } : {}),
@@ -304,35 +358,72 @@ export async function runDrill(sampleVideo, snapshotPath) {
 		report.snapshotProtected = true;
 		report.snapshotSha256 = createHash("sha256").update(sql).digest("hex");
 		const expected = snapshot(recovered);
+		const projection = projectSnapshot(sql);
+		sql = projection.sql;
+		const normalized = snapshot(sql, true);
+		if (
+			schemaDigest(expected.schema) !== schemaDigest(normalized.schema) ||
+			expected.tables.some(
+				(name) =>
+					rowDigest(expected.rows.get(name)) !==
+					rowDigest(normalized.rows.get(name)),
+			)
+		)
+			throw Error("Snapshot import normalization changed schema or rows");
+		report.importNormalization =
+			"sqlite-schema-parent-first-data-triggers-last";
+		report.importTransport = "D1-query-with-foreign-keys-enabled";
+		report.importSqlSha256 = createHash("sha256").update(sql).digest("hex");
 		const name = `tam-cap-restore-drill-${id.replaceAll("-", "")}`;
 		report.plannedRestoreName = name;
 		await writeFile(reportPath, JSON.stringify(report, null, 2));
-		const database = await api(token, "/d1/database", { name });
-		created = { id: database.uuid, name };
+		if (resumeReceiptPath) {
+			const receiptPath = resolve(resumeReceiptPath);
+			const privateBackups = join(root, ".secrets/backups") + sep;
+			if (
+				!receiptPath.startsWith(privateBackups) ||
+				(!receiptPath.endsWith("/report.json") &&
+					!receiptPath.endsWith("\\report.json"))
+			)
+				throw Error("Resume receipt must stay inside private backup storage");
+			const previous = JSON.parse(await readFile(receiptPath, "utf8"));
+			created = previous.restoreDatabase;
+			if (
+				previous.sourceDatabase !== sourceDatabase ||
+				previous.snapshotSha256 !== report.snapshotSha256 ||
+				created?.name !==
+					`tam-cap-restore-drill-${previous.id?.replaceAll("-", "")}`
+			)
+				throw Error("Resume receipt identity or snapshot mismatch");
+			const current = await api(token, `/d1/database/${created.id}`);
+			assertRestoreTarget(current.uuid, current.name, created);
+			const [objects] = await api(token, `/d1/database/${created.id}/query`, {
+				sql: "SELECT count(*) AS n FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+			});
+			if (objects.results?.[0]?.n !== 0)
+				throw Error("Resume target is not empty");
+			report.resumedReceipt = receiptPath;
+		} else {
+			const database = await api(token, "/d1/database", { name });
+			created = { id: database.uuid, name };
+		}
 		assertRestoreTarget(created.id, created.name, created);
 		report.restoreDatabase = created;
 		await writeFile(reportPath, JSON.stringify(report, null, 2));
-		const etag = createHash("md5").update(sql).digest("hex");
-		const initialized = await api(token, `/d1/database/${created.id}/import`, {
-			action: "init",
-			etag,
-		});
-		if (initialized.upload_url) {
-			const upload = await transfer(signedUrl(initialized.upload_url), {
-				method: "PUT",
-				body: sql,
-			});
-			await upload.body?.cancel();
-		}
-		await poll((bookmark) =>
-			api(
-				token,
-				`/d1/database/${created.id}/import`,
-				bookmark
-					? { action: "poll", current_bookmark: bookmark }
-					: { action: "ingest", etag, filename: initialized.filename },
-			),
+		const [foreignKeyMode] = await api(
+			token,
+			`/d1/database/${created.id}/query`,
+			{ sql: "PRAGMA foreign_keys" },
 		);
+		if (foreignKeyMode.results?.[0]?.foreign_keys !== 1)
+			throw Error("Restore target must enforce foreign keys");
+		for (const statement of projection.statements) {
+			const results = await api(token, `/d1/database/${created.id}/query`, {
+				sql: statement,
+			});
+			if (!Array.isArray(results) || results.some((result) => !result.success))
+				throw Error("Snapshot statement replay failed");
+		}
 		sql = "";
 		const query = async (command) => {
 			const results = await api(token, `/d1/database/${created.id}/query`, {
@@ -454,6 +545,7 @@ export async function runDrill(sampleVideo, snapshotPath) {
 			error instanceof Error && !error.message.includes("http")
 				? error.message
 				: "Restore drill failed";
+		if (error?.diagnostic) report.snapshotOperationFailure = error.diagnostic;
 		report.retainedDatabase = created ?? null;
 		report.retainedSampleKeys = [...createdKeys];
 		await writeFile(reportPath, JSON.stringify(report, null, 2));
@@ -473,6 +565,7 @@ if (
 				await runDrill(
 					process.argv[2],
 					process.argv[3] === "--snapshot" ? process.argv[4] : undefined,
+					process.argv[5] === "--resume-receipt" ? process.argv[6] : undefined,
 				),
 				null,
 				2,

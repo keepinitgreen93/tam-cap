@@ -4,6 +4,7 @@ import {
 	parseCloudflareTranscription,
 	transcribeWithCloudflare,
 } from "../../lib/cloudflare-transcription";
+import { cloudflareWhisperLongFixture } from "../fixtures/cloudflare-whisper-long-response";
 import { cloudflareWhisperResponse } from "../fixtures/cloudflare-whisper-response";
 
 const credentials = {
@@ -32,6 +33,26 @@ function response(
 }
 
 describe("Cloudflare Whisper transcription", () => {
+	it("preserves every spoken reference token from the real 200-second VAD regression", () => {
+		const { response, sourceDurationMs, expectedNormalizedTokens } =
+			cloudflareWhisperLongFixture;
+		const transcript = parseCloudflareTranscription(response, sourceDurationMs);
+		expect(transcript.status).toBe("completed");
+		expect(transcript.words).toHaveLength(409);
+		const tokens = transcript.words.flatMap(
+			(word) => word.text.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [],
+		);
+		expect(tokens).toEqual(expectedNormalizedTokens);
+		expect(tokens).toHaveLength(410);
+		expect(
+			transcript.words.every(
+				(word) =>
+					word.end > word.start &&
+					word.start >= 0 &&
+					word.end <= sourceDurationMs,
+			),
+		).toBe(true);
+	});
 	it("preserves the live synthetic fixture's fillers and exact provider word boundaries", () => {
 		const transcript = parseCloudflareTranscription(
 			cloudflareWhisperResponse,
@@ -190,7 +211,7 @@ describe("Cloudflare Whisper transcription", () => {
 			expect(await request.json()).toEqual({
 				audio: "AQID",
 				task: "transcribe",
-				vad_filter: false,
+				vad_filter: true,
 				...(language === "auto" ? {} : { language }),
 			});
 		},

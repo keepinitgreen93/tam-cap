@@ -61,4 +61,10 @@ The web process already peaked above 1 GiB in these tests, so the 1 GiB basic in
 
 One media job runs at a time; containers scale to zero. Private storage and immutable job outputs prevent retries from overwriting source material. Avoid frequent external uptime checks against application pages, which wake the web container. Keep old originals until edited exports and backups are verified.
 
-Review actual container running hours/CPU, R2 retained bytes/operations, AI minutes/tokens, D1 reads/writes/storage and Resend sends before importing the Loom library. If combined runtime approaches150 hours/month, assess reducing idle wakeups or container size using measured memory rather than assuming the $20 target still holds. No automatic billing emails or paid-plan upgrades were enabled by this document.
+Review actual container running hours/CPU, R2 retained bytes/operations, AI minutes/tokens, D1 reads/writes/storage and Resend sends before importing the Loom library. If combined runtime approaches150 hours/month, assess reducing idle wakeups or container size using measured memory rather than assuming the $20 target still holds.
+
+### Existing native budget notification
+
+Read-only Cloudflare checks on2026-10-28 confirmed the account's existing **Default budget alert (auto-created)** is enabled with a **$10 account-wide usage-charge threshold**. Policy `5c7966bdba544c469d04f7dc98b88123` was created before this Cap setup and has one configured email destination. The existing policy and recipient were retained unchanged; the Cap owner mailbox is not a recipient. No new notification policy, verification message or test email was created, and delivery was not tested.
+
+This is a shared-account control: other applications contribute to the threshold. It is not a Cap-specific $20 limit and does not pause or cap usage. Cloudflare's [budget-alert documentation](https://developers.cloudflare.com/billing/manage/budget-alerts/) defines its account-wide scope and informational behavior. Review or change the existing policy in the [account Notifications dashboard](https://dash.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/notifications), or under Manage Account > Billing > Billable Usage > Budget alerts. No paid-plan upgrade was made.

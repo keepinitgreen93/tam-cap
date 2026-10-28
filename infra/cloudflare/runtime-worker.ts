@@ -8,10 +8,13 @@ import { downloadArtifact } from "./downloads";
 import { runMaintenance } from "./maintenance";
 import { applicationHeaders } from "./request-headers";
 import {
+	configurationUpdatingResponse,
 	WEB_CONFIGURATION_HEADER,
+	WEB_VERSION_HEADER,
 	webConfigurationFingerprint,
 	webConfigurationRequest,
 	webEnvironment,
+	workerVersionTimestamp,
 } from "./runtime-env";
 
 export { ContainerProxy } from "@cloudflare/containers";
@@ -32,6 +35,7 @@ interface RuntimeBindings {
 	WORKFLOW_QUEUE: Queue<unknown>;
 	CAP_PREVIEW_KEY?: string;
 	CAP_WEB_IMAGE_REVISION?: string;
+	CF_VERSION_METADATA?: WorkerVersionMetadata;
 }
 
 function hasPreviewAccess(request: Request, configuredKey: string | undefined) {
@@ -83,52 +87,107 @@ export class CapWeb extends CapContainer {
 		this.env.MEDIA_SERVER_WEBHOOK_SECRET,
 	);
 	private readonly configurationReady: Promise<string>;
+	private appliedFingerprint?: string;
+	private reconciling?: Promise<string>;
+	private versionFloor?: bigint;
+	private resetting = false;
 
 	constructor(
 		ctx: ConstructorParameters<typeof Container<RuntimeBindings>>[0],
-		env: RuntimeBindings & { CAP_WEB_IMAGE_REVISION?: string },
+		env: RuntimeBindings,
 	) {
 		super(ctx, env);
-		this.configurationReady = ctx.blockConcurrencyWhile(async () => {
-			const fingerprint = await webConfigurationFingerprint(env);
+		this.versionFloor = workerVersionTimestamp(
+			env.CF_VERSION_METADATA?.timestamp,
+		);
+		this.configurationReady = this.reconcileConfiguration();
+	}
+
+	private async reconcileConfiguration() {
+		this.reconciling ??= this.ctx.blockConcurrencyWhile(async () => {
+			const envVars = webEnvironment(
+				this.env.CAP_WEB_ENV,
+				this.env.MEDIA_SERVER_WEBHOOK_SECRET,
+			);
+			const fingerprint = await webConfigurationFingerprint(this.env);
 			const key = "cap.runtime.web-config";
-			if ((await ctx.storage.get<string>(key)) === fingerprint)
-				return fingerprint;
-			const container = ctx.container;
-			if (container?.running) {
-				await this.stop();
-				const deadline = Date.now() + 20_000;
-				while (container.running) {
-					if (Date.now() >= deadline)
-						throw new Error(
-							"Web container did not stop for configuration refresh",
-						);
-					await new Promise((resolve) => setTimeout(resolve, 100));
+			if ((await this.ctx.storage.get<string>(key)) !== fingerprint) {
+				const container = this.ctx.container;
+				if (container?.running) {
+					await this.stop();
+					const deadline = Date.now() + 20_000;
+					while (container.running) {
+						if (Date.now() >= deadline)
+							throw new Error(
+								"Web container did not stop for configuration refresh",
+							);
+						await new Promise((resolve) => setTimeout(resolve, 100));
+					}
 				}
+				await this.ctx.storage.put(key, fingerprint);
 			}
-			await ctx.storage.put(key, fingerprint);
+			this.envVars = envVars;
+			this.appliedFingerprint = fingerprint;
 			return fingerprint;
 		});
+		const pending = this.reconciling;
+		try {
+			return await pending;
+		} finally {
+			if (this.reconciling === pending) this.reconciling = undefined;
+		}
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		const fingerprint = await this.configurationReady;
-		if (request.headers.get(WEB_CONFIGURATION_HEADER) !== fingerprint) {
-			return new Response("Application configuration is updating", {
-				status: 503,
-				headers: { "Cache-Control": "no-store", "Retry-After": "1" },
-			});
+		await this.configurationReady;
+		const expected = request.headers.get(WEB_CONFIGURATION_HEADER);
+		const fingerprint = await webConfigurationFingerprint(this.env);
+		const requestVersion = workerVersionTimestamp(
+			request.headers.get(WEB_VERSION_HEADER),
+		);
+		if (
+			expected &&
+			expected === fingerprint &&
+			fingerprint !== this.appliedFingerprint
+		) {
+			await this.reconcileConfiguration();
 		}
+		if (
+			!expected ||
+			expected !== fingerprint ||
+			expected !== this.appliedFingerprint ||
+			requestVersion === undefined ||
+			this.versionFloor === undefined
+		) {
+			if (
+				expected &&
+				/^[a-f0-9]{64}$/.test(expected) &&
+				expected !== fingerprint &&
+				requestVersion !== undefined &&
+				this.versionFloor !== undefined &&
+				requestVersion > this.versionFloor &&
+				!this.resetting
+			) {
+				this.resetting = true;
+				this.ctx.abort("Newer Worker configuration requires web actor refresh");
+			}
+			return configurationUpdatingResponse();
+		}
+		if (requestVersion > this.versionFloor) this.versionFloor = requestVersion;
 		const headers = new Headers(request.headers);
 		headers.delete(WEB_CONFIGURATION_HEADER);
+		headers.delete(WEB_VERSION_HEADER);
 		return super.fetch(new Request(request, { headers }));
 	}
 }
 
 async function fetchWeb(request: Request, env: RuntimeBindings) {
-	return getContainer(env.CAP_WEB, "primary").fetch(
-		await webConfigurationRequest(request, env),
-	);
+	const forwarded = await webConfigurationRequest(request, env);
+	try {
+		return await getContainer(env.CAP_WEB, "primary").fetch(forwarded);
+	} catch {
+		return configurationUpdatingResponse();
+	}
 }
 
 async function workflowRpc(
@@ -233,6 +292,8 @@ export default {
 		if (!isPreview) return response;
 		const previewResponse = new Response(response.body, response);
 		previewResponse.headers.set("Cache-Control", "private, no-store");
+		if (env.CF_VERSION_METADATA?.id)
+			previewResponse.headers.set("X-Cap-Worker-Version", env.CF_VERSION_METADATA.id);
 		return previewResponse;
 	},
 	async scheduled(event: ScheduledController, env: RuntimeBindings) {

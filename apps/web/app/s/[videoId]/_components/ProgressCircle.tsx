@@ -62,13 +62,7 @@ export function useUploadProgress(
 		automaticRetry: query.data.automaticRetry,
 	});
 
-	if (phase === "complete") {
-		return {
-			status: "generating_thumbnail",
-			lastUpdated,
-			progress: 100,
-		};
-	}
+	if (phase === "complete") return null;
 
 	if (phase === "error") {
 		return {
