@@ -699,13 +699,15 @@ export function CapVideoPlayer({
 		isUploadFailed ||
 		(isUploadError && (blockPlaybackDuringProcessing || !videoLoaded));
 	const canRetryUploadProcessing = canRetryFailedProcessing(
-		uploadProgress,
+		uploadProgressRaw,
 		canRetryProcessing,
 	);
 	const uploadFailureMessage = getUploadFailureMessage(
-		uploadProgress,
+		uploadProgressRaw,
 		canRetryProcessing,
 	);
+	const showProcessingRecovery =
+		videoLoaded && !blockPlaybackDuringProcessing && canRetryUploadProcessing;
 
 	const retryProcessing = useCallback(async () => {
 		if (!canRetryUploadProcessing || isRetryingProcessing) {
@@ -880,6 +882,19 @@ export function CapVideoPlayer({
 						{rawPlaybackBadgeDescription}
 					</TooltipContent>
 				</Tooltip>
+			)}
+			{showProcessingRecovery && (
+				<div className="absolute top-3 right-3 z-20">
+					<button
+						type="button"
+						onClick={retryProcessing}
+						disabled={isRetryingProcessing}
+						title={uploadFailureMessage}
+						className="rounded-full bg-blue-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
+					>
+						{isRetryingProcessing ? "Retrying..." : "Retry Processing"}
+					</button>
+				</div>
 			)}
 			<VideoPreviewGif
 				videoId={videoId}

@@ -1,6 +1,6 @@
 # TAM Cap operating costs
 
-Checked 2026-10-27. Target: roughly $20/month. This is a usage estimate, not a spending cap. Cloudflare allowances are shared with other applications in the account. Resend uses the existing account.
+Checked 2026-10-28. Target: roughly $20/month. This is a usage estimate, not a spending cap. Cloudflare allowances are shared with other applications in the account. Resend uses the existing account.
 
 ## Runtime envelope
 
@@ -31,7 +31,31 @@ Add the account's $5 Workers plan and other meters. Keeping both containers awak
 - Distributed clients total about249 MB: Windows133,799,920 bytes; Apple Silicon Mac114,574,144 bytes; Chrome502,935 bytes. Download checksums are in distribution/checksums.txt.
 - A real guest session produced a persisted analytics event in the separate D1 analytics database.
 
-These measurements establish functional test sizes, not monthly team demand or an invoice. Container CPU seconds and running time must be checked in Cloudflare's account usage dashboard after representative team use. Do not infer a paid-usage total from successful requests or a storage sample.
+These functional measurements do not establish monthly team demand.
+
+### Actual container usage
+
+Read-only Cloudflare GraphQL queries covered **2026-10-21 00:00 UTC through 2026-10-28 00:40 UTC**, filtered exclusively to CapWeb and CapMedia. Returned usage falls on October 27 and 28. The [billing-usage dataset](https://developers.cloudflare.com/analytics/graphql-api/tutorials/querying-container-metrics/) includes the micro-VM overhead; workload metrics are separate. The connected Cloudflare account supplied analytics access without another key. GraphQL needs the application IDs in dashed UUID format; the undashed IDs returned empty arrays rather than a permission error.
+
+| Service | Billable CPU seconds | Running-hour equivalent at 4 GiB | Peak workload RAM |
+| --- | ---: | ---: | ---: |
+| CapWeb | 537.27 | 2.561 | 1.097 GiB |
+| CapMedia | 74.80 | 0.515 | 0.391 GiB |
+| Combined | 612.07 | 3.076 | — |
+
+Allocated RAM totals **44,295.85 GiB-seconds** and allocated disk **88,591.70 GB-seconds**. Before included allowances, those meters correspond to about **$0.129** in container CPU/RAM/disk usage. They fit within the stated monthly container allowances if those allowances remain available; other account applications may consume them. This is a metered usage estimate, not a posted invoice or a claim of zero account cost. Cap-only aggregates and calculations are saved in [the usage evidence](evidence/2026-10-28-cap-container-usage.json).
+
+The observed CPU ratio is 198.98 CPU seconds per combined running hour. Holding that ratio and the current instance sizes constant gives this conditional forecast:
+
+| Combined running hours/month | RAM overage | CPU overage at observed ratio | Disk overage | Container subtotal |
+| --- | ---: | ---: | ---: | ---: |
+| 50 | $1.58 | $0.00 | $0.05 | $1.63 |
+| 150 | $5.18 | $0.15 | $0.25 | $5.57 |
+| 720 | $25.70 | $2.42 | $1.40 | $29.51 |
+
+These are demand scenarios, not a projection of the seven-day query window. The small synthetic acceptance workload includes setup, idle time and retries; longer or higher-resolution media can change CPU demand. The first table remains the saturated-CPU upper scenario. For illustration, 150 combined running hours plus 100 audio hours and 100 GB of retained R2 data comes to about **$15.00** including the $5 plan, these container overages, Whisper and storage, before Workers/DO/queue requests, text AI, storage operations, container egress, shared-allowance contention or email charges. The roughly $20 target remains conditional. Keeping even one 4 GiB container awake continuously would exceed it on RAM and base-plan charges alone.
+
+The web process already peaked above 1 GiB in these tests, so the 1 GiB basic instance is not established as a safe replacement. The media sample also does not establish memory needs for long/high-resolution jobs. No instance settings changed. AI inference totals cannot be attributed to Cap from application-filtered container metrics; no account-wide invoice or other customer financial data was queried.
 
 ## Controls and review
 

@@ -57,6 +57,7 @@ vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 vi.mock("@/lib/server", () => ({ runPromise: vi.fn() }));
 
 import { createOrganization } from "@/components/forms/server";
+import { getCloudflareComputeDenial } from "@/lib/cloudflare-compute-access";
 import { ensureRecordingOrganization } from "@/lib/desktop-recording-organization";
 
 let fixture: Awaited<ReturnType<typeof createTestDatabase>>;
@@ -81,16 +82,14 @@ describe("viewer-only accounts and workspace capabilities", () => {
 		videoId = nanoId() as typeof videos.$inferInsert.id;
 		grantId = nanoId();
 		const email = `${nanoId()}@example.com`;
-		await fixture.database
-			.insert(videos)
-			.values({
-				id: videoId,
-				ownerId: owner.id,
-				orgId: owner.activeOrganizationId,
-				name: "Private",
-				public: false,
-				source: { type: "webMP4" },
-			});
+		await fixture.database.insert(videos).values({
+			id: videoId,
+			ownerId: owner.id,
+			orgId: owner.activeOrganizationId,
+			name: "Private",
+			public: false,
+			source: { type: "webMP4" },
+		});
 		await fixture.database
 			.insert(videoViewerGrants)
 			.values({ id: grantId, videoId, email, invitedByUserId: owner.id });
@@ -156,6 +155,28 @@ describe("viewer-only accounts and workspace capabilities", () => {
 		).toHaveLength(0);
 		expect(state.upload).not.toHaveBeenCalled();
 	});
+	it("gates paid compute on the live workspace roster rather than a viewer session", async () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		const request = new Request("https://cap.example/api/tools/loom-download", {
+			headers: { "sec-fetch-site": "same-origin" },
+		});
+		try {
+			expect((await getCloudflareComputeDenial(request))?.status).toBe(403);
+			await provisionCloudflareInvitee(fixture.database, {
+				organizationId: owner.activeOrganizationId,
+				email: guest.email,
+				invitedByUserId: owner.id,
+				role: "member",
+			});
+			expect(await getCloudflareComputeDenial(request)).toBeUndefined();
+			await fixture.database
+				.delete(organizationMembers)
+				.where(eq(organizationMembers.userId, guest.id));
+			expect((await getCloudflareComputeDenial(request))?.status).toBe(403);
+		} finally {
+			vi.unstubAllEnvs();
+		}
+	});
 	it("rejects revoked grants and grants to tombstoned or deleting resources", async () => {
 		await fixture.database
 			.update(videoViewerGrants)
@@ -180,16 +201,14 @@ describe("viewer-only accounts and workspace capabilities", () => {
 			.update(organizations)
 			.set({ tombstoneAt: null })
 			.where(eq(organizations.id, owner.activeOrganizationId));
-		await fixture.database
-			.insert(videoProcessingJobs)
-			.values({
-				videoId,
-				ownerId: owner.id,
-				generation: "deleting",
-				state: "source-blocked",
-				errorCode: "video-deleting",
-				nextRetryAt: new Date(),
-			});
+		await fixture.database.insert(videoProcessingJobs).values({
+			videoId,
+			ownerId: owner.id,
+			generation: "deleting",
+			state: "source-blocked",
+			errorCode: "video-deleting",
+			nextRetryAt: new Date(),
+		});
 		expect((await capability()).kind).toBe("none");
 	});
 	it("preserves explicit roster provisioning once the identity is verified", async () => {

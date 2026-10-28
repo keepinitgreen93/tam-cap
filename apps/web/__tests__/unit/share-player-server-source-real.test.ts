@@ -19,6 +19,7 @@ import {
 	it,
 	vi,
 } from "vitest";
+import { retryVideoProcessing } from "@/actions/video/retry-processing";
 import { CapVideoPlayer } from "@/app/s/[videoId]/_components/CapVideoPlayer";
 import type { UploadProgress } from "@/app/s/[videoId]/_components/upload-progress";
 import { getStalledProcessingMessage } from "@/app/s/[videoId]/_components/upload-progress";
@@ -333,6 +334,128 @@ describe("share MP4 source rendered on the server, with the real player", () => 
 					player.container.querySelectorAll("button"),
 				).find((button) => button.textContent === "Retry Processing");
 				expect(Boolean(retry)).toBe(isOwner);
+			} finally {
+				await act(async () => player.root?.unmount());
+				player.client.clear();
+			}
+		},
+	);
+	it.each([
+		{
+			isOwner: true,
+			ageMs: 30 * 60000,
+			automaticRetry: false,
+			showRetry: true,
+		},
+		{
+			isOwner: false,
+			ageMs: 30 * 60000,
+			automaticRetry: false,
+			showRetry: false,
+		},
+		{ isOwner: true, ageMs: 30000, automaticRetry: false, showRetry: false },
+		{
+			isOwner: true,
+			ageMs: 30 * 60000,
+			automaticRetry: true,
+			showRetry: false,
+		},
+	])(
+		"retains a nonblocking recovery action while raw fallback plays: %j",
+		async ({ isOwner, ageMs, automaticRetry, showRetry }) => {
+			const rawUrl = "https://media.example.test/owner/video/raw-upload.mp4";
+			vi.stubGlobal(
+				"fetch",
+				vi
+					.fn<typeof fetch>()
+					.mockResolvedValueOnce(response(SERVER_URL, 404))
+					.mockResolvedValueOnce(response(rawUrl, 206, true)),
+			);
+			vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+			const updatedAt = new Date(Date.now() - ageMs);
+			const errorMessage = getStalledProcessingMessage({
+				phase: "processing",
+				updatedAt,
+				processingProgress: 0,
+				automaticRetry,
+			});
+			uploadState.progress = errorMessage
+				? {
+						status: "error",
+						lastUpdated: updatedAt,
+						errorMessage,
+						hasRawFallback: true,
+					}
+				: {
+						status: "processing",
+						lastUpdated: updatedAt,
+						progress: 0,
+						message: "Processing video...",
+					};
+			const { props, videoRef } = playerProps({
+				initialPlaybackUrl: undefined,
+				serverPlaybackUrl: null,
+				rawFallbackSrc: "/api/playlist?videoType=raw-preview",
+				hasActiveUpload: true,
+				canRetryProcessing: isOwner,
+				showPlaybackStatusBadge: true,
+			});
+			const player = await hydratePlayer(props);
+			try {
+				await act(async () => {
+					await vi.waitFor(() =>
+						expect(videoRef.current?.getAttribute("src")).toBe(rawUrl),
+					);
+					const video = videoRef.current;
+					if (!video) throw new Error("Missing raw video");
+					setMediaState(video, { readyState: 3 });
+					Object.defineProperty(video, "duration", {
+						configurable: true,
+						get: () => 17.133,
+					});
+					video.dispatchEvent(new Event("loadedmetadata"));
+					video.dispatchEvent(new Event("loadeddata"));
+				});
+				expect(player.recoverableErrors).toEqual([]);
+				const retry = Array.from(
+					player.container.querySelectorAll("button"),
+				).find((button) => button.textContent === "Retry Processing");
+				expect(Boolean(retry)).toBe(showRetry);
+				expect(
+					player.container.querySelector(
+						'[data-slot="media-player-play-button"]',
+					),
+				).not.toBeNull();
+				expect(loadingOverlay(player.container)?.className).toContain(
+					"opacity-0",
+				);
+				if (showRetry) {
+					expect(player.container.textContent).toContain("Original upload");
+					const invalidate = vi.spyOn(player.client, "invalidateQueries");
+					let finishRetry:
+						| ((result: { success: boolean; status: "started" }) => void)
+						| undefined;
+					vi.mocked(retryVideoProcessing).mockImplementationOnce(
+						() =>
+							new Promise((resolve) => {
+								finishRetry = resolve;
+							}),
+					);
+					await act(async () => retry?.click());
+					expect(retryVideoProcessing).toHaveBeenCalledExactlyOnceWith({
+						videoId: props.videoId,
+					});
+					expect(retry?.disabled).toBe(true);
+					await act(async () => retry?.click());
+					expect(retryVideoProcessing).toHaveBeenCalledTimes(1);
+					expect(videoRef.current?.getAttribute("src")).toBe(rawUrl);
+					await act(async () =>
+						finishRetry?.({ success: true, status: "started" }),
+					);
+					expect(invalidate).toHaveBeenCalledWith({
+						queryKey: ["getUploadProgress", props.videoId],
+					});
+				} else expect(retryVideoProcessing).not.toHaveBeenCalled();
 			} finally {
 				await act(async () => player.root?.unmount());
 				player.client.clear();

@@ -7,7 +7,12 @@ import {
 import { downloadArtifact } from "./downloads";
 import { runMaintenance } from "./maintenance";
 import { applicationHeaders } from "./request-headers";
-import { webEnvironment } from "./runtime-env";
+import {
+	WEB_CONFIGURATION_HEADER,
+	webConfigurationFingerprint,
+	webConfigurationRequest,
+	webEnvironment,
+} from "./runtime-env";
 
 export { ContainerProxy } from "@cloudflare/containers";
 export { CapWorkflowStore } from "./workflow-store.mjs";
@@ -26,6 +31,7 @@ interface RuntimeBindings {
 	CAP_MAINTENANCE_ENABLED?: string;
 	WORKFLOW_QUEUE: Queue<unknown>;
 	CAP_PREVIEW_KEY?: string;
+	CAP_WEB_IMAGE_REVISION?: string;
 }
 
 function hasPreviewAccess(request: Request, configuredKey: string | undefined) {
@@ -76,7 +82,7 @@ export class CapWeb extends CapContainer {
 		this.env.CAP_WEB_ENV,
 		this.env.MEDIA_SERVER_WEBHOOK_SECRET,
 	);
-	private readonly configurationReady: Promise<void>;
+	private readonly configurationReady: Promise<string>;
 
 	constructor(
 		ctx: ConstructorParameters<typeof Container<RuntimeBindings>>[0],
@@ -84,23 +90,10 @@ export class CapWeb extends CapContainer {
 	) {
 		super(ctx, env);
 		this.configurationReady = ctx.blockConcurrencyWhile(async () => {
-			const serialized = JSON.stringify({
-				version: 2,
-				envVars: Object.entries(this.envVars).sort(([left], [right]) =>
-					left < right ? -1 : left > right ? 1 : 0,
-				),
-				imageRevision: env.CAP_WEB_IMAGE_REVISION ?? "",
-				deploymentId: env.CAP_DEPLOYMENT_ID,
-			});
-			const digest = await crypto.subtle.digest(
-				"SHA-256",
-				new TextEncoder().encode(serialized),
-			);
-			const fingerprint = Array.from(new Uint8Array(digest), (value) =>
-				value.toString(16).padStart(2, "0"),
-			).join("");
+			const fingerprint = await webConfigurationFingerprint(env);
 			const key = "cap.runtime.web-config";
-			if ((await ctx.storage.get<string>(key)) === fingerprint) return;
+			if ((await ctx.storage.get<string>(key)) === fingerprint)
+				return fingerprint;
 			const container = ctx.container;
 			if (container?.running) {
 				await this.stop();
@@ -114,13 +107,28 @@ export class CapWeb extends CapContainer {
 				}
 			}
 			await ctx.storage.put(key, fingerprint);
+			return fingerprint;
 		});
 	}
 
 	async fetch(request: Request): Promise<Response> {
-		await this.configurationReady;
-		return super.fetch(request);
+		const fingerprint = await this.configurationReady;
+		if (request.headers.get(WEB_CONFIGURATION_HEADER) !== fingerprint) {
+			return new Response("Application configuration is updating", {
+				status: 503,
+				headers: { "Cache-Control": "no-store", "Retry-After": "1" },
+			});
+		}
+		const headers = new Headers(request.headers);
+		headers.delete(WEB_CONFIGURATION_HEADER);
+		return super.fetch(new Request(request, { headers }));
 	}
+}
+
+async function fetchWeb(request: Request, env: RuntimeBindings) {
+	return getContainer(env.CAP_WEB, "primary").fetch(
+		await webConfigurationRequest(request, env),
+	);
 }
 
 async function workflowRpc(
@@ -189,8 +197,7 @@ CapWeb.outboundByHost = {
 };
 
 CapMedia.outboundByHost = {
-	"cap.web": (request, env: RuntimeBindings) =>
-		getContainer(env.CAP_WEB, "primary").fetch(request),
+	"cap.web": (request, env: RuntimeBindings) => fetchWeb(request, env),
 };
 
 export default {
@@ -222,9 +229,7 @@ export default {
 		const headers = applicationHeaders(request, request.cf);
 		if (path.startsWith("/downloads/"))
 			return downloadArtifact(request, path, env.DOWNLOADS, isPreview);
-		const response = await getContainer(env.CAP_WEB, "primary").fetch(
-			new Request(request, { headers }),
-		);
+		const response = await fetchWeb(new Request(request, { headers }), env);
 		if (!isPreview) return response;
 		const previewResponse = new Response(response.body, response);
 		previewResponse.headers.set("Cache-Control", "private, no-store");
@@ -254,7 +259,7 @@ export default {
 					await runMaintenance(
 						maintenance.scheduledTime,
 						env.CAP_WEB_ENV,
-						(request) => getContainer(env.CAP_WEB, "primary").fetch(request),
+						(request) => fetchWeb(request, env),
 					);
 					message.ack();
 					continue;
@@ -270,7 +275,7 @@ export default {
 				const kind = envelope.queueName.includes("_wkf_step_")
 					? "step"
 					: "flow";
-				const response = await getContainer(env.CAP_WEB, "primary").fetch(
+				const response = await fetchWeb(
 					new Request(`http://cap.web/.well-known/workflow/v1/${kind}`, {
 						method: "POST",
 						headers: { "Content-Type": "application/json" },
@@ -278,6 +283,7 @@ export default {
 							encode({ ...envelope, attempt: message.attempts }),
 						),
 					}),
+					env,
 				);
 				if (!response.ok) {
 					message.retry({ delaySeconds: 30 });

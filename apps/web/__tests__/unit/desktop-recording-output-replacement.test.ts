@@ -96,6 +96,10 @@ import {
 	decodeDesktopReuploadToken,
 } from "@/lib/desktop-reupload-token";
 import { getEditSourceKey } from "@/lib/video-edit-processing";
+import {
+	applyVideoProcessingProgress,
+	claimVideoProcessing,
+} from "@/lib/video-processing-state";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import {
 	saveEditResultAndComplete,
@@ -107,6 +111,7 @@ let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
 let video: typeof Db.videos.$inferSelect;
 let sequence = 0;
 let loseResponse = false;
+let beforeBatch: (() => Promise<void>) | undefined;
 const rendered = { duration: 5, width: 320, height: 180, fps: 30 };
 const editSpec = {
 	version: 1 as const,
@@ -132,6 +137,11 @@ beforeAll(async () => {
 					operation: string;
 					statements?: { sql: string }[];
 				};
+				if (payload.operation === "batch" && beforeBatch) {
+					const hook = beforeBatch;
+					beforeBatch = undefined;
+					await hook();
+				}
 				const response = await handleD1BridgeRequest(request, runtime.binding);
 				if (
 					payload.operation === "batch" &&
@@ -155,6 +165,7 @@ afterEach(() => {
 	vi.unstubAllEnvs();
 });
 beforeEach(async () => {
+	beforeBatch = undefined;
 	vi.clearAllMocks();
 	const suffix = String(++sequence),
 		ownerId = User.UserId.make(`o${suffix}`),
@@ -239,6 +250,286 @@ beforeEach(async () => {
 		if (!row) throw Error("Missing fixture");
 		return row;
 	}
+});
+
+async function completedGenericReceipt(edited = false, originalInput = false) {
+	const baseKey = `${video.ownerId}/${video.id}/.recording/outputs/original/result.mp4`;
+	const renderedKey = edited
+		? `${video.ownerId}/${video.id}/.recording/outputs/edited/result.mp4`
+		: baseKey;
+	await change({
+		duration: edited ? 5 : 10,
+		source: { type: "webMP4", outputKey: renderedKey },
+		metadata: {
+			editingBase: {
+				version: 1,
+				id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+				sourceKey: baseKey,
+				duration: 10,
+			},
+		},
+	});
+	if (edited)
+		await runtime.database
+			.insert(Db.videoEdits)
+			.values({ videoId: video.id, sourceKey: baseKey, editSpec });
+	const rawKey =
+		edited || originalInput
+			? renderedKey
+			: `${video.ownerId}/${video.id}/raw-upload.webm`;
+	if (!rawKey) throw new Error("Missing raw key");
+	await runtime.database.insert(Db.videoUploads).values({
+		videoId: video.id,
+		rawFileKey: rawKey,
+		phase: "uploading",
+		mode: "singlepart",
+		uploaded: 1000,
+		total: 1000,
+	});
+	const claim = await claimVideoProcessing(runtime.database, {
+		videoId: video.id,
+		userId: video.ownerId,
+		rawFileKey: rawKey,
+		bucketId: null,
+		processingMessage: "Processing",
+	});
+	if (!claim.run) throw new Error("Missing generic processing run");
+	expect(
+		await applyVideoProcessingProgress(runtime.database, {
+			videoId: video.id,
+			token: claim.run.token,
+			attemptId: claim.run.attemptId,
+			phase: "complete",
+			progress: 100,
+			metadata: { duration: edited ? 5 : 10, width: 320, height: 180, fps: 30 },
+		}),
+	).toBe(true);
+	video = await current();
+	mocks.auth.mockResolvedValue({
+		id: video.ownerId,
+		email: "owner@replacement.test",
+		emailVerified: new Date(),
+		activeOrganizationId: video.orgId,
+	});
+	const [upload] = await runtime.database
+		.select()
+		.from(Db.videoUploads)
+		.where(eq(Db.videoUploads.videoId, video.id));
+	if (!upload || !video.metadata?.processingRun)
+		throw new Error("Missing completed receipt");
+	return {
+		upload,
+		run: video.metadata.processingRun,
+		rawKey,
+		baseKey: video.metadata.editingBase?.sourceKey ?? baseKey,
+	};
+}
+
+it("saves edits after a completed generic upload without losing its completion receipt or raw bytes", async () => {
+	const receipt = await completedGenericReceipt();
+	expect(await saveVideoEdits(video.id, editSpec)).toEqual({ success: true });
+	const saved = await current();
+	const [upload] = await runtime.database
+		.select()
+		.from(Db.videoUploads)
+		.where(eq(Db.videoUploads.videoId, video.id));
+	expect(upload).toMatchObject({
+		phase: "processing",
+		rawFileKey: receipt.baseKey,
+		processingProgress: 0,
+	});
+	expect(saved.metadata?.processingRun).toEqual(receipt.run);
+	expect(saved.metadata?.editProcessing?.sourceKey).toBe(receipt.baseKey);
+	expect(mocks.start).toHaveBeenCalledOnce();
+	expect(mocks.copy).not.toHaveBeenCalled();
+	expect(mocks.deleteObjects).not.toHaveBeenCalled();
+	expect(
+		await applyVideoProcessingProgress(runtime.database, {
+			videoId: video.id,
+			token: receipt.run.token,
+			attemptId: receipt.run.attemptId,
+			phase: "complete",
+			progress: 100,
+			metadata: { duration: 10, width: 320, height: 180, fps: 30 },
+		}),
+	).toBe(false);
+	expect(
+		(
+			await runtime.database
+				.select()
+				.from(Db.videoUploads)
+				.where(eq(Db.videoUploads.videoId, video.id))
+		)[0],
+	).toEqual(upload);
+	await expect(saveVideoEdits(video.id, editSpec)).rejects.toThrow(
+		"already uploading or processing",
+	);
+	expect(mocks.start).toHaveBeenCalledOnce();
+});
+
+it("restores an edited recording after a completed identity reprocessing receipt", async () => {
+	const receipt = await completedGenericReceipt(true);
+	expect(await restoreVideoToOriginal(video.id)).toEqual({ success: true });
+	expect(mocks.start).toHaveBeenCalledOnce();
+	expect(mocks.start.mock.calls[0]?.[1]?.[0]).toMatchObject({
+		sourceKey: receipt.baseKey,
+		previousSpec: editSpec,
+		editSpec: {
+			version: 1,
+			sourceDuration: 10,
+			keepRanges: [{ start: 0, end: 10 }],
+		},
+	});
+	expect((await current()).metadata?.processingRun).toEqual(receipt.run);
+	expect(mocks.deleteObjects).not.toHaveBeenCalled();
+});
+
+it("does not misclassify a completed original-input reprocess as a legacy edit", async () => {
+	const receipt = await completedGenericReceipt(false, true);
+	expect(receipt.rawKey).toBe(receipt.baseKey);
+	expect(await restoreVideoToOriginal(video.id)).toEqual({
+		success: true,
+		skipped: true,
+	});
+	expect(mocks.start).not.toHaveBeenCalled();
+	expect(await saveVideoEdits(video.id, editSpec)).toEqual({ success: true });
+	expect((await current()).metadata?.processingRun).toEqual(receipt.run);
+});
+
+it.each([
+	"legacy-complete",
+	"error",
+	"incomplete-run",
+	"owner",
+	"organization",
+	"storage",
+	"raw-key",
+	"unpublished-output",
+	"new-upload",
+])(
+	"does not consume an unproven %s upload as a generic completion receipt",
+	async (kind) => {
+		const receipt = await completedGenericReceipt();
+		if (kind === "legacy-complete")
+			await change({
+				metadata: { ...video.metadata, processingRun: undefined },
+			});
+		else if (kind === "error")
+			await runtime.database
+				.update(Db.videoUploads)
+				.set({ phase: "error" })
+				.where(eq(Db.videoUploads.videoId, video.id));
+		else if (kind === "raw-key")
+			await runtime.database
+				.update(Db.videoUploads)
+				.set({ rawFileKey: `${video.ownerId}/${video.id}/other-raw.webm` })
+				.where(eq(Db.videoUploads.videoId, video.id));
+		else if (kind === "new-upload")
+			await runtime.database
+				.update(Db.videoUploads)
+				.set({
+					startedAt: new Date(Date.parse(receipt.run.completedAt ?? "") + 1000),
+				})
+				.where(eq(Db.videoUploads.videoId, video.id));
+		else if (kind === "unpublished-output")
+			await change({
+				source: {
+					type: "webMP4",
+					outputKey: `${video.ownerId}/${video.id}/.recording/outputs/other/result.mp4`,
+				},
+			});
+		else
+			await change({
+				metadata: {
+					...video.metadata,
+					processingRun: {
+						...receipt.run,
+						...(kind === "incomplete-run"
+							? { state: "processing" as const }
+							: kind === "owner"
+								? { ownerId: "different-owner" }
+								: kind === "organization"
+									? { organizationId: "different-org" }
+									: { storageIntegrationId: "different-storage" }),
+					},
+				},
+			});
+		const before = await current();
+		const [upload] = await runtime.database
+			.select()
+			.from(Db.videoUploads)
+			.where(eq(Db.videoUploads.videoId, video.id));
+		await expect(saveVideoEdits(video.id, editSpec)).rejects.toThrow(
+			/Previous edit|already uploading/,
+		);
+		expect(await current()).toEqual(before);
+		expect(
+			(
+				await runtime.database
+					.select()
+					.from(Db.videoUploads)
+					.where(eq(Db.videoUploads.videoId, video.id))
+			)[0],
+		).toEqual(upload);
+		expect(mocks.start).not.toHaveBeenCalled();
+		expect(mocks.deleteObjects).not.toHaveBeenCalled();
+	},
+);
+
+it.each(["upload", "run"])(
+	"rechecks the completed %s receipt at the edit publication boundary",
+	async (kind) => {
+		const receipt = await completedGenericReceipt();
+		beforeBatch = async () => {
+			if (kind === "upload")
+				await runtime.database
+					.update(Db.videoUploads)
+					.set({ phase: "processing", processingMessage: "Newer processing" })
+					.where(eq(Db.videoUploads.videoId, video.id));
+			else
+				await change({
+					metadata: {
+						...video.metadata,
+						processingRun: {
+							...receipt.run,
+							token: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+						},
+					},
+				});
+		};
+		await expect(saveVideoEdits(video.id, editSpec)).rejects.toThrow(
+			"already uploading or processing",
+		);
+		expect((await current()).metadata?.editProcessing).toBeUndefined();
+		expect(mocks.start).not.toHaveBeenCalled();
+		expect(mocks.deleteObjects).not.toHaveBeenCalled();
+	},
+);
+
+it("rolls back completed receipt consumption when creating the edit reservation fails", async () => {
+	const receipt = await completedGenericReceipt();
+	const before = await current();
+	await runtime.binding
+		.prepare(
+			`CREATE TRIGGER fail_new_edit_receipt BEFORE INSERT ON video_uploads WHEN NEW.videoId = '${video.id}' AND NEW.phase = 'processing' BEGIN SELECT RAISE(ABORT,'edit reservation failed'); END`,
+		)
+		.run();
+	try {
+		await expect(saveVideoEdits(video.id, editSpec)).rejects.toThrow();
+	} finally {
+		await runtime.binding.prepare("DROP TRIGGER fail_new_edit_receipt").run();
+	}
+	expect(await current()).toEqual(before);
+	expect(
+		(
+			await runtime.database
+				.select()
+				.from(Db.videoUploads)
+				.where(eq(Db.videoUploads.videoId, video.id))
+		)[0],
+	).toEqual(receipt.upload);
+	expect(mocks.start).not.toHaveBeenCalled();
+	expect(mocks.deleteObjects).not.toHaveBeenCalled();
 });
 async function current() {
 	const [row] = await runtime.database

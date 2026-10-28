@@ -8,9 +8,10 @@ import {
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
-import { Video } from "@cap/web-domain";
+import { VideosPolicy } from "@cap/web-backend/src/Videos/VideosPolicy";
+import { CurrentUser, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { Effect } from "effect";
+import { Effect, Option } from "effect";
 import { runPromise } from "@/lib/server";
 import { canUserDownloadVideo } from "@/lib/video-download-permissions";
 import { getVideoEditingBase } from "@/lib/video-editing-base";
@@ -79,6 +80,9 @@ export async function getVideoDownloadInfo(
 	videoId: Video.VideoId,
 	variant: VideoDownloadVariant = "current",
 ): Promise<VideoDownloadInfo> {
+	if (variant !== "current" && variant !== "original") {
+		throw new Error("Invalid video download variant");
+	}
 	const user = await getCurrentUser();
 	if (!user || !videoId) {
 		throw new Error("Missing required data for downloading video");
@@ -90,6 +94,9 @@ export async function getVideoDownloadInfo(
 		.where(eq(videos.id, videoId));
 
 	if (!video) throw new Error("Video not found");
+	if (variant === "original" && user.id !== video.ownerId) {
+		throw new Error("You don't have permission to download the original video");
+	}
 
 	const allowed = await canUserDownloadVideo({
 		userId: user.id,
@@ -99,6 +106,32 @@ export async function getVideoDownloadInfo(
 
 	if (!allowed) {
 		throw new Error("You don't have permission to download this video");
+	}
+	if (user.id !== video.ownerId) {
+		const viewable = await Effect.gen(function* () {
+			const policy = yield* VideosPolicy;
+			return yield* policy.getViewableById(videoId);
+		}).pipe(
+			Effect.provideService(CurrentUser, {
+				id: user.id,
+				email: user.email,
+				activeOrganizationId: user.activeOrganizationId,
+				iconUrlOrKey: Option.fromNullable(user.image),
+			}),
+			runPromise,
+		);
+		if (Option.isNone(viewable)) throw new Error("Video not found");
+		const current = viewable.value[0];
+		if (
+			current.ownerId !== video.ownerId ||
+			current.orgId !== video.orgId ||
+			Option.getOrNull(current.bucketId) !== video.bucket ||
+			Option.getOrNull(current.storageIntegrationId) !==
+				video.storageIntegrationId ||
+			JSON.stringify(Object.entries(current.source).sort()) !==
+				JSON.stringify(Object.entries(video.source).sort())
+		)
+			throw new Error("Video changed. Reload before downloading.");
 	}
 
 	if (variant === "current") {

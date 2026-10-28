@@ -14,6 +14,7 @@ import { useVideoDownload } from "./use-video-download";
 export function VideoDownloadMenu({
 	videoId,
 	hasEdits,
+	allowOriginal = true,
 	align = "end",
 	triggerClassName,
 	triggerLabel = "Video options",
@@ -21,6 +22,7 @@ export function VideoDownloadMenu({
 }: {
 	videoId: Video.VideoId;
 	hasEdits: boolean;
+	allowOriginal?: boolean;
 	align?: "start" | "center" | "end";
 	triggerClassName?: string;
 	triggerLabel?: string;
@@ -47,7 +49,7 @@ export function VideoDownloadMenu({
 				</button>
 			</DropdownMenuTrigger>
 			<DropdownMenuContent align={align} sideOffset={6} className="min-w-52">
-				{hasEdits ? (
+				{hasEdits && allowOriginal ? (
 					<>
 						<DropdownMenuItem
 							className="flex gap-2 items-center"

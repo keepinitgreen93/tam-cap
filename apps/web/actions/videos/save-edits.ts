@@ -10,7 +10,7 @@ import {
 	videos,
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
-import type { VideoEditSpec } from "@cap/database/types";
+import type { VideoEditSpec, VideoProcessingRun } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { Storage } from "@cap/web-backend";
@@ -37,6 +37,7 @@ import {
 	normalizeKeepRanges,
 } from "@/lib/video-edits";
 import { decodeStorageVideo } from "@/lib/video-storage";
+import { isVideoStorageKey } from "@/lib/video-storage-key";
 import { isAiGenerationEnabled } from "@/utils/flags";
 import { editVideoWorkflow } from "@/workflows/edit-video";
 
@@ -54,6 +55,49 @@ function isMp4BackedVideo(source: typeof videos.$inferSelect.source) {
 
 function getResultKey(ownerId: string, videoId: string) {
 	return `${ownerId}/${videoId}/result.mp4`;
+}
+
+type CompletedProcessingReceipt = {
+	upload: typeof videoUploads.$inferSelect;
+	run: VideoProcessingRun;
+};
+
+function getCompletedProcessingReceipt(
+	video: typeof videos.$inferSelect,
+	upload: typeof videoUploads.$inferSelect | undefined,
+): CompletedProcessingReceipt | undefined {
+	const run = video.metadata?.processingRun;
+	const completedAt = Date.parse(run?.completedAt ?? "");
+	if (
+		!upload ||
+		upload.videoId !== video.id ||
+		upload.phase !== "complete" ||
+		upload.processingProgress !== 100 ||
+		upload.processingError !== null ||
+		video.metadata?.editProcessing ||
+		!run ||
+		run.state !== "complete" ||
+		!run.token ||
+		!run.attemptId ||
+		run.error ||
+		!Number.isFinite(completedAt) ||
+		upload.startedAt.getTime() > completedAt ||
+		upload.updatedAt.getTime() < completedAt ||
+		run.ownerId !== video.ownerId ||
+		run.organizationId !== video.orgId ||
+		run.bucketId !== video.bucket ||
+		run.storageIntegrationId !== video.storageIntegrationId ||
+		upload.rawFileKey !== run.rawFileKey ||
+		!isVideoStorageKey(video, run.rawFileKey) ||
+		!run.outputKey.startsWith(
+			`${video.ownerId}/${video.id}/.recording/outputs/`,
+		) ||
+		!isVideoStorageKey(video, run.outputKey) ||
+		(video.source.type !== "desktopMP4" && video.source.type !== "webMP4") ||
+		video.source.outputKey !== run.outputKey
+	)
+		return undefined;
+	return { upload, run };
 }
 
 async function objectExists(
@@ -99,11 +143,13 @@ async function markEditProcessing({
 	sourceKey,
 	previousSpec,
 	legacyUpload,
+	completedUpload,
 }: {
 	video: typeof videos.$inferSelect;
 	sourceKey: string;
 	previousSpec: VideoEditSpec;
 	legacyUpload?: typeof videoUploads.$inferSelect;
+	completedUpload?: CompletedProcessingReceipt;
 }): Promise<EditOperation> {
 	const startedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
 	const operation = { token: randomUUID(), startedAt: startedAt.toISOString() };
@@ -135,7 +181,16 @@ async function markEditProcessing({
 				.from(videoUploads)
 				.where(eq(videoUploads.videoId, video.id)),
 		);
+		const completedCurrent = getCompletedProcessingReceipt(current, upload);
 		if (
+			completedUpload &&
+			completedCurrent &&
+			isDeepStrictEqual(completedCurrent, completedUpload)
+		) {
+			statements.push(
+				database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
+			);
+		} else if (
 			legacyUpload &&
 			upload &&
 			!current.metadata?.editProcessing &&
@@ -237,6 +292,9 @@ async function loadEditableVideo(
 		.select()
 		.from(videoUploads)
 		.where(eq(videoUploads.videoId, videoId));
+	const completedUpload = getCompletedProcessingReceipt(video, activeUpload);
+	if (completedUpload)
+		return { user, video, legacyUpload: undefined, completedUpload };
 
 	if (
 		recoverLegacy &&
@@ -256,7 +314,12 @@ async function loadEditableVideo(
 			throw new Error("The edit recovery runtime is unavailable");
 		}
 		await assertLegacyEditsQuiescent(editVideoWorkflow.workflowId);
-		return { user, video, legacyUpload: activeUpload };
+		return {
+			user,
+			video,
+			legacyUpload: activeUpload,
+			completedUpload: undefined,
+		};
 	}
 	if (activeUpload && ACTIVE_UPLOAD_PHASES.has(activeUpload.phase)) {
 		const message =
@@ -268,14 +331,14 @@ async function loadEditableVideo(
 		throw new Error(message);
 	}
 
-	return { user, video, legacyUpload: undefined };
+	return { user, video, legacyUpload: undefined, completedUpload: undefined };
 }
 
 export async function saveVideoEdits(
 	videoId: Video.VideoId,
 	editSpec: VideoEditSpec,
 ) {
-	const { user, video } = await loadEditableVideo(videoId);
+	const { user, video, completedUpload } = await loadEditableVideo(videoId);
 
 	const [existingEdit] = await db()
 		.select()
@@ -320,6 +383,7 @@ export async function saveVideoEdits(
 		video,
 		sourceKey,
 		previousSpec,
+		completedUpload,
 	});
 	try {
 		await ensureOriginalSourceCopy(
@@ -360,7 +424,8 @@ export async function saveVideoEdits(
 }
 
 export async function restoreVideoToOriginal(videoId: Video.VideoId) {
-	const { user, video, legacyUpload } = await loadEditableVideo(videoId, true);
+	const { user, video, legacyUpload, completedUpload } =
+		await loadEditableVideo(videoId, true);
 
 	const [existingEdit] = await db()
 		.select()
@@ -436,6 +501,7 @@ export async function restoreVideoToOriginal(videoId: Video.VideoId) {
 		sourceKey,
 		previousSpec,
 		legacyUpload,
+		completedUpload,
 	});
 
 	try {

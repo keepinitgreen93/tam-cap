@@ -5,7 +5,9 @@ import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => {
 	const updateWhere = vi.fn(async () => undefined);
-	const updateSet = vi.fn(() => ({ where: updateWhere }));
+	const updateSet = vi.fn((_values: unknown) => ({
+		where: updateWhere,
+	}));
 	const db = {
 		select: vi.fn(() => ({
 			from: vi.fn(() => ({

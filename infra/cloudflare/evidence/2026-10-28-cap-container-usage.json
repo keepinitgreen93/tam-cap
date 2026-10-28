@@ -1,0 +1,125 @@
+{
+	"collectedAt": "2026-10-28T00:44:31.406Z",
+	"source": "Cloudflare GraphQL Analytics via connected Cloudflare account; filtered only by the two Cap application IDs",
+	"window": {
+		"from": "2026-10-21T00:00:00Z",
+		"to": "2026-10-28T00:40:00Z"
+	},
+	"apps": [
+		{
+			"service": "CapWeb",
+			"applicationId": "1cec9399-20f4-4d5a-83f4-67d7807daafa",
+			"daily": [
+				{
+					"date": "2026-10-27",
+					"allocatedDisk": 52756955572120,
+					"allocatedMemory": 28323674852347.55,
+					"cpuTimeSec": 359.82000000000005,
+					"txBytes": 57891456
+				},
+				{
+					"date": "2026-10-28",
+					"allocatedDisk": 20999882657416,
+					"allocatedMemory": 11274226154179.914,
+					"cpuTimeSec": 177.44999999999942,
+					"txBytes": 37742994
+				}
+			],
+			"billingUsage": {
+				"allocatedDisk": 73756838229536,
+				"allocatedMemory": 39597901006527.47,
+				"cpuTimeSec": 537.2699999999995,
+				"txBytes": 95634450
+			},
+			"workloadSamples": 1970,
+			"workloadPeakMemoryBytes": 1177526272,
+			"workloadMemoryP95Bytes": 881197056,
+			"workloadCpuUtilizationP95": 0.3279924207180289,
+			"workloadCpuSeconds": 299.873662,
+			"runningHoursFromAllocatedMemory": 2.561001327414445
+		},
+		{
+			"service": "CapMedia",
+			"applicationId": "9e8f5a65-c90a-4677-b07e-25f272fff5f4",
+			"daily": [
+				{
+					"date": "2026-10-27",
+					"allocatedDisk": 8460004205768,
+					"allocatedMemory": 4541930173474.502,
+					"cpuTimeSec": 49.869999999999266,
+					"txBytes": 73970452
+				},
+				{
+					"date": "2026-10-28",
+					"allocatedDisk": 6374861333656,
+					"allocatedMemory": 3422477618073.432,
+					"cpuTimeSec": 24.92999999999991,
+					"txBytes": 78348
+				}
+			],
+			"billingUsage": {
+				"allocatedDisk": 14834865539424,
+				"allocatedMemory": 7964407791547.934,
+				"cpuTimeSec": 74.79999999999917,
+				"txBytes": 74048800
+			},
+			"workloadSamples": 286,
+			"workloadPeakMemoryBytes": 419414016,
+			"workloadMemoryP95Bytes": 418033664,
+			"workloadCpuUtilizationP95": 0.7534246409192231,
+			"workloadCpuSeconds": 39.96193099999998,
+			"runningHoursFromAllocatedMemory": 0.5150994978966665
+		}
+	],
+	"totals": {
+		"cpuSeconds": 612.0699999999987,
+		"memoryGiBSeconds": 44295.85188448001,
+		"diskGBSeconds": 88591.70376896001,
+		"runningHours": 3.0761008253111113
+	},
+	"grossMeteredContainerCostBeforeAllowances": {
+		"cpu": 0.012241399999999975,
+		"memory": 0.11073962971120004,
+		"disk": 0.006201419263827201,
+		"total": 0.1291824489750272
+	},
+	"assumptions": {
+		"memoryGiBPerRunningInstance": 4,
+		"diskGBPerRunningInstance": 8,
+		"allowancesSharedAcrossAccount": true,
+		"containerCpuSecondsPerCombinedRunningHour": 198.97592268878086
+	},
+	"forecast": [
+		{
+			"combinedRunningHours": 50,
+			"cpuSecondsAtObservedRatio": 9948.796134439042,
+			"memoryOverage": 1.5750000000000002,
+			"cpuOverage": 0,
+			"diskOverage": 0.0504,
+			"containerSubtotal": 1.6254000000000002
+		},
+		{
+			"combinedRunningHours": 150,
+			"cpuSecondsAtObservedRatio": 29846.388403317127,
+			"memoryOverage": 5.175000000000001,
+			"cpuOverage": 0.14692776806634256,
+			"diskOverage": 0.252,
+			"containerSubtotal": 5.573927768066343
+		},
+		{
+			"combinedRunningHours": 720,
+			"cpuSecondsAtObservedRatio": 143262.66433592222,
+			"memoryOverage": 25.695000000000004,
+			"cpuOverage": 2.4152532867184444,
+			"diskOverage": 1.4011200000000001,
+			"containerSubtotal": 29.511373286718445
+		}
+	],
+	"limitations": [
+		"Development and synthetic acceptance usage; not representative monthly team demand.",
+		"Usage API estimates include VM overhead but are not an invoice.",
+		"Allocated memory time gives running-time equivalent at the configured 4GiB allocation.",
+		"AI inference cannot be attributed to Cap from these application-filtered container metrics.",
+		"No account-wide invoice or other customer financial data queried."
+	]
+}

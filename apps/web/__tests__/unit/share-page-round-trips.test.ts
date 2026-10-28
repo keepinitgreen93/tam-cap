@@ -1,18 +1,44 @@
 import { createHash } from "node:crypto";
-import { organizations } from "@cap/database/schema";
-import { getTableColumns } from "drizzle-orm";
+import { createCloudflareDb } from "@cap/database/cloudflare";
+import {
+	createD1BridgeBinding,
+	handleD1BridgeRequest,
+} from "@cap/database/cloudflare/bridge";
+import * as Db from "@cap/database/cloudflare/schema";
+import {
+	type ImageUpload,
+	Organisation,
+	Space,
+	User,
+	Video,
+} from "@cap/web-domain";
+import { eq } from "drizzle-orm";
 import { Context, Effect } from "effect";
 import { type ComponentProps, isValidElement, type ReactElement } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
 
-const mocks = vi.hoisted(() => ({ query: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+	query: vi.fn<(request: Request) => Promise<Response>>(),
+	database: undefined as ReturnType<typeof createCloudflareDb> | undefined,
+}));
 
 vi.mock("server-only", () => ({}));
-vi.mock("@cap/database", async () => {
-	const { drizzle } = await import("drizzle-orm/mysql-proxy");
-	const client = drizzle(mocks.query);
-	return { db: () => client };
-});
+vi.mock("@cap/database/cloudflare/application", () => ({
+	db: () => {
+		if (!mocks.database) throw new Error("Fixture missing");
+		return mocks.database;
+	},
+}));
+
 vi.mock("@cap/database/auth/session", () => ({
 	getCurrentUser: async () => ({ id: "viewer", activeOrganizationId: "org-1" }),
 }));
@@ -28,10 +54,10 @@ vi.mock("@cap/web-backend", async () => {
 		"../../../../packages/web-backend/src/Videos/EffectiveVideoRules"
 	);
 	return {
-		Database: Context.GenericTag("SharePerfDatabase"),
+		CloudflareDatabase: Context.GenericTag("SharePerfDatabase"),
 		ImageUploads: Context.GenericTag("SharePerfImages"),
 		Videos: Context.GenericTag("SharePerfVideos"),
-		Tinybird: Context.GenericTag("SharePerfAnalytics"),
+		Analytics: Context.GenericTag("SharePerfAnalytics"),
 		provideOptionalAuth: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
 		resolveEffectiveVideoRules,
 	};
@@ -40,7 +66,7 @@ vi.mock("@cap/web-backend/src/Videos/VideosPolicy", () => ({
 	VideosPolicy: Context.GenericTag("SharePerfPolicy"),
 }));
 vi.mock("@/lib/server", async () => {
-	const { db } = await import("@cap/database");
+	const { db } = await import("@cap/database/cloudflare/application");
 	return {
 		runPromise: <A, E>(effect: Effect.Effect<A, E, unknown>) =>
 			effect.pipe(
@@ -55,7 +81,7 @@ vi.mock("@/lib/server", async () => {
 					resolveImageUrl: (url: string) => Effect.succeed(url),
 				}),
 				Effect.provideService(Context.GenericTag("SharePerfAnalytics"), {
-					querySql: () => Effect.succeed({ data: [{ views: 120 }] }),
+					countViews: () => Effect.succeed([{ views: 120 }]),
 				}),
 				Effect.runPromise,
 			),
@@ -99,133 +125,112 @@ import type { ShareHeader } from "@/app/s/[videoId]/_components/ShareHeader";
 import ShareVideoPage from "@/app/s/[videoId]/page";
 import type { Share } from "@/app/s/[videoId]/Share";
 
-const createdAt = "2026-10-20 12:00:00";
-const organization = {
-	id: "org-1",
-	name: "Team",
-	ownerId: "viewer",
-	settings: {},
-};
-const recording = {
-	id: "video-1",
-	name: "Ten minute walkthrough",
-	ownerId: "owner",
-	orgId: "org-1",
-	createdAt,
-	updatedAt: createdAt,
-	effectiveCreatedAt: createdAt,
-	source: { type: "desktopMP4" },
-	metadata: { summary: "Project walkthrough" },
-	duration: 600,
-	public: 1,
-	isScreenshot: 0,
-	transcriptionStatus: "COMPLETE",
-};
-
-function project(
-	query: string,
-	tables: Record<string, Record<string, unknown>>,
-) {
-	return query
-		.slice(7, query.indexOf(" from "))
-		.split(", ")
-		.map((column) => {
-			if (column.includes(" IS NOT NULL")) return 0;
-			const match = /^`(\w+)`\.`(\w+)`$/.exec(column);
-			if (!match) throw new Error(`Unexpected projection: ${column}`);
-			return tables[match[1] ?? ""]?.[match[2] ?? ""] ?? null;
-		});
-}
-
-function rowsFor(query: string) {
-	if (
-		query.includes("from `videos` inner join") ||
-		query.includes("from `videos` left join")
-	) {
-		return [
-			project(query, {
-				videos: recording,
-				users: { id: "owner", name: "Owner", email: "owner@example.com" },
-				organizations: organization,
-				shared_videos: { organizationId: "shared-org" },
-			}),
-		];
-	}
-	if (query.includes("from `comments`")) {
-		return Array.from({ length: 30 }, (_, index) =>
-			project(query, {
-				comments: {
-					id: `comment-${index}`,
+const createdAt = new Date("2026-10-20T12:00:00Z");
+const recording = { id: Video.VideoId.make("video-1") };
+let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
+beforeAll(async () => {
+	runtime = await createTestDatabase();
+	const viewer = User.UserId.make("viewer"),
+		owner = User.UserId.make("owner");
+	const orgId = Organisation.OrganisationId.make("org-1"),
+		sharedOrg = Organisation.OrganisationId.make("shared-org");
+	await runtime.database.insert(Db.users).values([
+		{
+			id: viewer,
+			email: "viewer@share-perf.test",
+			name: "Viewer",
+			activeOrganizationId: orgId,
+			emailVerified: createdAt,
+		},
+		{
+			id: owner,
+			email: "owner@share-perf.test",
+			name: "Owner",
+			activeOrganizationId: orgId,
+			emailVerified: createdAt,
+		},
+		...Array.from({ length: 5 }, (_, index) => ({
+			id: User.UserId.make(`author-${index}`),
+			email: `author-${index}@share-perf.test`,
+			name: `Reviewer ${index}`,
+			activeOrganizationId: orgId,
+			image: "https://example.com/avatar.png" as ImageUpload.ImageUrlOrKey,
+			emailVerified: createdAt,
+		})),
+	]);
+	await runtime.database.insert(Db.organizations).values([
+		{ id: orgId, ownerId: viewer, name: "Team", settings: {} },
+		{ id: sharedOrg, ownerId: owner, name: "Shared team", settings: {} },
+	]);
+	await runtime.database.insert(Db.organizationMembers).values({
+		id: "shared-member",
+		organizationId: sharedOrg,
+		userId: viewer,
+		role: "member",
+	});
+	await runtime.database.insert(Db.videos).values({
+		id: recording.id,
+		name: "Ten minute walkthrough",
+		ownerId: owner,
+		orgId,
+		createdAt,
+		updatedAt: createdAt,
+		source: { type: "desktopMP4" },
+		metadata: { summary: "Project walkthrough" },
+		duration: 600,
+		public: true,
+		isScreenshot: false,
+		transcriptionStatus: "COMPLETE",
+	});
+	await runtime.database.insert(Db.spaces).values(
+		Array.from({ length: 3 }, (_, index) => ({
+			id: Space.SpaceId.make(index === 0 ? "space-1" : `dash-space-${index}`),
+			organizationId: orgId,
+			createdById: viewer,
+			name: index === 0 ? "Project" : `Space ${index}`,
+			privacy: "Public" as const,
+			settings: {},
+		})),
+	);
+	await runtime.database.insert(Db.spaceMembers).values({
+		id: "space-member",
+		spaceId: Space.SpaceId.make("space-1"),
+		userId: viewer,
+		role: "member",
+	});
+	await runtime.database.insert(Db.spaceVideos).values({
+		id: "share-space",
+		addedById: owner,
+		videoId: recording.id,
+		spaceId: Space.SpaceId.make("space-1"),
+	});
+	await runtime.database.insert(Db.sharedVideos).values({
+		id: "share-org",
+		sharedByUserId: owner,
+		videoId: recording.id,
+		organizationId: sharedOrg,
+	});
+	for (let offset = 0; offset < 30; offset += 5)
+		await runtime.database.insert(Db.comments).values(
+			Array.from({ length: 5 }, (_, local) => {
+				const index = offset + local;
+				return {
+					id: `comment-${index}` as typeof Db.comments.$inferSelect.id,
 					videoId: recording.id,
-					authorId: `author-${index % 5}`,
+					authorId: User.UserId.make(`author-${index % 5}`),
 					content: `Review note ${index}`,
-					type: "text",
+					type: "text" as const,
 					timestamp: index * 20,
 					createdAt,
 					updatedAt: createdAt,
-				},
-				users: {
-					name: `Reviewer ${index % 5}`,
-					image: "https://example.com/avatar.png",
-				},
+				};
 			}),
 		);
-	}
-	if (query.includes("from `organizations`")) {
-		if (query.includes("left join")) return [["viewer", "member"]];
-		if (query.includes("inner join")) return [];
-		if (query.startsWith("select `id`, `name` from"))
-			return [["org-1", "Team"]];
-		return [
-			Object.values(getTableColumns(organizations)).map(
-				(column) =>
-					(organization as Record<string, unknown>)[column.name] ?? null,
-			),
-		];
-	}
-	if (query.includes("from `organization_members`")) {
-		if (query.includes("count(")) return [[5]];
-		if (query.startsWith("select `role`")) return [["member"]];
-		return [];
-	}
-	if (query.includes("from `spaces`"))
-		return Array.from({ length: 3 }, (_, i) => [
-			`dashboard-space-${i}`,
-			0,
-			"Public",
-			0,
-			`Space ${i}`,
-			null,
-			"org-1",
-			"viewer",
-			null,
-			{},
-			"member",
-			0,
-			5,
-			10,
-		]);
-	if (query.includes("from `videos`")) return [["org-1"]];
-	if (query.includes("from `shared_videos`")) {
-		if (query.includes("COUNT(")) return [[10]];
-		if (query.includes("inner join `organization_members`")) return [];
-		if (query.includes("inner join `organizations`"))
-			return [["shared-org", "Shared team", "shared-org", null]];
-		return [["shared-org"]];
-	}
-	if (query.includes("from `space_videos`")) {
-		if (query.includes("inner join `space_members`"))
-			return query.includes("inner join `spaces`")
-				? [["space-1", "Project", "org-1"]]
-				: [["space-member"]];
-		if (query.includes("inner join `spaces`"))
-			return [["space-1", "Project", "org-1", null, {}, 0]];
-		return [["space-1"]];
-	}
-	if (query.includes("from `space_members`")) return [["space-member"]];
-	if (query.includes("from `video_edits`")) return [];
-	throw new Error(`Unexpected query: ${query}`);
-}
+	mocks.database = createCloudflareDb(
+		createD1BridgeBinding({ fetch: (request) => mocks.query(request) }),
+	);
+}, 120000);
+afterAll(async () => runtime?.dispose());
 
 async function loadPage() {
 	const page = (await ShareVideoPage({
@@ -257,21 +262,60 @@ async function loadPage() {
 	};
 }
 
-beforeEach(() => mocks.query.mockReset());
+beforeEach(async () => {
+	mocks.query
+		.mockReset()
+		.mockImplementation((request) =>
+			handleD1BridgeRequest(request, runtime.binding),
+		);
+	await runtime.database
+		.delete(Db.videoEdits)
+		.where(eq(Db.videoEdits.videoId, recording.id));
+	await runtime.database
+		.delete(Db.organizationMembers)
+		.where(eq(Db.organizationMembers.id, "shared-member"));
+	await runtime.database.insert(Db.organizationMembers).values({
+		id: "shared-member",
+		organizationId: Organisation.OrganisationId.make("shared-org"),
+		userId: User.UserId.make("viewer"),
+		role: "member",
+	});
+	await runtime.database
+		.delete(Db.spaceMembers)
+		.where(eq(Db.spaceMembers.id, "space-member"));
+	await runtime.database.insert(Db.spaceMembers).values({
+		id: "space-member",
+		spaceId: Space.SpaceId.make("space-1"),
+		userId: User.UserId.make("viewer"),
+		role: "member",
+	});
+});
 
 describe("share page database round trips", () => {
 	it("keeps download permission and edit checks within the existing page load", async () => {
-		const pending: Array<() => void> = [];
+		const pending: Array<() => Promise<void>> = [];
 		mocks.query.mockImplementation(
-			(query: string) =>
-				new Promise((resolve) => {
-					pending.push(() => resolve({ rows: rowsFor(query) }));
+			(request: Request) =>
+				new Promise((resolve, reject) => {
+					pending.push(async () => {
+						try {
+							resolve(await handleD1BridgeRequest(request, runtime.binding));
+						} catch (error) {
+							reject(error);
+						}
+					});
 				}),
 		);
 		let settled = false;
-		const page = loadPage().finally(() => {
-			settled = true;
-		});
+		const page = loadPage();
+		void page.then(
+			() => {
+				settled = true;
+			},
+			() => {
+				settled = true;
+			},
+		);
 		let roundTrips = 0;
 		let idleTicks = 0;
 		while (!settled) {
@@ -284,7 +328,7 @@ describe("share page database round trips", () => {
 			if (++idleTicks < 3) continue;
 			idleTicks = 0;
 			roundTrips++;
-			for (const release of pending.splice(0)) release();
+			await Promise.all(pending.splice(0).map((release) => release()));
 		}
 		const result = await page;
 		expect(result.comments).toHaveLength(30);
@@ -297,14 +341,46 @@ describe("share page database round trips", () => {
 		});
 	});
 
+	it.each([false, true])(
+		"reads edit metadata only when current native download grants allow it: %s",
+		async (canDownload) => {
+			if (!canDownload) {
+				await runtime.database
+					.delete(Db.organizationMembers)
+					.where(eq(Db.organizationMembers.id, "shared-member"));
+				await runtime.database
+					.delete(Db.spaceMembers)
+					.where(eq(Db.spaceMembers.id, "space-member"));
+			}
+			await runtime.database.insert(Db.videoEdits).values({
+				videoId: recording.id,
+				sourceKey: `owner/${recording.id}/source/original.mp4`,
+				editSpec: {
+					version: 1,
+					sourceDuration: 600,
+					keepRanges: [{ start: 0, end: 300 }],
+				},
+			});
+			const result = await loadPage();
+			expect(result.comments).toHaveLength(30);
+			expect(result.data).toMatchObject({ duration: 600 });
+			expect(result.header.spacesData).toHaveLength(4);
+			expect(result.header).toMatchObject({
+				canDownload,
+				hasEdits: canDownload,
+			});
+			expect(mocks.query.mock.calls).toHaveLength(canDownload ? 20 : 19);
+		},
+	);
+
 	it.skipIf(!process.env.CAP_SHARE_PAGE_BENCH)(
 		"measures simulated 20ms database latency",
 		async () => {
 			const samples: number[] = [];
 			const outputs = new Set<string>();
-			mocks.query.mockImplementation(async (query: string) => {
+			mocks.query.mockImplementation(async (request: Request) => {
 				await new Promise((resolve) => setTimeout(resolve, 20));
-				return { rows: rowsFor(query) };
+				return handleD1BridgeRequest(request, runtime.binding);
 			});
 			for (let iteration = 0; iteration < 22; iteration++) {
 				const start = performance.now();

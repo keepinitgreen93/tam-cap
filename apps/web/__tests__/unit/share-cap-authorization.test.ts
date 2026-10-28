@@ -4,8 +4,10 @@ import {
 	handleD1BridgeRequest,
 } from "@cap/database/cloudflare/bridge";
 import * as Db from "@cap/database/cloudflare/schema";
+import { buildCanViewLoaded } from "@cap/web-backend/src/Videos/VideosPolicy";
 import { Organisation, Space, User, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
+import { Effect, Exit, Option } from "effect";
 import {
 	afterAll,
 	beforeAll,
@@ -131,6 +133,103 @@ async function assertShared() {
 	]);
 }
 describe("sharing Caps to private spaces", () => {
+	it("makes an owner's public clip private with the live empty-destination payload", async () => {
+		const anonymousCanView = async () => {
+			const row = (await snapshot()).video[0];
+			if (!row) throw new Error("Missing video");
+			return Exit.isSuccess(
+				await Effect.runPromiseExit(
+					buildCanViewLoaded(
+						{
+							repo: {
+								hasViewerGrant: () =>
+									Effect.die("Anonymous reads must not consult an email grant"),
+							},
+							orgsRepo: {
+								membershipForVideo: () =>
+									Effect.die("Anonymous reads have no membership"),
+								allowedEmailDomain: (id) =>
+									Effect.promise(async () => {
+										const [org] = await runtime.database
+											.select({ domain: Db.organizations.allowedEmailDomain })
+											.from(Db.organizations)
+											.where(eq(Db.organizations.id, id));
+										return Option.fromNullable(org?.domain);
+									}),
+							},
+							spacesRepo: {
+								membershipForVideo: () =>
+									Effect.die("Anonymous reads have no membership"),
+								passwordsForVideo: (id) =>
+									Effect.promise(() =>
+										runtime.database
+											.select({ password: Db.spaces.password })
+											.from(Db.spaceVideos)
+											.innerJoin(
+												Db.spaces,
+												eq(Db.spaces.id, Db.spaceVideos.spaceId),
+											)
+											.where(eq(Db.spaceVideos.videoId, id)),
+									),
+							},
+						},
+						row,
+						Option.fromNullable(row.password),
+					),
+				),
+			);
+		};
+		await runtime.database
+			.update(Db.organizations)
+			.set({ ownerId: caller })
+			.where(eq(Db.organizations.id, orgId));
+		await runtime.database
+			.delete(Db.organizationMembers)
+			.where(eq(Db.organizationMembers.userId, caller));
+		await runtime.database
+			.update(Db.videos)
+			.set({ public: true })
+			.where(eq(Db.videos.id, capId));
+		expect(await anonymousCanView()).toBe(true);
+		expect(await shareCap({ capId, spaceIds: [], public: false })).toEqual({
+			success: true,
+		});
+		expect((await snapshot()).video[0]?.public).toBe(false);
+		expect(await anonymousCanView()).toBe(false);
+		state.user.mockResolvedValue(null);
+		expect(await shareCap({ capId, spaceIds: [], public: true })).toEqual({
+			success: false,
+			error: "Unauthorized",
+		});
+		expect((await snapshot()).video[0]?.public).toBe(false);
+	});
+	it("saves the organization owner's selected default organization and public flag without an explicit membership row", async () => {
+		await runtime.database
+			.update(Db.organizations)
+			.set({ ownerId: caller })
+			.where(eq(Db.organizations.id, orgId));
+		await runtime.database
+			.delete(Db.organizationMembers)
+			.where(eq(Db.organizationMembers.userId, caller));
+		await runtime.database
+			.update(Db.videos)
+			.set({ public: true })
+			.where(eq(Db.videos.id, capId));
+		for (const visibility of [false, true, false]) {
+			expect(
+				await shareCap({ capId, spaceIds: [orgId], public: visibility }),
+			).toEqual({ success: true });
+			const saved = await snapshot();
+			expect(saved.video[0]?.public).toBe(visibility);
+			expect(saved.organization).toHaveLength(1);
+			expect(saved.organization[0]).toMatchObject({
+				videoId: capId,
+				organizationId: orgId,
+				sharedByUserId: caller,
+			});
+			expect(saved.space).toEqual([]);
+		}
+	});
 	it("rejects an organization member outside the space before changing any shares or visibility", async () => {
 		await runtime.database.insert(Db.sharedVideos).values({
 			id: "orgshare",

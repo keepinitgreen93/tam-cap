@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { type NextRequest, NextResponse } from "next/server";
+import { getCloudflareComputeDenial } from "@/lib/cloudflare-compute-access";
 import {
 	fetchConvertedVideoViaMediaServer,
 	isMediaServerConfigured,
@@ -160,6 +161,8 @@ async function tryMp4CandidateDownload(
 }
 
 export async function GET(request: NextRequest) {
+	const denial = await getCloudflareComputeDenial(request);
+	if (denial) return denial;
 	const videoId = request.nextUrl.searchParams.get("id");
 	const videoName = request.nextUrl.searchParams.get("name");
 

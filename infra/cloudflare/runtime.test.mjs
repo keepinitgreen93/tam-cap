@@ -3,7 +3,13 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
-import { webEnvironment } from "./runtime-env.ts";
+import { encode } from "../../packages/workflow-cloudflare/transport.mjs";
+import {
+	WEB_CONFIGURATION_HEADER,
+	webConfigurationFingerprint,
+	webConfigurationRequest,
+	webEnvironment,
+} from "./runtime-env.ts";
 
 test("container environment fixes private providers and preserves self-hosted mode", () => {
 	const env = webEnvironment(
@@ -93,10 +99,11 @@ test("runtime staging remains closed and never exposes workflow or database cont
 	}
 });
 
-async function loadWebContainerContract() {
+async function loadRuntimeContract() {
 	const bundle = await build({
 		stdin: {
-			contents: 'export { CapWeb } from "./runtime-worker.ts";',
+			contents:
+				'export { CapWeb, CapMedia, default } from "./runtime-worker.ts";',
 			resolveDir: import.meta.dirname,
 		},
 		bundle: true,
@@ -114,17 +121,21 @@ async function loadWebContainerContract() {
 					build.onLoad(
 						{ filter: /.*/, namespace: "container-contract" },
 						() => ({
-							contents: `export class Container { constructor(ctx,env){this.ctx=ctx;this.env=env;} async setOutboundByHosts(){await this.ctx.configure();} async stop(){await this.ctx.stop();} async fetch(){this.ctx.forward?.();return new Response("ready");} } export class ContainerProxy{} export class DurableObject{} export function getContainer(){throw new Error("Unexpected routing");}`,
+							contents: `export class Container { constructor(ctx,env){this.ctx=ctx;this.env=env;} async setOutboundByHosts(){await this.ctx.configure();} async stop(){await this.ctx.stop();} async fetch(request){this.ctx.forward?.(request);return new Response("ready");} } export class ContainerProxy{} export class DurableObject{} export function getContainer(binding){return binding;}`,
 						}),
 					);
 				},
 			},
 		],
 	});
-	const { CapWeb } = await import(
+	const module = await import(
 		`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString("base64")}`
 	);
-	return CapWeb;
+	return module;
+}
+
+async function loadWebContainerContract() {
+	return (await loadRuntimeContract()).CapWeb;
 }
 
 test("named-image startup coalesces concurrent requests and configures private egress first", async () => {
@@ -142,6 +153,14 @@ test("named-image startup coalesces concurrent requests and configures private e
 			this.running = true;
 		},
 	};
+	const env = {
+		CAP_WEB_ENV: JSON.stringify({
+			WEB_URL: "https://cap.example",
+			NEXTAUTH_URL: "https://cap.example",
+			NEXTAUTH_SECRET: "test",
+		}),
+		MEDIA_SERVER_WEBHOOK_SECRET: "media-secret",
+	};
 	const app = new CapWeb(
 		{
 			container,
@@ -155,18 +174,15 @@ test("named-image startup coalesces concurrent requests and configures private e
 				throw new Error("Cold container must not be stopped");
 			},
 		},
-		{
-			CAP_WEB_ENV: JSON.stringify({
-				WEB_URL: "https://cap.example",
-				NEXTAUTH_URL: "https://cap.example",
-				NEXTAUTH_SECRET: "test",
-			}),
-			MEDIA_SERVER_WEBHOOK_SECRET: "media-secret",
-		},
+		env,
 	);
 	const requests = [
-		app.fetch(new Request("https://cap.example/a")),
-		app.fetch(new Request("https://cap.example/b")),
+		app.fetch(
+			await webConfigurationRequest(new Request("https://cap.example/a"), env),
+		),
+		app.fetch(
+			await webConfigurationRequest(new Request("https://cap.example/b"), env),
+		),
 	];
 	assert.equal(events.length, 0);
 	configured();
@@ -246,8 +262,18 @@ test(
 		};
 		const app = new CapWeb(fixture.ctx, fixture.env);
 		const requests = [
-			app.fetch(new Request("https://cap.example/a")),
-			app.fetch(new Request("https://cap.example/b")),
+			app.fetch(
+				await webConfigurationRequest(
+					new Request("https://cap.example/a"),
+					fixture.env,
+				),
+			),
+			app.fetch(
+				await webConfigurationRequest(
+					new Request("https://cap.example/b"),
+					fixture.env,
+				),
+			),
 		];
 		await stopping;
 		assert.deepEqual(fixture.calls, {
@@ -280,7 +306,12 @@ test(
 			false,
 		);
 		const recreated = new CapWeb(fixture.ctx, fixture.env);
-		await recreated.fetch(new Request("https://cap.example/c"));
+		await recreated.fetch(
+			await webConfigurationRequest(
+				new Request("https://cap.example/c"),
+				fixture.env,
+			),
+		);
 		assert.equal(fixture.calls.stops, 1);
 		assert.equal(fixture.calls.starts, 1);
 	},
@@ -290,7 +321,9 @@ test("configuration fingerprint uses sorted effective environment and tracks sec
 	const CapWeb = await loadWebContainerContract();
 	const fixture = webConfigurationFixture();
 	const serve = async (env) =>
-		new CapWeb(fixture.ctx, env).fetch(new Request("https://cap.example"));
+		new CapWeb(fixture.ctx, env).fetch(
+			await webConfigurationRequest(new Request("https://cap.example"), env),
+		);
 	await serve(fixture.env);
 	const first = fixture.storage.get("cap.runtime.web-config");
 	await serve({
@@ -325,7 +358,10 @@ test("a cold web container records its configuration without stopping", async ()
 	const CapWeb = await loadWebContainerContract();
 	const fixture = webConfigurationFixture();
 	await new CapWeb(fixture.ctx, fixture.env).fetch(
-		new Request("https://cap.example"),
+		await webConfigurationRequest(
+			new Request("https://cap.example"),
+			fixture.env,
+		),
 	);
 	assert.equal(fixture.calls.stops, 0);
 	assert.equal(fixture.calls.starts, 1);
@@ -347,7 +383,10 @@ test(
 			acknowledged();
 		};
 		const request = new CapWeb(fixture.ctx, fixture.env).fetch(
-			new Request("https://cap.example"),
+			await webConfigurationRequest(
+				new Request("https://cap.example"),
+				fixture.env,
+			),
 		);
 		await stopped;
 		await new Promise((resolve) => setImmediate(resolve));
@@ -376,15 +415,13 @@ test("a failed web refresh never persists acceptance or forwards to the stale pr
 		fixture.calls.stops++;
 		throw new Error("Synthetic stop failure");
 	};
+	const request = await webConfigurationRequest(
+		new Request("https://cap.example"),
+		fixture.env,
+	);
 	const app = new CapWeb(fixture.ctx, fixture.env);
-	await assert.rejects(
-		app.fetch(new Request("https://cap.example")),
-		/Synthetic stop failure/,
-	);
-	await assert.rejects(
-		app.fetch(new Request("https://cap.example")),
-		/Synthetic stop failure/,
-	);
+	await assert.rejects(app.fetch(request), /Synthetic stop failure/);
+	await assert.rejects(app.fetch(request), /Synthetic stop failure/);
 	assert.equal(fixture.storage.size, 0);
 	assert.deepEqual(fixture.calls, {
 		stops: 1,
@@ -419,6 +456,7 @@ export default runtime;`,
 			compatibilityFlags: ["nodejs_compat"],
 			durableObjects: { CAP_WEB: { className: "PreviewWeb", useSQLite: true } },
 			bindings: {
+				...webConfigurationFixture().env,
 				CAP_RUNTIME_READY: "false",
 				...(configuredKey === undefined
 					? {}
@@ -474,4 +512,165 @@ export default runtime;`,
 			await mf.dispose();
 		}
 	}
+});
+
+test("new edge configuration rejects an old DO and overrides forged caller fingerprints", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	const oldApp = new CapWeb(fixture.ctx, fixture.env);
+	await oldApp.fetch(
+		await webConfigurationRequest(
+			new Request("https://cap.example/login"),
+			fixture.env,
+		),
+	);
+	fixture.calls.forwards = 0;
+	const newEnv = {
+		...fixture.env,
+		CAP_RUNTIME_READY: "true",
+		CAP_WEB_ENV: JSON.stringify({
+			...JSON.parse(fixture.env.CAP_WEB_ENV),
+			NEXTAUTH_SECRET: "rotated-synthetic-auth-secret",
+		}),
+	};
+	const request = new Request("https://cap.example/api/auth/signin", {
+		headers: {
+			[WEB_CONFIGURATION_HEADER]: await webConfigurationFingerprint(
+				fixture.env,
+			),
+		},
+	});
+	const staleResponse = await runtime.fetch(request, {
+		...newEnv,
+		CAP_WEB: { fetch: (request) => oldApp.fetch(request) },
+	});
+	assert.equal(staleResponse.status, 503);
+	assert.equal(staleResponse.headers.get("Cache-Control"), "no-store");
+	assert.equal(fixture.calls.forwards, 0);
+	let forwarded;
+	fixture.ctx.forward = (request) => {
+		fixture.calls.forwards++;
+		forwarded = request;
+	};
+	const newApp = new CapWeb(fixture.ctx, newEnv);
+	const ready = await runtime.fetch(request, {
+		...newEnv,
+		CAP_WEB: { fetch: (request) => newApp.fetch(request) },
+	});
+	assert.equal(ready.status, 200);
+	assert.equal(fixture.calls.stops, 1);
+	assert.equal(fixture.calls.forwards, 1);
+	assert.equal(forwarded.headers.get(WEB_CONFIGURATION_HEADER), null);
+});
+
+test("a missing internal fingerprint never reaches the Node process", async () => {
+	const CapWeb = await loadWebContainerContract();
+	const fixture = webConfigurationFixture();
+	const response = await new CapWeb(fixture.ctx, fixture.env).fetch(
+		new Request("http://cap.web/login"),
+	);
+	assert.equal(response.status, 503);
+	assert.equal(fixture.calls.forwards, 0);
+	assert.equal(fixture.calls.starts, 0);
+});
+
+test("private media callbacks attach current configuration and strip the fence before Node", async () => {
+	const { CapWeb, CapMedia } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	let forwarded;
+	fixture.ctx.forward = (request) => {
+		forwarded = request;
+	};
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	const env = {
+		...fixture.env,
+		CAP_WEB: { fetch: (request) => app.fetch(request) },
+	};
+	const response = await CapMedia.outboundByHost["cap.web"](
+		new Request("http://cap.web/api/webhooks/media-server/progress", {
+			method: "POST",
+			headers: {
+				"x-media-server-secret": "existing-pending-job-secret",
+				[WEB_CONFIGURATION_HEADER]: "stale-caller-value",
+			},
+			body: "{}",
+		}),
+		env,
+	);
+	assert.equal(response.status, 200);
+	assert.equal(forwarded.headers.get(WEB_CONFIGURATION_HEADER), null);
+	assert.equal(
+		forwarded.headers.get("x-media-server-secret"),
+		"existing-pending-job-secret",
+	);
+	assert.equal(await forwarded.text(), "{}");
+});
+
+test("workflow and maintenance queue deliveries use the same fence without losing credentials", async () => {
+	const { CapWeb, default: runtime } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	fixture.env.CAP_WEB_ENV = JSON.stringify({
+		...JSON.parse(fixture.env.CAP_WEB_ENV),
+		CRON_SECRET: "synthetic-cron-secret",
+	});
+	const forwarded = [];
+	fixture.ctx.forward = (request) => forwarded.push(request);
+	const app = new CapWeb(fixture.ctx, fixture.env);
+	const env = {
+		...fixture.env,
+		CAP_MAINTENANCE_ENABLED: "true",
+		CAP_WEB: { fetch: (request) => app.fetch(request) },
+		CAP_WORKFLOW: {
+			getByName: () => ({
+				fetch: async () =>
+					Response.json({
+						value: encode({
+							queueName: "_wkf_step_test",
+							runId: "synthetic-run",
+						}),
+					}),
+			}),
+		},
+	};
+	let acknowledgements = 0;
+	let retries = 0;
+	const message = (body) => ({
+		body,
+		attempts: 1,
+		ack: () => acknowledgements++,
+		retry: () => retries++,
+	});
+	await runtime.queue(
+		{
+			messages: [
+				message({ messageId: "delivery" }),
+				message({
+					kind: "maintenance",
+					scheduledTime: Date.parse("2026-10-27T12:00:00Z"),
+				}),
+			],
+		},
+		env,
+	);
+	assert.equal(acknowledgements, 2);
+	assert.equal(retries, 0);
+	assert.equal(forwarded.length, 3);
+	assert(
+		forwarded.every(
+			(request) => request.headers.get(WEB_CONFIGURATION_HEADER) === null,
+		),
+	);
+	assert.equal(
+		new URL(forwarded[0].url).pathname,
+		"/.well-known/workflow/v1/step",
+	);
+	assert(
+		forwarded
+			.slice(1)
+			.every(
+				(request) =>
+					request.headers.get("authorization") ===
+					"Bearer synthetic-cron-secret",
+			),
+	);
 });

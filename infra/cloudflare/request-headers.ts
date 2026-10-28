@@ -1,5 +1,21 @@
 export function applicationHeaders(request: Request, geography?: unknown) {
 	const headers = new Headers(request.headers);
+	const clientIp = headers.get("cf-connecting-ip");
+	for (const name of [
+		"forwarded",
+		"x-forwarded-for",
+		"x-real-ip",
+		"x-client-ip",
+		"true-client-ip",
+		"x-vercel-forwarded-for",
+	])
+		headers.delete(name);
+	if (clientIp && clientIp.length <= 64 && /^[0-9a-f:.]+$/i.test(clientIp)) {
+		headers.set("x-forwarded-for", clientIp);
+		headers.set("x-real-ip", clientIp);
+	} else {
+		headers.delete("cf-connecting-ip");
+	}
 	for (const key of [...headers.keys()]) {
 		if (key === "x-cap-preview-key" || key.startsWith("x-cap-geo-"))
 			headers.delete(key);

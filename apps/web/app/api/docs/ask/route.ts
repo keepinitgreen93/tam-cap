@@ -2,6 +2,7 @@ import { streamText } from "ai";
 import type { NextRequest } from "next/server";
 import { isAiConfigured } from "@/lib/ai/provider";
 import { runWithAiProviders } from "@/lib/ai/run";
+import { getCloudflareComputeDenial } from "@/lib/cloudflare-compute-access";
 import { buildDocsAskContext, buildDocsAskSystemPrompt } from "@/lib/docs-ask";
 import { isRateLimited, RATE_LIMIT_IDS } from "@/lib/rate-limit";
 import { getAllDocs } from "@/utils/docs";
@@ -11,6 +12,7 @@ export const dynamic = "force-dynamic";
 const MAX_QUESTION_LENGTH = 500;
 const MAX_HISTORY_TURNS = 6;
 const MAX_HISTORY_CONTENT_LENGTH = 4000;
+const MAX_REQUEST_BYTES = 65_536;
 const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_MAX_REQUESTS = 10;
 
@@ -44,16 +46,48 @@ interface HistoryTurn {
 
 function parseHistory(value: unknown): HistoryTurn[] {
 	if (!Array.isArray(value)) return [];
-	return value
-		.flatMap((entry): HistoryTurn[] => {
-			if (!entry || typeof entry !== "object") return [];
-			const role = (entry as { role?: unknown }).role;
-			const content = (entry as { content?: unknown }).content;
-			if (role !== "user" && role !== "assistant") return [];
-			if (typeof content !== "string" || !content.trim()) return [];
-			return [{ role, content: content.slice(0, MAX_HISTORY_CONTENT_LENGTH) }];
-		})
-		.slice(-MAX_HISTORY_TURNS * 2);
+	return value.slice(-MAX_HISTORY_TURNS * 2).flatMap((entry): HistoryTurn[] => {
+		if (!entry || typeof entry !== "object") return [];
+		const role = (entry as { role?: unknown }).role;
+		const content = (entry as { content?: unknown }).content;
+		if (role !== "user" && role !== "assistant") return [];
+		if (typeof content !== "string" || !content.trim()) return [];
+		return [{ role, content: content.slice(0, MAX_HISTORY_CONTENT_LENGTH) }];
+	});
+}
+
+async function readPayload(request: NextRequest) {
+	const reader = request.body?.getReader();
+	if (!reader) return { status: 400 as const };
+	const chunks: Uint8Array[] = [];
+	let size = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			size += value.byteLength;
+			if (size > MAX_REQUEST_BYTES) {
+				await reader.cancel();
+				return { status: 413 as const };
+			}
+			chunks.push(value);
+		}
+		const bytes = new Uint8Array(size);
+		let offset = 0;
+		for (const chunk of chunks) {
+			bytes.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		return {
+			payload: JSON.parse(
+				new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+			) as unknown,
+		};
+	} catch {
+		return { status: 400 as const };
+	} finally {
+		reader.releaseLock();
+	}
 }
 
 function toStreamError(error: unknown): Error {
@@ -61,6 +95,8 @@ function toStreamError(error: unknown): Error {
 }
 
 export async function POST(request: NextRequest) {
+	const denial = await getCloudflareComputeDenial(request);
+	if (denial) return denial;
 	if (!isAiConfigured("chat-streaming")) {
 		return Response.json(
 			{ error: "Ask AI is not available right now. Try searching instead." },
@@ -68,12 +104,16 @@ export async function POST(request: NextRequest) {
 		);
 	}
 
-	let payload: unknown;
-	try {
-		payload = await request.json();
-	} catch {
-		return Response.json({ error: "Invalid request." }, { status: 400 });
+	const input = await readPayload(request);
+	if ("status" in input) {
+		return Response.json(
+			{
+				error: input.status === 413 ? "Request too large." : "Invalid request.",
+			},
+			{ status: input.status },
+		);
 	}
+	const payload = input.payload;
 
 	const question =
 		payload && typeof payload === "object"

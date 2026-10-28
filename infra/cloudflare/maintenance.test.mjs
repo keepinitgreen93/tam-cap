@@ -91,7 +91,13 @@ test("scheduled maintenance uses durable queue delivery and retries failed jobs"
 	let calls = 0;
 	const env = {
 		CAP_MAINTENANCE_ENABLED: "false",
-		CAP_WEB_ENV: JSON.stringify({ CRON_SECRET: "test" }),
+		CAP_WEB_ENV: JSON.stringify({
+			CRON_SECRET: "test",
+			WEB_URL: "https://cap.example",
+			NEXTAUTH_URL: "https://cap.example",
+			NEXTAUTH_SECRET: "synthetic-auth-secret",
+		}),
+		MEDIA_SERVER_WEBHOOK_SECRET: "synthetic-media-secret",
 		WORKFLOW_QUEUE: { send: async (message) => enqueued.push(message) },
 		CAP_WEB: {
 			fetch: async () => {

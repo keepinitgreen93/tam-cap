@@ -1324,6 +1324,7 @@ export const ShareHeader = ({
 											<VideoDownloadMenu
 												videoId={data.id}
 												hasEdits
+												allowOriginal={false}
 												triggerLabel="Download"
 												triggerClassName={clsx(
 													ACTION_BAR_BUTTON_CLASS,

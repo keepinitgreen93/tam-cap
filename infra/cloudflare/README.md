@@ -71,3 +71,7 @@ Accepted deliveries and delayed retries are persisted before acknowledgement. An
 After twenty failed queue attempts the message remains in the failed queue; monitor and redrive that queue after resolving the cause. Do not purge it during deployment or rollback. Retain the workflow Durable Object namespace and its storage across releases. A deployment change still requires validating that pending workflows can execute against the new code; no automatic version-pinned routing has been claimed.
 
 Local tests cover native Durable Object persistence across restarts, hook-token races, nested rollback, stream pagination, duplicate delivery, stale lease rejection, ambiguous completion, and the installed SDK. They do not substitute for interrupting real media work and checking output ownership, live container networking, or the full recording/import/edit acceptance flow. D1 caller migration, private R2 application integration, live callbacks, and those end-to-end checks remain release gates.
+
+## Configuration and authentication rotation
+
+See [Runtime configuration refresh and session rotation](configuration-refresh.md) before changing `CAP_WEB_ENV`, a pinned image or the NextAuth secret. Worker deployment success does not prove that the running Node or media container has adopted those values. The internal configuration fingerprint fences new Worker requests from stale web configurations across public, workflow, maintenance and callback paths.

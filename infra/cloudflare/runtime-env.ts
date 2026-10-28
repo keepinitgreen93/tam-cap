@@ -36,3 +36,40 @@ export function webEnvironment(serialized: string, mediaSecret: string) {
 		MEDIA_SERVER_WEBHOOK_SECRET: mediaSecret,
 	};
 }
+export interface WebConfigurationEnvironment {
+	CAP_WEB_ENV: string;
+	MEDIA_SERVER_WEBHOOK_SECRET: string;
+	CAP_WEB_IMAGE_REVISION?: string;
+	CAP_DEPLOYMENT_ID?: string;
+}
+
+export const WEB_CONFIGURATION_HEADER = "x-cap-runtime-web-config";
+
+export async function webConfigurationFingerprint(
+	env: WebConfigurationEnvironment,
+) {
+	const serialized = JSON.stringify({
+		version: 2,
+		envVars: Object.entries(
+			webEnvironment(env.CAP_WEB_ENV, env.MEDIA_SERVER_WEBHOOK_SECRET),
+		).sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0)),
+		imageRevision: env.CAP_WEB_IMAGE_REVISION ?? "",
+		deploymentId: env.CAP_DEPLOYMENT_ID,
+	});
+	const digest = await crypto.subtle.digest(
+		"SHA-256",
+		new TextEncoder().encode(serialized),
+	);
+	return Array.from(new Uint8Array(digest), (value) =>
+		value.toString(16).padStart(2, "0"),
+	).join("");
+}
+
+export async function webConfigurationRequest(
+	request: Request,
+	env: WebConfigurationEnvironment,
+) {
+	const headers = new Headers(request.headers);
+	headers.set(WEB_CONFIGURATION_HEADER, await webConfigurationFingerprint(env));
+	return new Request(request, { headers });
+}

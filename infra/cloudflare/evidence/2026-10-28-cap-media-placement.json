@@ -1,0 +1,161 @@
+{
+	"collectedAt": "2026-10-28T00:47:06.689Z",
+	"queryWindow": {
+		"from": "2026-10-28T00:00:00Z",
+		"to": "2026-10-28T00:45:00Z"
+	},
+	"service": "CapMedia",
+	"applicationId": "9e8f5a65-c90a-4677-b07e-25f272fff5f4",
+	"source": "Cloudflare GraphQL containersMetricsAdaptiveGroups filtered exclusively to this application",
+	"fieldMeaning": {
+		"containerUptime": "Maximum container uptime, in milliseconds",
+		"placementId": "The placement ID",
+		"deploymentId": "The deployment ID; observed here equal to durableObjectId and instanceId across both placements"
+	},
+	"rows": [
+		{
+			"samples": 8,
+			"datetimeMinute": "2026-10-28T00:02:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "195fb7cf-f255-411e-91ba-f080861b0a2a",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 9,
+			"datetimeMinute": "2026-10-28T00:03:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "195fb7cf-f255-411e-91ba-f080861b0a2a",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 9,
+			"datetimeMinute": "2026-10-28T00:04:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "195fb7cf-f255-411e-91ba-f080861b0a2a",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 16,
+			"datetimeMinute": "2026-10-28T00:05:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "195fb7cf-f255-411e-91ba-f080861b0a2a",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 9,
+			"datetimeMinute": "2026-10-28T00:06:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "195fb7cf-f255-411e-91ba-f080861b0a2a",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 4,
+			"datetimeMinute": "2026-10-28T00:07:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "195fb7cf-f255-411e-91ba-f080861b0a2a",
+			"maximumUptimeMs": 302705
+		},
+		{
+			"samples": 1,
+			"datetimeMinute": "2026-10-28T00:31:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 6,
+			"datetimeMinute": "2026-10-28T00:32:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 8,
+			"datetimeMinute": "2026-10-28T00:33:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 12,
+			"datetimeMinute": "2026-10-28T00:34:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 8,
+			"datetimeMinute": "2026-10-28T00:35:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 6,
+			"datetimeMinute": "2026-10-28T00:36:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 2,
+			"datetimeMinute": "2026-10-28T00:37:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 3,
+			"datetimeMinute": "2026-10-28T00:38:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 0
+		},
+		{
+			"samples": 6,
+			"datetimeMinute": "2026-10-28T00:39:00Z",
+			"deploymentId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"durableObjectId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"instanceId": "e8c3fec43463d1fa0523124077e07aaa611d7a1e1bff5ad24b3162439c486e65",
+			"placementId": "094e9541-90eb-413d-81be-e6aadfd219fc",
+			"maximumUptimeMs": 453108
+		}
+	],
+	"activeValuesObserved": [1],
+	"findings": [
+		"A different placement first appears in the 00:31 UTC minute, after the earlier placement's last observed 00:07 minute.",
+		"Old placement maximum reported uptime is 302705ms; new placement maximum is 453108ms.",
+		"No metric rows appear in the 00:08 through 00:30 minute buckets in this filtered query.",
+		"This supports a separate runtime lifetime at the retry, rather than continuous execution in the earlier placement.",
+		"The dataset has no image or digest field. Its deploymentId is the same DO identifier for both placements, so this does not identify a named image digest.",
+		"Active is1 in every observed row; exact stop time is not independently reported here."
+	]
+}
