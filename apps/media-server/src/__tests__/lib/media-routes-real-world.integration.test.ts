@@ -28,6 +28,10 @@ import * as recordingVerification from "../../lib/recording-verification";
 const FIXTURES_DIR = join(import.meta.dir, "..", "fixtures");
 const TEST_VIDEO_WITH_AUDIO = join(FIXTURES_DIR, "test-with-audio.mp4");
 const TEST_VIDEO_NO_AUDIO = join(FIXTURES_DIR, "test-no-audio.mp4");
+const TEST_BROWSER_CAPTURE = join(
+	FIXTURES_DIR,
+	"browser-capture-duration.webm",
+);
 const MEDIA_SERVER_SECRET = "test-secret";
 const AUTH_HEADERS = {
 	"Content-Type": "application/json",
@@ -47,6 +51,7 @@ const uploadGates = new Map<string, () => Promise<void> | void>();
 const uploadRequests: string[] = [];
 const fixtureReads: string[] = [];
 const webhookPhases: JobProgress["phase"][] = [];
+const webhookPayloads: JobProgress[] = [];
 const recordingSources = new Map<string, Uint8Array>();
 const sourceReads: {
 	path: string;
@@ -285,6 +290,7 @@ beforeAll(async () => {
 			if (request.method === "POST" && url.pathname === "/ignored-webhook") {
 				const payload = (await request.json()) as JobProgress;
 				webhookPhases.push(payload.phase);
+				webhookPayloads.push(payload);
 				if (!payload.recordingWorker)
 					return new Response(null, { status: 200 });
 				if (
@@ -384,15 +390,17 @@ beforeAll(async () => {
 					return new Response("Unavailable", { status: 503 });
 				}
 				const fixturePath =
-					url.pathname === "/fixtures/test-no-audio.mp4"
-						? TEST_VIDEO_NO_AUDIO
-						: url.pathname === "/fixtures/transient-no-audio.mp4"
+					url.pathname === "/fixtures/browser-capture-duration.webm"
+						? TEST_BROWSER_CAPTURE
+						: url.pathname === "/fixtures/test-no-audio.mp4"
 							? TEST_VIDEO_NO_AUDIO
-							: url.pathname === "/fixtures/test-with-audio.mp4"
-								? TEST_VIDEO_WITH_AUDIO
-								: url.pathname === "/fixtures/chrome.webm"
-									? join(tempDir, "chrome.webm")
-									: null;
+							: url.pathname === "/fixtures/transient-no-audio.mp4"
+								? TEST_VIDEO_NO_AUDIO
+								: url.pathname === "/fixtures/test-with-audio.mp4"
+									? TEST_VIDEO_WITH_AUDIO
+									: url.pathname === "/fixtures/chrome.webm"
+										? join(tempDir, "chrome.webm")
+										: null;
 
 				if (fixturePath) {
 					if (request.method === "GET") fixtureReads.push(url.pathname);
@@ -496,6 +504,7 @@ beforeEach(() => {
 	uploadRequests.length = 0;
 	fixtureReads.length = 0;
 	webhookPhases.length = 0;
+	webhookPayloads.length = 0;
 	transientFixtureFailures = 0;
 	permanentFixtureFailures = 0;
 	slowFixtureCancellations = 0;
@@ -1264,6 +1273,79 @@ describe("media routes real-world integration tests", () => {
 		expect(metadata.audioCodec).toBe("aac");
 		expect(metadata.duration).toBeGreaterThan(0);
 	}, 60000);
+
+	test("publishes rendered output metadata for the real browser duration regression", async () => {
+		const input = await probeVideoFile(TEST_BROWSER_CAPTURE);
+		expect(input.duration).toBeCloseTo(19.198, 3);
+		const thumbnail = spyOn(mediaVideo, "generateThumbnail");
+		const preview = spyOn(mediaVideo, "generatePreviewGif");
+		const enhance = spyOn(
+			audioLevels,
+			"enhanceLocalRecording",
+		).mockResolvedValue({
+			status: "unchanged",
+			reason: "duration-observation",
+		});
+		const response = await app.fetch(
+			mediaPostRequest("/video/process", {
+				videoId: "browser-duration-regression",
+				userId: "real-process-user",
+				videoUrl: fixtureUrl("browser-capture-duration.webm"),
+				inputExtension: ".webm",
+				outputPresignedUrl: uploadUrl("browser-duration.mp4"),
+				thumbnailPresignedUrl: uploadUrl("browser-duration.jpg"),
+				previewGifPresignedUrl: uploadUrl("browser-duration.gif"),
+				webhookUrl: `${baseUrl}/ignored-webhook`,
+				webhookSecret: MEDIA_SERVER_SECRET,
+				audioLevels: true,
+				maxWidth: 160,
+				maxHeight: 120,
+				crf: 30,
+				preset: "ultrafast",
+			}),
+		);
+		expect(response.status).toBe(200);
+		const { jobId } = (await response.json()) as { jobId: string };
+		try {
+			const job = await waitForTerminalJob(jobId);
+			expect(job.phase).toBe("complete");
+			expect(job.error).toBeUndefined();
+			const bytes = uploadedBytes("/uploads/browser-duration.mp4");
+			const rendered = await probeBytesAsMp4(bytes, "browser-duration.mp4");
+			expect(rendered.duration).toBeCloseTo(19.255814, 3);
+			expect(rendered.duration).toBeGreaterThan(input.duration + 0.04);
+			expect(rendered.videoCodec).toBe("h264");
+			expect(rendered.audioCodec).toBe("aac");
+			expect(rendered.fps).toBeCloseTo(25.08, 2);
+			expect(job.metadata).toEqual(rendered);
+			expect(rendered.fileSize).toBe(bytes.byteLength);
+			for (
+				let attempt = 0;
+				attempt < 100 &&
+				!webhookPayloads.some(
+					(payload) => payload.jobId === jobId && payload.phase === "complete",
+				);
+				attempt++
+			)
+				await Bun.sleep(20);
+			expect(
+				webhookPayloads.findLast(
+					(payload) => payload.jobId === jobId && payload.phase === "complete",
+				)?.metadata,
+			).toEqual(rendered);
+			expect(thumbnail.mock.calls[0]?.[1]).toBe(rendered.duration);
+			expect(preview.mock.calls[0]?.[1]).toBe(rendered.duration);
+			for (
+				let attempt = 0;
+				attempt < 100 && enhance.mock.calls.length === 0;
+				attempt++
+			)
+				await Bun.sleep(20);
+			expect(enhance.mock.calls[0]?.[0].duration).toBe(rendered.duration);
+		} finally {
+			deleteJob(jobId);
+		}
+	}, 90000);
 
 	test("processes and uploads a real video job through the async route", async () => {
 		const response = await app.fetch(

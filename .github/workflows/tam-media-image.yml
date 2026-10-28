@@ -1,0 +1,72 @@
+name: TAM Cap Cloudflare media image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [codex/cloudflare-self-host]
+    paths: [.github/workflows/tam-media-image.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tam-cap-media-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/codex/cloudflare-self-host'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      REGISTRY_NAMESPACE: registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: docker/setup-buildx-action@v3
+      - name: Build media only
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          MEDIA_IMAGE_TAG="$REGISTRY_NAMESPACE/tam-cap-media:sha-$GITHUB_SHA-media"
+          printf 'MEDIA_IMAGE_TAG=%s\n' "$MEDIA_IMAGE_TAG" >> "$GITHUB_ENV"
+          docker buildx build --platform linux/amd64 --provenance=false --load --file Dockerfile.cloudflare --target media --tag "$MEDIA_IMAGE_TAG" .
+      - name: Push media and record immutable reference
+        shell: bash
+        env:
+          TAM_CAP_REGISTRY_USERNAME: ${{ secrets.TAM_CAP_REGISTRY_USERNAME }}
+          TAM_CAP_REGISTRY_PASSWORD: ${{ secrets.TAM_CAP_REGISTRY_PASSWORD }}
+          DOCKER_CONFIG: ${{ runner.temp }}/tam-cap-media-registry-auth
+        run: |
+          set -euo pipefail
+          [[ -n "$TAM_CAP_REGISTRY_USERNAME" && -n "$TAM_CAP_REGISTRY_PASSWORD" ]]
+          mkdir -p "$DOCKER_CONFIG"
+          trap 'docker logout registry.cloudflare.com >/dev/null 2>&1 || true; rm -f "$DOCKER_CONFIG/config.json"' EXIT
+          printf '%s' "$TAM_CAP_REGISTRY_PASSWORD" | docker login registry.cloudflare.com --username "$TAM_CAP_REGISTRY_USERNAME" --password-stdin
+          docker push "$MEDIA_IMAGE_TAG"
+          docker image inspect --format '{{json .RepoDigests}}' "$MEDIA_IMAGE_TAG" > "$RUNNER_TEMP/tam-cap-media-digests.json"
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import path from "node:path";
+          const namespace = process.env.REGISTRY_NAMESPACE;
+          const sourceRevision = process.env.GITHUB_SHA;
+          if (namespace !== "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94" || !/^[0-9a-f]{40}$/.test(sourceRevision ?? "")) throw new Error("Invalid registry namespace or source revision");
+          const values = JSON.parse(readFileSync(path.join(process.env.RUNNER_TEMP, "tam-cap-media-digests.json"), "utf8"));
+          if (!Array.isArray(values)) throw new Error("Invalid image digest list");
+          const prefix = `${namespace}/tam-cap-media@sha256:`;
+          const matches = values.filter((value) => typeof value === "string" && value.startsWith(prefix) && /^[0-9a-f]{64}$/.test(value.slice(prefix.length)));
+          if (matches.length !== 1) throw new Error("Expected one immutable media digest");
+          writeFileSync("media-image-manifest.json", `${JSON.stringify({ mediaImage: matches[0], sourceRevision }, null, 2)}\n`);
+          NODE
+      - name: Upload media manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: tam-cap-media-image-manifest
+          path: media-image-manifest.json
+          if-no-files-found: error
+          retention-days: 7

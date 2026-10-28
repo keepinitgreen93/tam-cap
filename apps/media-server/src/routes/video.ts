@@ -1722,12 +1722,15 @@ async function processVideoAsync(
 		outputTempFile = processed.outputFile;
 		lastResortRepairFile = processed.lastResortRepairFile;
 		const outputPath = processed.outputFile.path;
-		updateJob(jobId, { outputTempFile: processed.outputFile });
+		const outputMetadata = await withJobHeartbeat(jobId, () =>
+			probeVideoFile(outputPath),
+		);
+		updateJob(jobId, {
+			outputTempFile: processed.outputFile,
+			metadata: outputMetadata,
+		});
 		if (options.importedOriginal) {
-			const recovered = await withJobHeartbeat(jobId, () =>
-				probeVideoFile(outputPath),
-			);
-			if (!isCompleteRecovery(recovered.duration, metadata.duration))
+			if (!isCompleteRecovery(outputMetadata.duration, metadata.duration))
 				throw new Error(
 					"The imported original could not be fully recovered. The original has been preserved.",
 				);
@@ -1752,10 +1755,20 @@ async function processVideoAsync(
 		const previewAbort = new AbortController();
 		const previewSignal = AbortSignal.any([signal, previewAbort.signal]);
 		const thumbnailRender = thumbnailPresignedUrl
-			? generateThumbnail(outputPath, metadata.duration, {}, previewSignal)
+			? generateThumbnail(
+					outputPath,
+					outputMetadata.duration,
+					{},
+					previewSignal,
+				)
 			: undefined;
 		const previewGifRender = previewGifPresignedUrl
-			? generatePreviewGif(outputPath, metadata.duration, {}, previewSignal)
+			? generatePreviewGif(
+					outputPath,
+					outputMetadata.duration,
+					{},
+					previewSignal,
+				)
 			: undefined;
 		thumbnailRender?.catch(() => {});
 		previewGifRender?.catch(() => {});
@@ -1854,7 +1867,7 @@ async function processVideoAsync(
 					options.processingOutputKey ??
 					`${options.userId}/${options.videoId}/result.mp4`,
 				sourceIdentity: uploadReceipt?.objectIdentity,
-				duration: metadata.duration,
+				duration: outputMetadata.duration,
 				webhookUrl: options.webhookUrl,
 				webhookSecret: options.webhookSecret,
 			});
