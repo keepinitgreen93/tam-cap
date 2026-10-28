@@ -57,6 +57,10 @@ These are demand scenarios, not a projection of the seven-day query window. The 
 
 The web process already peaked above 1 GiB in these tests, so the 1 GiB basic instance is not established as a safe replacement. The media sample also does not establish memory needs for long/high-resolution jobs. No instance settings changed. AI inference totals cannot be attributed to Cap from application-filtered container metrics; no account-wide invoice or other customer financial data was queried.
 
+### Sign-in responsiveness
+
+A production probe on 2026-10-28 waited135 seconds before loading login: the first response took10.726 seconds and the next156 milliseconds. This is the cost of waking the sleeping web service, separate from email delivery. The repaired desktop sign-in polls only while an explicit sign-in is pending, at three-second intervals for at most ten minutes, so the service stays responsive during that flow. It stops on success, cancellation or expiry. The two-minute idle policy is retained; no always-on hosting commitment was added.
+
 ## Controls and review
 
 One media job runs at a time; containers scale to zero. Private storage and immutable job outputs prevent retries from overwriting source material. Avoid frequent external uptime checks against application pages, which wake the web container. Keep old originals until edited exports and backups are verified.

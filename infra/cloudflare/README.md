@@ -1,6 +1,6 @@
 # TAM Cap Cloudflare infrastructure
 
-This directory contains the platform foundation and the application runtime for the Cap fork. The application is live at https://videos.trulyauthenticmarketing.com with production readiness and maintenance enabled. The separate platform health endpoint returns `applicationReady: false`; it is an infrastructure probe, not the application status. Current component digests are pinned in `releases/production-b117f8d0b96fb1fa04793f7e8fa26c93a76a28e7.json`; `EXECUTION_LEDGER.md` records acceptance and its qualifications.
+This directory contains the platform foundation and the application runtime for the Cap fork. The application is live at https://videos.trulyauthenticmarketing.com with production readiness and maintenance enabled. The separate platform health endpoint returns `applicationReady: false`; it is an infrastructure probe, not the application status. Current component digests are pinned in `releases/production-99d08e5191d24054d04ab603e24e01fdcf3f5267.json`; `EXECUTION_LEDGER.md` records acceptance and its qualifications.
 
 ## Start using Cap
 
@@ -8,6 +8,8 @@ This directory contains the platform foundation and the application runtime for 
 2. Record in the browser at `/dashboard/caps/record`. After processing, open Edit to review transcript-based filler removal and selected quiet cuts, then save and share the resulting link. Original downloads remain available to the owner.
 3. Optional clients are at `/download`: Windows x64, Apple Silicon macOS and a manually installed Chrome extension. The browser recorder requires no installation or local Docker. Desktop builds are unsigned/ad hoc signed, with manual updates and local operating-system permission setup; see `distribution/README.md`.
 4. The first ordinary-member invitation is delivered and awaiting the recipient's acceptance. Invite additional teammates from organization settings when needed.
+
+On a recording, use **Manage Cap → Edit video**. The transcript panel includes **Remove fillers** when fillers are detected, otherwise an explicit message. **Silence cleanup → Find quiet ranges** suggests cuts; review/listen and select them before removing, then choose **Done** to render. Nothing is cut automatically. The panel moves below the player in a narrow window. The integrations page distinguishes the configured default Cloudflare R2 storage from optional organization storage; Google Drive needs a configured Google OAuth app before Connect is available.
 
 Existing Loom videos remain in Loom until the separately deferred migration. Costs are usage-based with a roughly $20 monthly target, not a hard cap; see `COSTS.md`.
 

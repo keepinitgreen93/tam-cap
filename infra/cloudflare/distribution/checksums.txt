@@ -1,3 +1,3 @@
-e8d7abfa166bedd11e524d20b74cfc8aef7a21fc3ce1d009fe753f4d1a1a4849  TAMCap-Windows-x64-setup.exe
-cd427f3c53791cf681e8990facd38ceb0186dff7f9805933c58a4b99c0481cd5  TAMCap-macOS-arm64.dmg
+c886e5fd18b53b227bebe475d2529a76b17610c627f59613bd334c017f41405c  TAMCap-Windows-x64-setup.exe
+4756af0fc2fbfedbde299c50ee1ff70b116ec74844e861a4ff9a98511b940955  TAMCap-macOS-arm64.dmg
 3d5374db2ed5a03daaee803a69d5a3cccb7851e053537a946b03f3b1a8d804e8  TAMCap-Chrome.zip

@@ -871,3 +871,11 @@ Inventory snapshot: 2026-10-28T02:48:05+00:00; 731 unique implementation/operati
 - `scripts/loops/database.test.ts` (M), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `scripts/tam-desktop-config.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
 - `scripts/verify/zod-collection-bounds.test.mjs` (A), Regression or integration coverage for the Cloudflare port/client lifecycle.
+
+## Focused follow-up repair evidence
+
+The coordinator verified the2026-10-28 follow-up release after scoped implementation checks. Settings now display the instance domain and default R2 accurately; missing S3 inputs return a readable message. Google Drive OAuth remains unconfigured and is explicitly shown as unavailable until setup, rather than causing a masked server-action exception.
+
+The replacement desktop handoff stays on the instance HTTPS domain and returns the reusable key only to a verifier-bearing client over HTTPS. The production approval/exchange/plan request passed, replay failed, and the temporary test key was revoked. Native Windows/macOS builds and package probes passed; Windows was installed and re-probed locally. This does not claim automated GUI authentication or hardware capture after the upgrade.
+
+A real owner desktop recording was made editable through the existing completed-manifest recovery. Duplicate signed thumbnail headers were fixed in the client. The first real silence scan exposed a50.042ms AAC/container tail discrepancy; bounded media and client fixes passed focused regressions. Production now shows the suggested0.6-second quiet range with no cut selected and Undo disabled. No user content was edited. Final component provenance is in `infra/cloudflare/releases/99d08e5-component-provenance.json`; Worker version84326a09-4199-42a2-aa60-46c503b55d9c. These coordinator checks supplement, rather than rewrite, the earlier independent review and its human-member/device qualifications.
