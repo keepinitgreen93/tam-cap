@@ -72,6 +72,7 @@ export default async function EditVideoPage(props: {
 			ownerId: video.ownerId,
 			videoId,
 			rawFileKey: video.rawFileKey,
+			metadata: video.metadata,
 		})
 	) {
 		return (

@@ -1,12 +1,18 @@
 import { randomUUID } from "node:crypto";
 import type { CloudflareDatabase } from "@cap/database/cloudflare";
 import { atomic } from "@cap/database/cloudflare/atomic";
-import { videos, videoUploads } from "@cap/database/cloudflare/schema";
+import { getVideoEditingBase } from "@cap/database/cloudflare/editing-base";
+import {
+	videoEdits,
+	videos,
+	videoUploads,
+} from "@cap/database/cloudflare/schema";
 import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
 import type { VideoProcessingRun } from "@cap/database/types";
 import { requireWritableVideo } from "@cap/web-backend/src/Videos/persistence";
-import { User, type Video } from "@cap/web-domain";
+import { User, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { isVideoStorageKey } from "./video-storage-key";
 
 export type ProcessingVideo = typeof videos.$inferSelect;
@@ -19,7 +25,7 @@ export type ProcessingClaim = {
 export class ProcessingRunSupersededError extends Error {
 	constructor() {
 		super("Video processing run was superseded");
-this.name = "ProcessingRunSupersededError";
+		this.name = "ProcessingRunSupersededError";
 	}
 }
 
@@ -51,6 +57,9 @@ export function matchesProcessingRun(
 			run.organizationId === video.orgId &&
 			run.bucketId === video.bucket &&
 			run.storageIntegrationId === video.storageIntegrationId &&
+			(run.state === "complete" ||
+				run.editingBaseId === undefined ||
+				run.editingBaseId === (getVideoEditingBase(video)?.id ?? null)) &&
 			(run.source === JSON.stringify(video.source) ||
 				(run.state === "complete" &&
 					"outputKey" in video.source &&
@@ -168,6 +177,7 @@ export async function claimVideoProcessing(
 			bucketId: video.bucket,
 			storageIntegrationId: video.storageIntegrationId,
 			source: JSON.stringify(video.source),
+			editingBaseId: getVideoEditingBase(video)?.id ?? null,
 			rawFileKey: input.rawFileKey,
 			state: "queued",
 			dispatch: "pending",
@@ -340,6 +350,63 @@ export async function applyVideoProcessingProgress(
 		if (!upload || upload.rawFileKey !== run.rawFileKey)
 			return { statements: [], result: false };
 		const complete = input.phase === "complete";
+		const [edit] = complete
+			? await snapshot.read((reader) =>
+					reader
+						.select()
+						.from(videoEdits)
+						.where(eq(videoEdits.videoId, video.id))
+						.limit(1),
+				)
+			: [];
+		const base = complete ? getVideoEditingBase(video) : null;
+		const renderedKey =
+			video.source.type === "webMP4" || video.source.type === "desktopMP4"
+				? (video.source.outputKey ?? `${video.ownerId}/${video.id}/result.mp4`)
+				: null;
+		const preservesEditingTimeline =
+			complete &&
+			!!(base || edit) &&
+			(run.rawFileKey === renderedKey ||
+				run.rawFileKey === Video.getAudioLevelOutputKey(video));
+		const replacesEditingTimeline = complete && !preservesEditingTimeline;
+		const metadata = { ...video.metadata };
+		if (replacesEditingTimeline) {
+			for (const key of [
+				"summary",
+				"chapters",
+				"summaryManuallyEdited",
+				"chaptersManuallyEdited",
+				"aiGenerationRun",
+				"aiGenerationStatus",
+				"enhancedAudioStatus",
+				"transcriptionRun",
+				"editTranscriptBackfill",
+				"liveTranscript",
+				"completedVideoEdit",
+				"editProcessing",
+				"loomReassignClaim",
+				"desktopRecordingUpload",
+				"agentUpload",
+				"loomImportRun",
+				"loomImportUpload",
+				"loomDeferredProcessing",
+				"loomPreviewGif",
+				"transcribeOnView",
+			] as const)
+				delete metadata[key];
+		}
+		if (complete) {
+			delete metadata.transcriptionRun;
+			delete metadata.editTranscriptBackfill;
+			delete metadata.liveTranscript;
+			delete metadata.aiGenerationRun;
+			if (
+				metadata.aiGenerationStatus === "QUEUED" ||
+				metadata.aiGenerationStatus === "PROCESSING"
+			)
+				delete metadata.aiGenerationStatus;
+		}
 		const next: VideoProcessingRun = {
 			...run,
 			state: complete
@@ -360,11 +427,24 @@ export async function applyVideoProcessingProgress(
 					.update(videos)
 					.set({
 						metadata: {
-							...video.metadata,
+							...metadata,
 							processingRun: next,
 							...(complete
 								? {
 										transcriptPublication: invalidation,
+										...(replacesEditingTimeline
+											? {
+													editingBase: {
+														version: 1,
+														id: invalidation.id,
+														sourceKey: run.outputKey,
+														duration:
+															input.metadata && input.metadata.duration > 0
+																? input.metadata.duration
+																: null,
+													},
+												}
+											: {}),
 										editTranscriptBackfill: undefined,
 										liveTranscript: undefined,
 									}
@@ -375,10 +455,13 @@ export async function applyVideoProcessingProgress(
 									transcriptionStatus: null,
 									width: input.metadata.width,
 									height: input.metadata.height,
-									fps: input.metadata.fps,
-									...(input.metadata.duration > 0
-										? { duration: input.metadata.duration }
-										: {}),
+									fps: normalizeVideoFps(input.metadata.fps),
+									duration:
+										input.metadata.duration > 0
+											? input.metadata.duration
+											: preservesEditingTimeline
+												? video.duration
+												: null,
 									source: {
 										type: "webMP4" as const,
 										outputKey: run.outputKey,
@@ -406,6 +489,13 @@ export async function applyVideoProcessingProgress(
 						updatedAt: now,
 					})
 					.where(eq(videoUploads.videoId, video.id)),
+				...(replacesEditingTimeline
+					? [
+							database
+								.delete(videoEdits)
+								.where(eq(videoEdits.videoId, video.id)),
+						]
+					: []),
 			],
 			result: true,
 		};

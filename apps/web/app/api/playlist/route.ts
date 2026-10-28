@@ -1,3 +1,4 @@
+import { atomic } from "@cap/database/cloudflare/atomic";
 import * as Db from "@cap/database/cloudflare/schema";
 import { serverEnv } from "@cap/env";
 import {
@@ -6,7 +7,8 @@ import {
 	Storage,
 	Videos,
 } from "@cap/web-backend";
-import { Video } from "@cap/web-domain";
+import { activeVideo } from "@cap/web-backend/src/Videos/persistence";
+import { CurrentUser, Video } from "@cap/web-domain";
 import {
 	HttpApi,
 	HttpApiBuilder,
@@ -15,7 +17,7 @@ import {
 	HttpApiGroup,
 	HttpServerResponse,
 } from "@effect/platform";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Effect, Layer, Option, Schema } from "effect";
 import {
 	resolveMobileRequestOrigin,
@@ -179,6 +181,64 @@ const getPlaylistResponse = (
 	publicOrigin: string,
 ) =>
 	Effect.gen(function* () {
+		const user = yield* Effect.serviceOption(CurrentUser);
+		const isOwner = Option.isSome(user) && user.value.id === video.ownerId;
+		const segmentRequest = urlParams.videoType.startsWith("segments-");
+		const currentSegments =
+			video.source.type === "desktopSegments" ||
+			(video.source.type === "desktopMP4" &&
+				!video.source.outputKey &&
+				!Option.getOrNull(video.metadata)?.completedVideoEdit &&
+				!Option.getOrNull(video.metadata)?.editingBase);
+		if (
+			!isOwner &&
+			segmentRequest &&
+			currentSegments &&
+			video.source.type === "desktopMP4"
+		) {
+			const database = yield* Database;
+			const stillUnedited = yield* database.use((database) =>
+				atomic(database, async (snapshot) => {
+					const [current] = await snapshot.read((reader) =>
+						reader
+							.select()
+							.from(Db.videos)
+							.where(and(activeVideo, eq(Db.videos.id, video.id)))
+							.limit(1),
+					);
+					const [edit] = await snapshot.read((reader) =>
+						reader
+							.select({ id: Db.videoEdits.videoId })
+							.from(Db.videoEdits)
+							.where(eq(Db.videoEdits.videoId, video.id))
+							.limit(1),
+					);
+					return {
+						statements: [],
+						result:
+							!!current &&
+							current.ownerId === video.ownerId &&
+							current.orgId === video.orgId &&
+							current.bucket === Option.getOrNull(video.bucketId) &&
+							current.storageIntegrationId ===
+								Option.getOrNull(video.storageIntegrationId) &&
+							JSON.stringify(current.source) === JSON.stringify(video.source) &&
+							!current.metadata?.editingBase &&
+							!current.metadata?.completedVideoEdit &&
+							!edit,
+					};
+				}),
+			);
+			if (!stillUnedited) return yield* new HttpApiError.NotFound();
+		}
+		if (
+			!isOwner &&
+			(urlParams.videoType === "raw-preview" ||
+				(segmentRequest && !currentSegments) ||
+				(Option.isSome(urlParams.fileType) &&
+					urlParams.fileType.value === "enhanced-audio"))
+		)
+			return yield* new HttpApiError.NotFound();
 		const [bucket, customBucket] = yield* Storage.getAccessForVideo(video);
 		const source = Video.Video.getSource(video);
 		const isMp4Source = source instanceof Video.Mp4Source;

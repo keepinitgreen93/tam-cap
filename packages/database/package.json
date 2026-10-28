@@ -86,6 +86,7 @@
 		"./cloudflare/organization-delete": "./cloudflare/organization-delete.ts",
 		"./cloudflare/access": "./cloudflare/access.ts",
 		"./cloudflare/transcript-publication": "./cloudflare/transcript-publication.ts",
+		"./cloudflare/editing-base": "./cloudflare/editing-base.ts",
 		"./cloudflare/transcription-state": "./cloudflare/transcription-state.ts",
 		"./cloudflare/ai-generation": "./cloudflare/ai-generation.ts",
 		"./transcript-encryption": "./transcript-encryption.ts",

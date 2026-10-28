@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createCloudflareDb } from "@cap/database/cloudflare";
 import {
 	createD1BridgeBinding,
@@ -32,6 +32,7 @@ import {
 	vi,
 } from "vitest";
 import type { ContentTransferPayload } from "@/lib/content-transfer";
+import { encodeContentTransferPayload } from "@/lib/content-transfer-payload";
 import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
 
 const state = vi.hoisted(() => ({
@@ -492,7 +493,7 @@ async function fixture() {
 		resourceId: orgId,
 		kind: "transfer_org_content",
 		state: "queued",
-		payload,
+		payload: sequence === 1 ? encodeContentTransferPayload(payload) : payload,
 	});
 	state.onCopy = undefined;
 	beforePublication = undefined;
@@ -525,6 +526,48 @@ async function video(f: Awaited<ReturnType<typeof fixture>>) {
 	if (!row) throw Error("Missing video");
 	return row;
 }
+it("transfers the immutable editing base with its existing original timeline", async () => {
+	const f = await fixture();
+	const current = await video(f);
+	const editingBase = {
+		version: 1 as const,
+		id: randomUUID(),
+		sourceKey: `${f.sourcePrefix}.recording/outputs/replacement/result.mp4`,
+		duration: 25,
+	};
+	state.objects.set(editingBase.sourceKey, "new editing original");
+	await runtime.database.batch([
+		runtime.database
+			.update(Db.videos)
+			.set({ metadata: { ...current.metadata, editingBase } })
+			.where(eq(Db.videos.id, f.videoId)),
+		runtime.database
+			.update(Db.videoEdits)
+			.set({ sourceKey: editingBase.sourceKey })
+			.where(eq(Db.videoEdits.videoId, f.videoId)),
+	]);
+	await transferOrganizationContentWorkflow({ operationId: f.operationId });
+	const row = await video(f);
+	const targetKey = editingBase.sourceKey.replace(
+		f.sourcePrefix,
+		f.targetPrefix,
+	);
+	expect(row.metadata?.editingBase).toEqual({
+		...editingBase,
+		sourceKey: targetKey,
+	});
+	expect(
+		(
+			await runtime.database
+				.select()
+				.from(Db.videoEdits)
+				.where(eq(Db.videoEdits.videoId, f.videoId))
+		)[0]?.sourceKey,
+	).toBe(targetKey);
+	expect(state.objects.get(targetKey)).toBe("new editing original");
+	expect(state.objects.get(editingBase.sourceKey)).toBe("new editing original");
+});
+
 it("atomically transfers media references and freshly encrypted original transcript words", async () => {
 	const f = await fixture();
 	await transferOrganizationContentWorkflow({ operationId: f.operationId });

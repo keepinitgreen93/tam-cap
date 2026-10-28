@@ -8,8 +8,8 @@ import {
 	verifyStorageObjectToken,
 } from "@cap/web-backend";
 import { getRecordingObjectIdentity } from "@cap/web-backend/src/Storage/recording-object-identity";
-import { isInternalRecordingKey } from "@cap/web-backend/src/Storage/recording-output";
-import { Storage as StorageDomain, Video } from "@cap/web-domain";
+import { resolveRecordingObjectKey } from "@cap/web-backend/src/Storage/recording-output";
+import { CurrentUser, Storage as StorageDomain, Video } from "@cap/web-domain";
 import { Effect, Option } from "effect";
 import type { NextRequest } from "next/server";
 import { isPrivateEditTranscriptObjectKey } from "@/lib/edit-transcript";
@@ -193,29 +193,40 @@ export async function GET(request: NextRequest) {
 
 	const effect = Effect.gen(function* () {
 		const tokenPayload = token ? verifyStorageObjectToken(token) : null;
+		const hasObjectCapability =
+			tokenPayload?.videoId === videoIdParam && tokenPayload.key === key;
 		const videoId = Video.VideoId.make(videoIdParam);
-		const video =
-			tokenPayload?.videoId === videoIdParam && tokenPayload.key === key
-				? yield* getTokenVideo(videoId)
-				: yield* getPolicyVideo(videoId);
+		const video = hasObjectCapability
+			? yield* getTokenVideo(videoId)
+			: yield* getPolicyVideo(videoId);
 
 		if (!key.startsWith(`${video.ownerId}/${video.id}/`)) {
 			return yield* Effect.fail("not-found" as const);
 		}
-		if (
-			isInternalRecordingKey(key) &&
-			!(tokenPayload?.videoId === videoIdParam && tokenPayload.key === key) &&
-			!(
-				key === Video.getAudioLevelOutputKey(video) ||
-				((video.source.type === "desktopMP4" ||
-					video.source.type === "webMP4") &&
-					[
-						key === video.source.outputKey,
-						key === video.source.thumbnailKey,
-						key === video.source.previewKey,
-					].some(Boolean))
-			)
-		) {
+		const user = yield* Effect.serviceOption(CurrentUser);
+		const isOwner = Option.isSome(user) && user.value.id === video.ownerId;
+		const prefix = `${video.ownerId}/${video.id}/`;
+		const isMp4 =
+			video.source.type === "desktopMP4" || video.source.type === "webMP4";
+		const canonicalAsset =
+			isMp4 &&
+			(key === `${prefix}result.mp4` ||
+				([
+					`${prefix}screenshot/screen-capture.jpg`,
+					`${prefix}preview/animated-preview.gif`,
+				].includes(key) &&
+					(!video.source.outputKey ||
+						resolveRecordingObjectKey(video, key) !== key)));
+		const isPublished =
+			canonicalAsset ||
+			key === Video.getAudioLevelOutputKey(video) ||
+			(isMp4 &&
+				[
+					video.source.outputKey,
+					video.source.thumbnailKey,
+					video.source.previewKey,
+				].includes(key));
+		if (!hasObjectCapability && !isOwner && !isPublished) {
 			return yield* Effect.fail("not-found" as const);
 		}
 

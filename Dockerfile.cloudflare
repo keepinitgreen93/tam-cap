@@ -34,6 +34,7 @@ CMD ["node", "apps/web/server.js"]
 FROM oven/bun:1.4.4 AS media-build
 WORKDIR /app
 COPY apps/media-server/package.json apps/media-server/bun.lock ./
+COPY apps/media-server/patches ./patches
 RUN --mount=type=cache,id=cap-media-bun-1.4.4,target=/root/.bun/install/cache bun install --frozen-lockfile --production
 
 FROM oven/bun:1.4.4 AS media

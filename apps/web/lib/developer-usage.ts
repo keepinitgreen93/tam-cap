@@ -9,6 +9,7 @@ import {
 } from "@cap/database/cloudflare/schema";
 import { nanoId } from "@cap/database/helpers";
 import { and, eq, isNull, sql } from "drizzle-orm";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 
 export async function reserveDeveloperUpload(
 	database: CloudflareDatabase,
@@ -69,9 +70,9 @@ export async function reserveDeveloperUpload(
 				typeof metadata !== "object" ||
 				!("uploadId" in metadata) ||
 				metadata.uploadId !== input.uploadId ||
-					!("durationSeconds" in metadata) ||
-					metadata.durationSeconds !== input.durationSeconds ||
-					!("totalBytes" in metadata) ||
+				!("durationSeconds" in metadata) ||
+				metadata.durationSeconds !== input.durationSeconds ||
+				!("totalBytes" in metadata) ||
 				metadata.totalBytes !== input.totalBytes
 			)
 				return { statements: [], result: "conflict" };
@@ -99,23 +100,21 @@ export async function reserveDeveloperUpload(
 					.update(developerCreditAccounts)
 					.set({ balanceMicroCredits: balance })
 					.where(eq(developerCreditAccounts.id, account.id)),
-				database
-					.insert(developerCreditTransactions)
-					.values({
-						id,
-						accountId: account.id,
-						type: "video_create",
-						amountMicroCredits: -input.amount,
-						balanceAfterMicroCredits: balance,
-						referenceId: input.videoId,
-						referenceType: "developer_video",
-						metadata: {
-							uploadId: input.uploadId,
-							durationSeconds: input.durationSeconds,
-							totalBytes: input.totalBytes,
-							complete: false,
-						},
-					}),
+				database.insert(developerCreditTransactions).values({
+					id,
+					accountId: account.id,
+					type: "video_create",
+					amountMicroCredits: -input.amount,
+					balanceAfterMicroCredits: balance,
+					referenceId: input.videoId,
+					referenceType: "developer_video",
+					metadata: {
+						uploadId: input.uploadId,
+						durationSeconds: input.durationSeconds,
+						totalBytes: input.totalBytes,
+						complete: false,
+					},
+				}),
 			],
 			result: "reserved",
 		};
@@ -180,7 +179,7 @@ export async function finishDeveloperUpload(
 						duration: input.duration,
 						width: input.width,
 						height: input.height,
-						fps: input.fps,
+						fps: normalizeVideoFps(input.fps),
 					})
 					.where(eq(developerVideos.id, input.videoId)),
 				database
@@ -268,22 +267,20 @@ export async function recordDeveloperStorageDay(
 					.update(developerCreditAccounts)
 					.set({ balanceMicroCredits: balance })
 					.where(eq(developerCreditAccounts.id, account.id)),
-				database
-					.insert(developerCreditTransactions)
-					.values({
-						id: transactionId,
-						accountId: account.id,
-						type: "storage_daily",
-						amountMicroCredits: -amount,
-						balanceAfterMicroCredits: balance,
-						referenceId: date,
-						referenceType: "manual",
-						metadata: {
-							snapshotDate: date,
-							totalDurationMinutes: minutes,
-							videoCount: values.videoCount,
-						},
-					}),
+				database.insert(developerCreditTransactions).values({
+					id: transactionId,
+					accountId: account.id,
+					type: "storage_daily",
+					amountMicroCredits: -amount,
+					balanceAfterMicroCredits: balance,
+					referenceId: date,
+					referenceType: "manual",
+					metadata: {
+						snapshotDate: date,
+						totalDurationMinutes: minutes,
+						videoCount: values.videoCount,
+					},
+				}),
 				existing
 					? database
 							.update(developerDailyStorageSnapshots)

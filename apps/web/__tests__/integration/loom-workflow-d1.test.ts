@@ -1,5 +1,6 @@
 import {
 	agentApiOperations,
+	s3Buckets,
 	videos,
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
@@ -29,6 +30,11 @@ const state = vi.hoisted(() => ({
 	remove: vi.fn(),
 	jobBodies: [] as Record<string, unknown>[],
 	provider: "s3",
+	importer: false,
+	download: vi.fn(),
+	heads: new Map<string, number>(),
+	onHead: undefined as (() => Promise<void>) | undefined,
+	videoId: "",
 }));
 vi.mock("server-only", () => ({}));
 vi.mock("@cap/database/cloudflare/application", () => ({
@@ -38,6 +44,9 @@ vi.mock("@cap/env", () => ({
 	buildEnv: { NEXT_PUBLIC_IS_CAP: "false" },
 	serverEnv: () => ({
 		MEDIA_SERVER_URL: "https://media.synthetic.example",
+		LOOM_IMPORTER_URL: state.importer
+			? "https://importer.synthetic.example"
+			: undefined,
 		WEB_URL: "https://web.synthetic.example",
 		MEDIA_SERVER_WEBHOOK_SECRET: "synthetic",
 	}),
@@ -54,8 +63,8 @@ vi.mock("@/workflows/video-processing-status", () => ({
 	VideoProcessingFailedError: class VideoProcessingFailedError extends Error {},
 }));
 vi.mock("@/lib/loom-download-url", () => ({
-	getReusableLoomDownloadUrl: () => "https://cdn.loom.com/source.mp4",
-	getLoomDownloadUrl: async () => "https://cdn.loom.com/source.mp4",
+	getReusableLoomDownloadUrl: (value: string | undefined) => value ?? null,
+	getLoomDownloadUrl: state.download,
 	LoomDownloadTemporaryError: class LoomDownloadTemporaryError extends Error {},
 }));
 vi.mock("@/lib/workflow-runtime", () => ({
@@ -73,7 +82,14 @@ vi.mock("@cap/web-backend/src/Storage/index", () => ({
 						Effect.succeed(
 							`https://storage.synthetic.example/${key}?put=synthetic`,
 						),
-					headObject: () => Effect.fail({ name: "NotFound" }),
+					headObject: (key: string) =>
+						Effect.gen(function* () {
+							if (state.onHead) yield* Effect.promise(state.onHead);
+							const length = state.heads.get(key);
+							if (length === undefined)
+								return yield* Effect.fail({ name: "NotFound" });
+							return { ContentLength: length };
+						}),
 					deleteObject: state.remove,
 					multipart: {
 						create: (key: string) =>
@@ -87,6 +103,7 @@ vi.mock("@cap/web-backend/src/Storage/index", () => ({
 
 import { loomImportSourcePublication } from "@/lib/loom-import-artifacts";
 import { importLoomVideoWorkflow } from "@/workflows/import-loom-video";
+import { VideoProcessingFailedError } from "@/workflows/video-processing-status";
 
 let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
 let owner: Awaited<ReturnType<typeof createTestOwner>>;
@@ -95,7 +112,7 @@ const metadata = { duration: 12, width: 640, height: 360, fps: 30 };
 const payload = () => ({
 	videoId: video.id,
 	userId: video.ownerId,
-	bucketId: null,
+	bucketId: video.bucket,
 	rawFileKey: `${video.ownerId}/${video.id}/raw-upload.mp4`,
 	loomVideoId: "a".repeat(32),
 	cleanupRawUpload: true,
@@ -120,6 +137,12 @@ describe("Loom import workflow on D1", () => {
 	});
 	beforeEach(async () => {
 		state.provider = "s3";
+		state.importer = false;
+		state.heads.clear();
+		state.onHead = undefined;
+		state.download
+			.mockReset()
+			.mockResolvedValue("https://cdn.loom.com/source.mp4");
 		owner = await createTestOwner(runtime.database);
 		vi.stubEnv("CAP_RUNTIME", "cloudflare");
 		state.onCompletion = undefined;
@@ -138,6 +161,7 @@ describe("Loom import workflow on D1", () => {
 			.returning();
 		if (!row) throw new Error("Fixture missing");
 		video = row;
+		state.videoId = video.id;
 		await runtime.database
 			.insert(videoUploads)
 			.values({ videoId: video.id, phase: "processing" });
@@ -147,7 +171,14 @@ describe("Loom import workflow on D1", () => {
 				const row = await current();
 				await runtime.database
 					.update(videos)
-					.set({ ...metadata, ...loomImportSourcePublication(row) })
+					.set({
+						...metadata,
+						...loomImportSourcePublication(
+							row,
+							row.metadata ?? {},
+							metadata.duration,
+						),
+					})
 					.where(eq(videos.id, video.id));
 			}
 			return metadata;
@@ -159,6 +190,12 @@ describe("Loom import workflow on D1", () => {
 					return Response.json({
 						loomMultipartUploads: true,
 						loomImportMaxBytes: 10 * 1024 ** 3,
+					});
+				if (url.includes("/status"))
+					return Response.json({
+						jobId: "job",
+						videoId: state.videoId,
+						phase: "error",
 					});
 				state.jobBodies.push(
 					JSON.parse(String(init?.body)) as Record<string, unknown>,
@@ -173,6 +210,14 @@ describe("Loom import workflow on D1", () => {
 		expect(row.source).toMatchObject({
 			outputKey: expect.stringContaining("/.recording/outputs/loom-"),
 		});
+		expect(row.metadata?.editingBase).toMatchObject({
+			version: 1,
+			sourceKey: "outputKey" in row.source ? row.source.outputKey : "missing",
+			duration: 12,
+		});
+		expect(row.metadata?.editingBase?.id).toBe(
+			row.metadata?.transcriptPublication?.id,
+		);
 		expect(row.metadata?.summary).toBeUndefined();
 		expect(row.metadata?.transcriptPublication?.vtt).toBe(false);
 		expect(row.metadata?.loomImportRun?.sourceRevision).toMatch(
@@ -189,6 +234,20 @@ describe("Loom import workflow on D1", () => {
 			key: "outputKey" in row.source ? row.source.outputKey : "missing",
 		});
 	});
+	it.each([25.06, 29.97])(
+		"publishes final Loom metadata with fractional fps %s",
+		async (fps) => {
+			state.wait.mockResolvedValue({ ...metadata, fps, duration: 19.198 });
+			expect((await importLoomVideoWorkflow(payload())).success).toBe(true);
+			expect(await current()).toMatchObject({
+				fps: Math.round(fps),
+				duration: 19.198,
+				source: {
+					outputKey: expect.stringContaining("/.recording/outputs/loom-"),
+				},
+			});
+		},
+	);
 	it("publishes immutable signed-PUT references for non-S3 storage", async () => {
 		state.provider = "google-drive";
 		expect((await importLoomVideoWorkflow(payload())).success).toBe(true);
@@ -228,6 +287,82 @@ describe("Loom import workflow on D1", () => {
 			.from(videoUploads)
 			.where(eq(videoUploads.videoId, video.id));
 		expect(upload?.phase).toBe("processing");
+	});
+	it("reuses the preserved importer WebM when the first conversion fails", async () => {
+		state.importer = true;
+		state.download.mockResolvedValue("https://cdn.loom.com/source.m3u8");
+		let savedKey = "";
+		state.wait.mockImplementationOnce(async () => {
+			const original = state.jobBodies[0]?.originalUpload as { key: string };
+			savedKey = original.key;
+			state.heads.set(savedKey, 4096);
+			throw new VideoProcessingFailedError("Synthetic conversion failure");
+		});
+		expect((await importLoomVideoWorkflow(payload())).success).toBe(true);
+		expect(state.download).toHaveBeenCalledTimes(1);
+		expect(state.jobBodies).toHaveLength(2);
+		expect(state.jobBodies[1]?.videoUrl).toBe(
+			`https://storage.synthetic.example/${savedKey}`,
+		);
+		expect(state.jobBodies[1]?.sourceUpload).toBeUndefined();
+		expect((await current()).metadata?.loomDeferredProcessing).toEqual({
+			rawFileKey: savedKey,
+			status: "complete",
+		});
+		expect(state.remove).not.toHaveBeenCalled();
+	});
+	it("rejects a saved input when replacement occurs during its storage check", async () => {
+		state.heads.set(payload().rawFileKey, 4096);
+		const replacementKey = `${video.ownerId}/${video.id}/replacement.mp4`;
+		state.onHead = async () => {
+			state.onHead = undefined;
+			await runtime.database
+				.update(videos)
+				.set({ source: { type: "webMP4", outputKey: replacementKey } })
+				.where(eq(videos.id, video.id));
+		};
+		await expect(
+			importLoomVideoWorkflow({ ...payload(), reuseExistingRawUpload: true }),
+		).rejects.toThrow("changed during storage verification");
+		expect((await current()).source).toMatchObject({
+			outputKey: replacementKey,
+		});
+		expect(state.jobBodies).toHaveLength(0);
+		expect(state.download).not.toHaveBeenCalled();
+	});
+	it("rejects a saved input when its bucket is disabled during HEAD", async () => {
+		const bucketId = nanoId() as typeof s3Buckets.$inferSelect.id;
+		await runtime.binding
+			.prepare(
+				"INSERT INTO s3_buckets (id, ownerId, region, bucketName, accessKeyId, secretAccessKey) VALUES (?, ?, ?, ?, ?, ?)",
+			)
+			.bind(
+				bucketId,
+				video.ownerId,
+				"synthetic",
+				"synthetic",
+				"synthetic",
+				"synthetic",
+			)
+			.run();
+		await runtime.database
+			.update(videos)
+			.set({ bucket: bucketId })
+			.where(eq(videos.id, video.id));
+		video = await current();
+		state.heads.set(payload().rawFileKey, 4096);
+		state.onHead = async () => {
+			state.onHead = undefined;
+			await runtime.database
+				.update(s3Buckets)
+				.set({ active: false })
+				.where(eq(s3Buckets.id, bucketId));
+		};
+		await expect(
+			importLoomVideoWorkflow({ ...payload(), reuseExistingRawUpload: true }),
+		).rejects.toThrow("storage is unavailable");
+		expect(state.jobBodies).toHaveLength(0);
+		expect(state.download).not.toHaveBeenCalled();
 	});
 	it("claims and completes an agent operation exactly once", async () => {
 		const id = nanoId();

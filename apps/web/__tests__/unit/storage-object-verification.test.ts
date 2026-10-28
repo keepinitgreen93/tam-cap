@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
 	head: vi.fn(),
 	read: vi.fn(),
 	download: vi.fn(),
+	owner: false,
 	token: null as { videoId: string; key: string } | null,
 	video: {
 		id: "video",
@@ -25,8 +26,22 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@cap/web-backend", async () => {
 	const { Effect, Option } = await import("effect");
+	const { CurrentUser, Organisation, User } = await import("@cap/web-domain");
 	return {
-		provideOptionalAuth: (effect: unknown) => effect,
+		provideOptionalAuth: (
+			effect: import("effect").Effect.Effect<unknown, unknown>,
+		) => {
+			return mocks.owner
+				? effect.pipe(
+						Effect.provideService(CurrentUser, {
+							id: User.UserId.make("owner"),
+							email: "owner@example.test",
+							activeOrganizationId: Organisation.OrganisationId.make("org"),
+							iconUrlOrKey: Option.none(),
+						}),
+					)
+				: effect;
+		},
 		Storage: {
 			getAccessForVideo: () =>
 				Effect.succeed([
@@ -71,6 +86,7 @@ function request(
 
 describe("recording verification object reads", () => {
 	beforeEach(() => {
+		mocks.owner = false;
 		mocks.token = { videoId: "video", key: "owner/video/result.mp4" };
 		mocks.video.source = { type: "desktopMP4" };
 		mocks.head.mockReturnValue(
@@ -83,6 +99,37 @@ describe("recording verification object reads", () => {
 					headers: { "Content-Range": "bytes 0-3/100" },
 				}),
 			),
+		);
+	});
+
+	it.each([
+		"source/original.mp4",
+		"raw-upload.mp4",
+		"raw-upload.webm",
+		"transcription.vtt",
+		"comments/deleted/media.webm",
+	])(
+		"denies an unsigned viewer the retained unpublished object %s",
+		async (suffix) => {
+			mocks.token = null;
+			mocks.video.source = {
+				type: "webMP4",
+				outputKey: "owner/video/.recording/outputs/current/result.mp4",
+			};
+			const response = await request({}, `owner/video/${suffix}`);
+			expect(response.status).toBe(404);
+			expect(mocks.read).not.toHaveBeenCalled();
+		},
+	);
+	it("preserves an authenticated owner's original read without granting that access to viewers", async () => {
+		mocks.token = null;
+		mocks.owner = true;
+		expect((await request({}, "owner/video/source/original.mp4")).status).toBe(
+			206,
+		);
+		mocks.owner = false;
+		expect((await request({}, "owner/video/source/original.mp4")).status).toBe(
+			404,
 		);
 	});
 

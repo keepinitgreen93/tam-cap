@@ -38,6 +38,7 @@ import {
 } from "@/lib/recording-multipart-integrity";
 import { ownedRecordingPlan } from "@/lib/recording-upload-state";
 import { runPromise } from "@/lib/server";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { stringOrNumberOptional } from "@/utils/zod";
 import {
@@ -839,7 +840,10 @@ app.post(
 											),
 											width: updateIfDefined(body.width, Db.videos.width),
 											height: updateIfDefined(body.height, Db.videos.height),
-											fps: updateIfDefined(body.fps, Db.videos.fps),
+											fps: updateIfDefined(
+												normalizeVideoFps(body.fps),
+												Db.videos.fps,
+											),
 										})
 										.where(
 											and(
@@ -927,7 +931,10 @@ app.post(
 										),
 										width: updateIfDefined(body.width, Db.videos.width),
 										height: updateIfDefined(body.height, Db.videos.height),
-										fps: updateIfDefined(body.fps, Db.videos.fps),
+										fps: updateIfDefined(
+											normalizeVideoFps(body.fps),
+											Db.videos.fps,
+										),
 									})
 									.where(
 										and(

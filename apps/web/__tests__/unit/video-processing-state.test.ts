@@ -1,5 +1,7 @@
+import { randomUUID } from "node:crypto";
 import {
 	organizations,
+	videoEdits,
 	videos,
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
@@ -48,6 +50,84 @@ async function input() {
 }
 const metadata = { duration: 10, width: 1920, height: 1080, fps: 30 };
 
+it.each([false, true])(
+	"%s identity reprocessing preserves only the current rendered timeline",
+	async (identity) => {
+		const value = await input();
+		const prefix = `${value.userId}/${value.videoId}/`;
+		const editingBase = {
+			version: 1 as const,
+			id: randomUUID(),
+			sourceKey: `${prefix}.recording/outputs/base/result.mp4`,
+			duration: 30,
+		};
+		const currentKey = `${prefix}.recording/outputs/edited/result.mp4`;
+		const editSpec = {
+			version: 1 as const,
+			sourceDuration: 30,
+			keepRanges: [{ start: 0, end: 10 }],
+		};
+		await fixture.database.batch([
+			fixture.database
+				.update(videos)
+				.set({
+					source: { type: "webMP4", outputKey: currentKey },
+					duration: 10,
+					metadata: {
+						editingBase,
+						summary: "Finished summary",
+						aiGenerationStatus: "COMPLETE",
+					},
+				})
+				.where(eq(videos.id, value.videoId)),
+			fixture.database.insert(videoEdits).values({
+				videoId: value.videoId,
+				sourceKey: editingBase.sourceKey,
+				editSpec,
+			}),
+		]);
+		const claimed = await claimVideoProcessing(fixture.database, {
+			...value,
+			rawFileKey: identity ? currentKey : value.rawFileKey,
+		});
+		if (!claimed.run) throw new Error("Missing processing run");
+		expect(
+			await applyVideoProcessingProgress(fixture.database, {
+				videoId: value.videoId,
+				token: claimed.run.token,
+				attemptId: claimed.run.attemptId,
+				phase: "complete",
+				progress: 100,
+				metadata,
+			}),
+		).toBe(true);
+		const [video] = await fixture.database
+			.select()
+			.from(videos)
+			.where(eq(videos.id, value.videoId));
+		const [edit] = await fixture.database
+			.select()
+			.from(videoEdits)
+			.where(eq(videoEdits.videoId, value.videoId));
+		if (identity) {
+			expect(video?.metadata?.editingBase).toEqual(editingBase);
+			expect(edit).toMatchObject({
+				sourceKey: editingBase.sourceKey,
+				editSpec,
+			});
+			expect(video?.metadata?.summary).toBe("Finished summary");
+		} else {
+			expect(video?.metadata?.editingBase).toMatchObject({
+				sourceKey: claimed.run.outputKey,
+				duration: 10,
+			});
+			expect(video?.metadata?.editingBase?.id).not.toBe(editingBase.id);
+			expect(edit).toBeUndefined();
+			expect(video?.metadata?.summary).toBeUndefined();
+		}
+	},
+);
+
 it("claims one processing run for concurrent upload completion requests", async () => {
 	const value = await input();
 	const results = await Promise.all([
@@ -60,6 +140,40 @@ it("claims one processing run for concurrent upload completion requests", async 
 		`/.recording/outputs/process-${run?.token}/`,
 	);
 	expect(run?.rawFileKey).toBe(value.rawFileKey);
+});
+
+it("rejects completion after the captured editing-base generation changes", async () => {
+	const value = await input();
+	const claimed = await claimVideoProcessing(fixture.database, value);
+	if (!claimed.run) throw new Error("Missing processing run");
+	const editingBase = {
+		version: 1 as const,
+		id: randomUUID(),
+		sourceKey: `${value.userId}/${value.videoId}/.recording/outputs/newer/result.mp4`,
+		duration: 30,
+	};
+	await fixture.database
+		.update(videos)
+		.set({ metadata: { processingRun: claimed.run, editingBase } })
+		.where(eq(videos.id, value.videoId));
+	expect(
+		await applyVideoProcessingProgress(fixture.database, {
+			videoId: value.videoId,
+			token: claimed.run.token,
+			attemptId: claimed.run.attemptId,
+			phase: "complete",
+			progress: 100,
+			metadata,
+		}),
+	).toBe(false);
+	expect(
+		(
+			await fixture.database
+				.select()
+				.from(videos)
+				.where(eq(videos.id, value.videoId))
+		)[0]?.metadata?.editingBase,
+	).toEqual(editingBase);
 });
 
 it("fences stale worker completion after a concurrent forced restart", async () => {

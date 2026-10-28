@@ -709,6 +709,9 @@
     "msgpackr-extract",
     "workerd",
   ],
+  "patchedDependencies": {
+    "zod@3.25.76": "patches/zod@3.25.76.patch",
+  },
   "overrides": {
     "react-native-worklets": "0.7.4",
     "zod@^4": {

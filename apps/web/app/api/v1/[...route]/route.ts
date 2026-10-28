@@ -149,6 +149,7 @@ import {
 	readTranscriptVtt,
 	TranscriptPublicationConflictError,
 } from "@/lib/transcript-publication";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { isVideoStorageKey } from "@/lib/video-storage-key";
 import { isAiGenerationEnabled } from "@/utils/flags";
@@ -7130,7 +7131,7 @@ const AgentManagementHandlersLive = HttpApiBuilder.group(
 										duration: payload.durationSeconds,
 										width: payload.width,
 										height: payload.height,
-										fps: payload.fps,
+										fps: normalizeVideoFps(payload.fps),
 										metadata: {
 											sourceName: payload.fileName,
 											agentUpload: { state: "pending" },

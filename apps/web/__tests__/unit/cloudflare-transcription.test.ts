@@ -1,240 +1,286 @@
 import { describe, expect, it } from "vitest";
 import {
+	CLOUDFLARE_SPEECH_MODEL,
 	parseCloudflareTranscription,
 	transcribeWithCloudflare,
 } from "../../lib/cloudflare-transcription";
+import { cloudflareWhisperResponse } from "../fixtures/cloudflare-whisper-response";
 
 const credentials = {
 	accountId: "0123456789abcdef0123456789abcdef",
 	apiToken: "test-token",
 };
-
 function response(
 	words: unknown[] = [
-		{
-			word: "um",
-			punctuated_word: "Um,",
-			start: 0.1,
-			end: 0.3,
-			confidence: 0.9,
-		},
-		{
-			word: "hello",
-			punctuated_word: "hello.",
-			start: 0.5,
-			end: 1,
-			confidence: 1,
-		},
+		{ word: " Um,", start: 0.1, end: 0.3 },
+		{ word: " hello.", start: 0.5, end: 1 },
 	],
-	transcript = "Um, hello.",
+	text = "Um, hello.",
 ) {
 	return {
 		success: true,
 		result: {
-			metadata: { duration: 2, request_id: "request-123" },
-			results: {
-				channels: [
-					{
-						detected_language: "en",
-						alternatives: [{ transcript, words }],
-					},
-				],
+			transcription_info: {
+				duration: 2,
+				language: "en",
+				language_probability: 1,
 			},
+			text,
+			segments: [{ text, words }],
 		},
 	};
 }
 
-describe("Cloudflare transcription", () => {
-	it("does not spend inference when source duration is unavailable", async () => {
-		let requests = 0;
+describe("Cloudflare Whisper transcription", () => {
+	it("preserves the live synthetic fixture's fillers and exact provider word boundaries", () => {
+		const transcript = parseCloudflareTranscription(
+			cloudflareWhisperResponse,
+			17134,
+		);
+		expect(transcript.speech_model_used).toBe(
+			"@cf/openai/whisper-large-v3-turbo",
+		);
+		expect(transcript.words).toHaveLength(25);
+		expect(transcript.words[0]).toEqual({
+			text: "Hello.",
+			start: 0,
+			end: 340,
+			confidence: null,
+			speaker: null,
+			channel: "0",
+		});
+		expect(transcript.words[1]).toMatchObject({
+			text: "Um,",
+			start: 960,
+			end: 1620,
+		});
+		expect(transcript.words[8]).toMatchObject({
+			text: "Uh,",
+			start: 6260,
+			end: 6920,
+		});
+		expect(transcript.words.at(-1)).toMatchObject({
+			text: "words.",
+			start: 15040,
+			end: 15460,
+		});
+		expect(
+			transcript.words.every(
+				(word) => word.confidence === null && word.speaker === null,
+			),
+		).toBe(true);
+		expect(transcript.audio_duration).toBe(17.134);
+		expect(transcript.language_code).toBe("en");
+	});
+	it("uses source duration when the response omits duration metadata", () => {
+		const value = response();
+		const shape = {
+			success: true,
+			result: { text: value.result.text, segments: value.result.segments },
+		};
+		expect(parseCloudflareTranscription(shape, 2000).audio_duration).toBe(2);
+		expect(() => parseCloudflareTranscription(shape)).toThrow("duration");
+	});
+	it.each([NaN, Infinity, 0, -1])(
+		"rejects invalid source duration %s",
+		(duration) => {
+			expect(() => parseCloudflareTranscription(response(), duration)).toThrow(
+				"duration",
+			);
+		},
+	);
+	it.each([
+		{ word: "bad", start: -1, end: 1 },
+		{ word: "bad", start: 1, end: 0.5 },
+		{ word: "bad", start: 0, end: NaN },
+		{ word: "bad", start: 0, end: 3 },
+		{ word: "bad", start: "0", end: 1 },
+		{ word: "", start: 0, end: 1 },
+		{ word: "bad", start: 0, end: 0.0001 },
+		{ word: "bad", start: 0, end: 1, confidence: 2 },
+		{ word: "bad", start: 0, end: 1, confidence: NaN },
+		{ word: "bad", start: 0, end: 1, confidence: "1" },
+	])(
+		"rejects invalid timing or confidence instead of inventing an edit",
+		(word) => {
+			expect(() => parseCloudflareTranscription(response([word]))).toThrow();
+		},
+	);
+	it("preserves overlaps without fabricating diarization", () => {
+		const transcript = parseCloudflareTranscription(
+			response([
+				{ word: "um", start: 0.1, end: 0.5 },
+				{ word: "yes", start: 0.2, end: 0.6, confidence: 0.9 },
+			]),
+		);
+		expect(
+			transcript.words.map((word) => [
+				word.start,
+				word.end,
+				word.speaker,
+				word.confidence,
+			]),
+		).toEqual([
+			[100, 500, null, null],
+			[200, 600, null, 0.9],
+		]);
+	});
+	it("accepts confirmed silence but rejects text without timed words", () => {
+		expect(
+			parseCloudflareTranscription(
+				{ success: true, result: { text: "", segments: [] } },
+				2000,
+			),
+		).toMatchObject({ status: "error", error: "No spoken audio", words: [] });
+		expect(() => parseCloudflareTranscription(response([]))).toThrow(
+			"word timings",
+		);
+		expect(() =>
+			parseCloudflareTranscription(
+				{ success: true, result: { text: "speech", segments: [] } },
+				2000,
+			),
+		).toThrow("word timings");
+		expect(() =>
+			parseCloudflareTranscription(
+				{
+					success: true,
+					result: { text: "speech", segments: [{ text: "speech" }] },
+				},
+				2000,
+			),
+		).toThrow("word timings");
+	});
+	it.each([
+		null,
+		[],
+		{ success: false, errors: [{ message: "private" }] },
+		{ success: true, result: {} },
+	])("rejects malformed or unsuccessful envelopes", (shape) => {
+		expect(() => parseCloudflareTranscription(shape, 2000)).toThrow();
+	});
+	it("rejects malformed language confidence", () => {
+		const shape = response();
+		shape.result.transcription_info.language_probability = 2;
+		expect(() => parseCloudflareTranscription(shape)).toThrow("confidence");
+	});
+	it.each(["en", "es", "auto"])(
+		"sends base64 JSON to Cloudflare with language %s and no fixture prompt",
+		async (language) => {
+			const audio = new Uint8Array([1, 2, 3]);
+			let request: Request | undefined;
+			const result = await transcribeWithCloudflare(
+				audio,
+				language,
+				credentials,
+				async (url, init) => {
+					request = new Request(url, init);
+					return Response.json(response());
+				},
+				"audio/mpeg",
+				2000,
+			);
+			expect(result.speech_model_used).toBe(CLOUDFLARE_SPEECH_MODEL);
+			if (!request) throw Error("Missing request");
+			expect(request.url).toBe(
+				`https://api.cloudflare.com/client/v4/accounts/${credentials.accountId}/ai/run/${CLOUDFLARE_SPEECH_MODEL}`,
+			);
+			expect(request.headers.get("content-type")).toBe("application/json");
+			expect(request.redirect).toBe("error");
+			expect(await request.json()).toEqual({
+				audio: "AQID",
+				task: "transcribe",
+				vad_filter: false,
+				...(language === "auto" ? {} : { language }),
+			});
+		},
+	);
+	it.each([undefined, NaN, 0])(
+		"rejects missing/invalid source duration before paid inference",
+		async (duration) => {
+			let calls = 0;
+			await expect(
+				transcribeWithCloudflare(
+					new Uint8Array([1]),
+					"auto",
+					credentials,
+					async () => {
+						calls++;
+						return Response.json(response());
+					},
+					"audio/mpeg",
+					duration,
+				),
+			).rejects.toThrow("source audio duration");
+			expect(calls).toBe(0);
+		},
+	);
+	it("rejects missing credentials and empty audio before inference", async () => {
+		await expect(
+			transcribeWithCloudflare(new Uint8Array([1]), "auto", {
+				...credentials,
+				apiToken: "",
+			}),
+		).rejects.toThrow("credentials");
+		await expect(
+			transcribeWithCloudflare(new Uint8Array(), "auto", credentials),
+		).rejects.toThrow("Empty Cloudflare");
+	});
+	it.each([
+		[401, false],
+		[429, true],
+		[503, true],
+	])(
+		"classifies HTTP %s without leaking response content or retrying",
+		async (status, retryable) => {
+			let calls = 0;
+			await expect(
+				transcribeWithCloudflare(
+					new Uint8Array([1]),
+					"auto",
+					credentials,
+					async () => {
+						calls++;
+						return new Response("private-details", { status });
+					},
+					"audio/mpeg",
+					2000,
+				),
+			).rejects.toMatchObject({
+				message: `Cloudflare transcription HTTP ${status}`,
+				retryable,
+			});
+			expect(calls).toBe(1);
+		},
+	);
+	it("classifies network failures as retryable and invalid JSON as permanent", async () => {
 		await expect(
 			transcribeWithCloudflare(
 				new Uint8Array([1]),
 				"auto",
 				credentials,
 				async () => {
-					requests += 1;
-					return Response.json(response());
+					throw Error("private-network-url");
 				},
-			),
-		).rejects.toThrow("source audio duration");
-		expect(requests).toBe(0);
-	});
-
-	it("uses known source duration for the live Cloudflare envelope without Deepgram metadata", () => {
-		const liveShape = {
-			success: true,
-			result: {
-				results: {
-					channels: [
-						{
-							alternatives: [
-								{
-									transcript: "um hello",
-									words: [
-										{ word: "um", start: 0.1, end: 0.3 },
-										{ word: "hello", start: 0.5, end: 1 },
-									],
-								},
-							],
-						},
-					],
-				},
-				usage: { neurons: 66.0911 },
-			},
-		};
-		const result = parseCloudflareTranscription(liveShape, 8388);
-		expect(result.audio_duration).toBe(8.388);
-		expect(result.words[1]?.end).toBe(1000);
-		expect(() => parseCloudflareTranscription(liveShape)).toThrow("duration");
-	});
-
-	it("preserves filler tokens and converts seconds to millisecond edit times", () => {
-		const result = parseCloudflareTranscription(response());
-		expect(result.words).toEqual([
-			{
-				text: "Um,",
-				start: 100,
-				end: 300,
-				confidence: 0.9,
-				speaker: null,
-				channel: "0",
-			},
-			{
-				text: "hello.",
-				start: 500,
-				end: 1000,
-				confidence: 1,
-				speaker: null,
-				channel: "0",
-			},
-		]);
-		expect(result.audio_duration).toBe(2);
-		expect(result.language_code).toBe("en");
-	});
-
-	it.each([
-		{ word: "wrong", start: -1, end: 1 },
-		{ word: "wrong", start: 1, end: 0.5 },
-		{ word: "wrong", start: 0, end: Number.NaN },
-		{ word: "wrong", start: 0, end: 3 },
-		{ word: "wrong", start: "0", end: 1 },
-		{ word: "", start: 0, end: 1 },
-	])("rejects malformed word timing rather than inventing a cut", (word) => {
-		expect(() => parseCloudflareTranscription(response([word]))).toThrow();
-	});
-
-	it("preserves overlapping speech so the editor can refuse unsafe cuts", () => {
-		const result = parseCloudflareTranscription(
-			response([
-				{ word: "um", start: 0.1, end: 0.5, speaker: 0 },
-				{ word: "yes", start: 0.2, end: 0.6, speaker: 1 },
-			]),
-		);
-		expect(
-			result.words.map((word) => [word.start, word.end, word.speaker]),
-		).toEqual([
-			[100, 500, "0"],
-			[200, 600, "1"],
-		]);
-	});
-
-	it("rejects provider error envelopes and missing word data", () => {
-		expect(() =>
-			parseCloudflareTranscription({
-				success: false,
-				errors: [{ message: "private error" }],
-			}),
-		).toThrow("Cloudflare transcription failed");
-		expect(() =>
-			parseCloudflareTranscription({ success: true, result: {} }),
-		).toThrow();
-	});
-
-	it("treats confirmed empty speech as no-audio but rejects text without word timing", () => {
-		const silent = response([], "");
-		expect(parseCloudflareTranscription(silent)).toMatchObject({
-			status: "error",
-			error: "No spoken audio",
-			words: [],
-		});
-		expect(() => parseCloudflareTranscription(response([]))).toThrow(
-			"Missing Cloudflare word timings",
-		);
-	});
-
-	it("treats permanent HTTP errors as non-retryable without exposing the response", async () => {
-		await expect(
-			transcribeWithCloudflare(
-				new Uint8Array([1]),
-				"auto",
-				credentials,
-				async () => new Response("secret-provider-detail", { status: 401 }),
 				"audio/mpeg",
 				2000,
 			),
 		).rejects.toMatchObject({
-			message: "Cloudflare transcription HTTP 401",
-			retryable: false,
+			message: "Cloudflare transcription request failed",
+			retryable: true,
 		});
-	});
-
-	it("sends raw audio only to Cloudflare with filler retention and explicit language", async () => {
-		const audio = new Uint8Array([1, 2, 3]);
-		let request: Request | undefined;
-		const result = await transcribeWithCloudflare(
-			audio,
-			"en",
-			credentials,
-			async (input, init) => {
-				request = new Request(input, init);
-				return Response.json(response());
-			},
-			"audio/mpeg",
-			2000,
-		);
-		expect(result.words[0]?.text).toBe("Um,");
-		expect(request?.url).toContain(
-			"https://api.cloudflare.com/client/v4/accounts/0123456789abcdef0123456789abcdef/ai/run/@cf/deepgram/nova-3?",
-		);
-		expect(new URL(request?.url ?? "").searchParams.get("filler_words")).toBe(
-			"true",
-		);
-		expect(new URL(request?.url ?? "").searchParams.get("language")).toBe("en");
-		expect(request?.headers.get("content-type")).toBe("audio/mpeg");
-		expect(request?.redirect).toBe("error");
-		if (!request) throw new Error("Missing Cloudflare request");
-		expect(new Uint8Array(await request.arrayBuffer())).toEqual(audio);
-	});
-
-	it("fails closed for missing credentials without making a request", async () => {
-		await expect(
-			transcribeWithCloudflare(
-				new Uint8Array([1]),
-				"auto",
-				{ ...credentials, apiToken: "" },
-				async () => {
-					throw new Error("Network request must not happen");
-				},
-			),
-		).rejects.toThrow("Cloudflare transcription credentials");
-	});
-
-	it("surfaces a retryable status without leaking provider response or retrying paid inference", async () => {
-		let calls = 0;
 		await expect(
 			transcribeWithCloudflare(
 				new Uint8Array([1]),
 				"auto",
 				credentials,
-				async () => {
-					calls += 1;
-					return new Response("private details", { status: 429 });
-				},
+				async () => new Response("not-json"),
 				"audio/mpeg",
 				2000,
 			),
-		).rejects.toThrow("Cloudflare transcription HTTP 429");
-		expect(calls).toBe(1);
+		).rejects.toMatchObject({
+			message: "Invalid Cloudflare transcription JSON",
+			retryable: false,
+		});
 	});
 });

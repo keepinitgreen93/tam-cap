@@ -3,6 +3,7 @@ param(
 	[ValidateSet('Initialize', 'Verify', 'Publish')]
 	[string]$Operation = 'Verify',
 	[string]$Origin,
+	[switch]$RotateAuthSecret,
 	[ValidatePattern('^[a-p]{32}$')]
 	[string]$ChromeExtensionId
 )
@@ -54,6 +55,9 @@ try {
 	}
 	if (-not $capPayload.web.CRON_SECRET) {
 		$capPayload.web.CRON_SECRET = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
+	}
+	if ($RotateAuthSecret) {
+		$capPayload.web.NEXTAUTH_SECRET = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()
 	}
 	if ($ChromeExtensionId) {
 		$capPayload.web.CAP_CHROME_EXTENSION_ID = $ChromeExtensionId

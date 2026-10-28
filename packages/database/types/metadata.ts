@@ -12,6 +12,7 @@ export interface VideoProcessingRun {
 	bucketId: string | null;
 	storageIntegrationId: string | null;
 	source: string;
+	editingBaseId?: string | null;
 	rawFileKey: string;
 	state: "queued" | "processing" | "complete" | "error";
 	dispatch: "pending" | "accepted" | "uncertain";
@@ -47,6 +48,12 @@ export interface TranscriptPublication {
 }
 
 export interface VideoMetadata {
+	editingBase?: {
+		version: 1;
+		id: string;
+		sourceKey: string;
+		duration: number | null;
+	};
 	loomReassignClaim?: { token: string; at: string };
 	aiGenerationRun?: {
 		id: string;
@@ -68,6 +75,7 @@ export interface VideoMetadata {
 	processingRun?: VideoProcessingRun;
 	loomImportRun?: {
 		runId: string;
+		inputKey?: string;
 		sourceRevision?: string;
 		sourceIdentity?: {
 			ownerId: string;
@@ -106,6 +114,7 @@ export interface VideoMetadata {
 	};
 	editProcessing?: {
 		token: string;
+		editingBaseId?: string | null;
 		startedAt: string;
 		ownerId: string;
 		bucket: string | null;

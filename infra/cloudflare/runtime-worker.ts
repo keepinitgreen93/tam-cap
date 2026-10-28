@@ -76,6 +76,51 @@ export class CapWeb extends CapContainer {
 		this.env.CAP_WEB_ENV,
 		this.env.MEDIA_SERVER_WEBHOOK_SECRET,
 	);
+	private readonly configurationReady: Promise<void>;
+
+	constructor(
+		ctx: ConstructorParameters<typeof Container<RuntimeBindings>>[0],
+		env: RuntimeBindings & { CAP_WEB_IMAGE_REVISION?: string },
+	) {
+		super(ctx, env);
+		this.configurationReady = ctx.blockConcurrencyWhile(async () => {
+			const serialized = JSON.stringify({
+				version: 2,
+				envVars: Object.entries(this.envVars).sort(([left], [right]) =>
+					left < right ? -1 : left > right ? 1 : 0,
+				),
+				imageRevision: env.CAP_WEB_IMAGE_REVISION ?? "",
+				deploymentId: env.CAP_DEPLOYMENT_ID,
+			});
+			const digest = await crypto.subtle.digest(
+				"SHA-256",
+				new TextEncoder().encode(serialized),
+			);
+			const fingerprint = Array.from(new Uint8Array(digest), (value) =>
+				value.toString(16).padStart(2, "0"),
+			).join("");
+			const key = "cap.runtime.web-config";
+			if ((await ctx.storage.get<string>(key)) === fingerprint) return;
+			const container = ctx.container;
+			if (container?.running) {
+				await this.stop();
+				const deadline = Date.now() + 20_000;
+				while (container.running) {
+					if (Date.now() >= deadline)
+						throw new Error(
+							"Web container did not stop for configuration refresh",
+						);
+					await new Promise((resolve) => setTimeout(resolve, 100));
+				}
+			}
+			await ctx.storage.put(key, fingerprint);
+		});
+	}
+
+	async fetch(request: Request): Promise<Response> {
+		await this.configurationReady;
+		return super.fetch(request);
+	}
 }
 
 async function workflowRpc(

@@ -11,7 +11,7 @@ import {
 } from "@cap/database/cloudflare/bridge";
 import * as Db from "@cap/database/cloudflare/schema";
 import { createTranscriptInvalidation } from "@cap/database/cloudflare/transcript-publication";
-import { Organisation, S3Bucket, User, Video } from "@cap/web-domain";
+import { Comment, Organisation, S3Bucket, User, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import {
@@ -34,6 +34,9 @@ const mocks = vi.hoisted(() => ({
 	fetch: vi.fn(),
 	auth: vi.fn(),
 	queue: vi.fn(),
+	start: vi.fn(),
+	copy: vi.fn(),
+	deleteObjects: vi.fn(),
 }));
 vi.mock("@cap/database/cloudflare/application", () => ({
 	db: () => {
@@ -67,6 +70,9 @@ vi.mock("@/lib/queue-video-transcription", () => ({
 	queueVideoTranscription: mocks.queue,
 }));
 vi.mock("@/lib/transcribe", () => ({ transcribeVideo: vi.fn() }));
+vi.mock("workflow/api", () => ({ start: mocks.start }));
+vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
+vi.mock("@/utils/flags", () => ({ isAiGenerationEnabled: async () => false }));
 vi.mock("@/lib/messenger/constants", () => ({
 	MESSENGER_ADMIN_EMAIL: "admin@cap.test",
 }));
@@ -75,6 +81,11 @@ import {
 	getVideoReplaceUploadUrl,
 	invalidateVideoCache,
 } from "@/actions/admin/replace-video";
+import { getVideoDownloadInfo } from "@/actions/videos/download";
+import {
+	restoreVideoToOriginal,
+	saveVideoEdits,
+} from "@/actions/videos/save-edits";
 import {
 	prepareDesktopReupload,
 	publishDesktopReupload,
@@ -84,6 +95,7 @@ import {
 	createDesktopReuploadToken,
 	decodeDesktopReuploadToken,
 } from "@/lib/desktop-reupload-token";
+import { getEditSourceKey } from "@/lib/video-edit-processing";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import {
 	saveEditResultAndComplete,
@@ -107,12 +119,28 @@ const operation = {
 };
 beforeAll(async () => {
 	runtime = await createTestDatabase();
+	await runtime.database.insert(Db.users).values({
+		id: User.UserId.make("admin"),
+		email: "admin@cap.test",
+		emailVerified: new Date(),
+		activeOrganizationId: Organisation.OrganisationId.make(""),
+	});
 	mocks.database = createCloudflareDb(
 		createD1BridgeBinding({
 			fetch: async (request) => {
-				const payload = (await request.clone().json()) as { operation: string };
+				const payload = (await request.clone().json()) as {
+					operation: string;
+					statements?: { sql: string }[];
+				};
 				const response = await handleD1BridgeRequest(request, runtime.binding);
-				if (payload.operation === "batch" && loseResponse && response.ok) {
+				if (
+					payload.operation === "batch" &&
+					loseResponse &&
+					response.ok &&
+					payload.statements?.some((statement) =>
+						statement.sql.startsWith('update "videos"'),
+					)
+				) {
 					loseResponse = false;
 					throw new Error("Committed publication response lost");
 				}
@@ -122,7 +150,10 @@ beforeAll(async () => {
 	);
 }, 60000);
 afterAll(async () => runtime?.dispose());
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+	vi.unstubAllGlobals();
+	vi.unstubAllEnvs();
+});
 beforeEach(async () => {
 	vi.clearAllMocks();
 	const suffix = String(++sequence),
@@ -153,7 +184,14 @@ beforeEach(async () => {
 		},
 	});
 	video = await readVideo();
-	mocks.auth.mockResolvedValue({ id: "admin", email: "admin@cap.test" });
+	mocks.auth.mockResolvedValue({
+		id: "admin",
+		email: "admin@cap.test",
+		emailVerified: new Date(),
+	});
+	mocks.start.mockReset().mockResolvedValue({ runId: "edit-run" });
+	mocks.copy.mockReset().mockReturnValue(Effect.void);
+	mocks.deleteObjects.mockReset().mockReturnValue(Effect.void);
 	mocks.queue.mockImplementation(async () => {
 		await runtime.database
 			.update(Db.videos)
@@ -176,7 +214,11 @@ beforeEach(async () => {
 				provider: "s3",
 				headObject: mocks.head,
 				createUploadTarget: mocks.target,
+				copyObject: mocks.copy,
+				deleteObjects: mocks.deleteObjects,
 				getObject: () => Effect.succeed(Option.none()),
+				getSignedObjectUrl: (key: string) =>
+					Effect.succeed(`https://storage.test/download/${key}`),
 				listObjects: () => Effect.succeed({ Contents: [] }),
 				getInternalSignedObjectUrl: (key: string) =>
 					Effect.succeed(
@@ -185,7 +227,9 @@ beforeEach(async () => {
 			},
 		]),
 	);
-	mocks.fetch.mockResolvedValue(Response.json({ metadata: rendered }));
+	mocks.fetch.mockImplementation(async () =>
+		Response.json({ metadata: rendered }),
+	);
 	vi.stubGlobal("fetch", mocks.fetch);
 	async function readVideo() {
 		const [row] = await runtime.database
@@ -244,6 +288,51 @@ async function plan(
 }
 
 describe("desktop reupload publication on D1", () => {
+	it("replaces an edited recording with a new editing base and retires its prior edit spec atomically", async () => {
+		const oldOriginal = `${video.ownerId}/${video.id}/source/original.mp4`;
+		await change({ duration: 5 });
+		await runtime.database
+			.insert(Db.videoEdits)
+			.values({ videoId: video.id, sourceKey: oldOriginal, editSpec });
+		await runtime.database.insert(Db.comments).values({
+			id: Comment.CommentId.make(`replacec${sequence}`),
+			authorId: video.ownerId,
+			videoId: video.id,
+			type: "text",
+			content: "Keep this comment",
+			timestamp: 3,
+		});
+		const { original, token } = await replacement();
+		await publishDesktopReupload(runtime.database, original, token, {
+			duration: 30,
+			width: 640,
+			height: 360,
+			fps: 30,
+		});
+		const replaced = await current();
+		expect
+			.soft(getEditSourceKey(replaced.ownerId, replaced.id, replaced.metadata))
+			.toBe(token.outputKey);
+		expect
+			.soft(
+				await runtime.database
+					.select()
+					.from(Db.videoEdits)
+					.where(eq(Db.videoEdits.videoId, video.id)),
+			)
+			.toEqual([]);
+		expect(
+			await runtime.database
+				.select()
+				.from(Db.comments)
+				.where(eq(Db.comments.videoId, video.id)),
+		).toMatchObject([{ content: "Keep this comment", timestamp: 3 }]);
+		expect(replaced).toMatchObject({
+			id: video.id,
+			duration: 30,
+			source: { outputKey: token.outputKey },
+		});
+	});
 	it("plans media and transcript invalidation without changing stored playback", async () => {
 		const before = await current();
 		const { original, token } = await replacement();
@@ -386,9 +475,14 @@ describe("desktop reupload publication on D1", () => {
 });
 
 describe("edited recording publication", () => {
-	it.each(["desktopMP4", "webMP4"] as const)(
-		"clears stale %s audio derivatives atomically and replays the edit",
-		async (type) => {
+	it.each(
+		(["desktopMP4", "webMP4"] as const).flatMap((type) =>
+			[30, 25.06, 29.97].map((fps) => ({ type, fps })),
+		),
+	)(
+		"clears stale derivatives and replays the edit with integer fps: %j",
+		async ({ type, fps }) => {
+			const renderedMetadata = { ...rendered, fps };
 			const source = {
 				type,
 				audioLevelSourceKey: "old.mp4",
@@ -421,10 +515,11 @@ describe("edited recording publication", () => {
 				sourceKey,
 				editSpec,
 				editSpec,
-				rendered,
+				renderedMetadata,
 				operation,
 			);
 			const result = await current();
+			expect(result.fps).toBe(Math.round(fps));
 			expect(result.source).toMatchObject({
 				type,
 				outputKey: `${video.ownerId}/${video.id}/.recording/outputs/edit-${operation.token}/result.mp4`,
@@ -436,7 +531,7 @@ describe("edited recording publication", () => {
 				sourceKey,
 				editSpec,
 				editSpec,
-				rendered,
+				renderedMetadata,
 				operation,
 			);
 			expect(await current()).toEqual(result);
@@ -582,4 +677,245 @@ describe("edit dispatch acceptance", () => {
 			startMediaServerEditJob("https://media.test", { videoId: "video" }),
 		).resolves.toEqual({ status: "accepted", jobId: "worker-1" });
 	});
+});
+it("edits and restores the replacement timeline without consulting the previous canonical original", async () => {
+	const oldOriginal = `${video.ownerId}/${video.id}/source/original.mp4`;
+	await change({ duration: 5 });
+	await runtime.database
+		.insert(Db.videoEdits)
+		.values({ videoId: video.id, sourceKey: oldOriginal, editSpec });
+	const { original, token } = await replacement();
+	await publishDesktopReupload(runtime.database, original, token, {
+		duration: 30,
+		width: 640,
+		height: 360,
+		fps: 30,
+	});
+	mocks.auth.mockResolvedValue({
+		id: video.ownerId,
+		email: "owner@replacement.test",
+		activeOrganizationId: video.orgId,
+		emailVerified: new Date(),
+	});
+	expect(
+		await saveVideoEdits(video.id, {
+			version: 1,
+			sourceDuration: 30,
+			keepRanges: [{ start: 0, end: 20 }],
+		}),
+	).toEqual({ success: true });
+	expect(mocks.start).toHaveBeenCalledOnce();
+	const first = mocks.start.mock.calls[0]?.[1]?.[0] as Parameters<
+		typeof import("@/workflows/edit-video").editVideoWorkflow
+	>[0];
+	expect(first).toMatchObject({
+		sourceKey: token.outputKey,
+		previousSpec: { sourceDuration: 30, keepRanges: [{ start: 0, end: 30 }] },
+		editSpec: { sourceDuration: 30, keepRanges: [{ start: 0, end: 20 }] },
+	});
+	expect(mocks.copy).not.toHaveBeenCalled();
+	expect(mocks.deleteObjects).not.toHaveBeenCalled();
+	await runtime.database
+		.update(Db.videoUploads)
+		.set({ phase: "complete", processingProgress: 100 })
+		.where(eq(Db.videoUploads.videoId, video.id));
+	await saveEditResultAndComplete(
+		video.id,
+		first.sourceKey,
+		first.previousSpec,
+		first.editSpec,
+		{ duration: 20, width: 640, height: 360, fps: 30 },
+		first.operation,
+	);
+	expect(await getVideoDownloadInfo(video.id, "original")).toMatchObject({
+		success: true,
+		downloadUrl: `https://storage.test/download/${token.outputKey}`,
+	});
+	expect((await current()).metadata?.editingBase?.sourceKey).toBe(
+		token.outputKey,
+	);
+	expect(await restoreVideoToOriginal(video.id)).toEqual({ success: true });
+	const restored = mocks.start.mock.calls.at(-1)?.[1]?.[0] as Parameters<
+		typeof import("@/workflows/edit-video").editVideoWorkflow
+	>[0];
+	expect(restored).toMatchObject({
+		sourceKey: token.outputKey,
+		editSpec: { sourceDuration: 30, keepRanges: [{ start: 0, end: 30 }] },
+	});
+	expect(mocks.head.mock.calls.map(([key]) => key)).not.toContain(oldOriginal);
+});
+it("rolls back the new editing base and source when old edit retirement cannot commit", async () => {
+	const oldOriginal = `${video.ownerId}/${video.id}/source/original.mp4`;
+	await change({ duration: 5 });
+	await runtime.database
+		.insert(Db.videoEdits)
+		.values({ videoId: video.id, sourceKey: oldOriginal, editSpec });
+	const { original, token } = await replacement(),
+		before = await current();
+	await runtime.binding
+		.prepare(
+			`CREATE TRIGGER fail_edit_retirement BEFORE DELETE ON video_edits WHEN OLD.videoId = '${video.id}' BEGIN SELECT RAISE(ABORT,'edit retirement failure'); END`,
+		)
+		.run();
+	try {
+		await expect(
+			publishDesktopReupload(runtime.database, original, token, {
+				duration: 30,
+			}),
+		).rejects.toThrow();
+	} finally {
+		await runtime.binding.prepare("DROP TRIGGER fail_edit_retirement").run();
+	}
+	expect(await current()).toEqual(before);
+	expect(
+		await runtime.database
+			.select()
+			.from(Db.videoEdits)
+			.where(eq(Db.videoEdits.videoId, video.id)),
+	).toMatchObject([{ sourceKey: oldOriginal, editSpec }]);
+	expect(
+		await runtime.database
+			.select()
+			.from(Db.videoUploads)
+			.where(eq(Db.videoUploads.videoId, video.id)),
+	).toMatchObject([{ rawFileKey: token.outputKey }]);
+	expect(mocks.deleteObjects).not.toHaveBeenCalled();
+});
+it("rejects a pending edit after its editing-base generation changes", async () => {
+	const { original, token } = await replacement();
+	await publishDesktopReupload(runtime.database, original, token, {
+		duration: 30,
+	});
+	mocks.auth.mockResolvedValue({
+		id: video.ownerId,
+		email: "owner@replacement.test",
+		activeOrganizationId: video.orgId,
+	});
+	await saveVideoEdits(video.id, {
+		version: 1,
+		sourceDuration: 30,
+		keepRanges: [{ start: 0, end: 20 }],
+	});
+	const edit = mocks.start.mock.calls[0]?.[1]?.[0] as Parameters<
+		typeof import("@/workflows/edit-video").editVideoWorkflow
+	>[0];
+	const row = await current();
+	if (!row.metadata?.editingBase) throw Error("Missing editing base");
+	await change({
+		metadata: {
+			...row.metadata,
+			editingBase: { ...row.metadata.editingBase, id: crypto.randomUUID() },
+		},
+	});
+	await runtime.database
+		.update(Db.videoUploads)
+		.set({ phase: "complete" })
+		.where(eq(Db.videoUploads.videoId, video.id));
+	const before = await current();
+	await expect(
+		saveEditResultAndComplete(
+			video.id,
+			edit.sourceKey,
+			edit.previousSpec,
+			edit.editSpec,
+			{ duration: 20, width: 640, height: 360, fps: 30 },
+			edit.operation,
+		),
+	).rejects.toThrow();
+	expect(await current()).toEqual(before);
+	expect(
+		await runtime.database
+			.select()
+			.from(Db.videoEdits)
+			.where(eq(Db.videoEdits.videoId, video.id)),
+	).toEqual([]);
+});
+it("probes the new immutable replacement instead of retaining old clip dimensions", async () => {
+	await change({ duration: 5 });
+	const prepared = await getVideoReplaceUploadUrl(video.id),
+		token = decodeDesktopReuploadToken(prepared.replacementToken);
+	if (!token) throw Error("Missing token");
+	mocks.fetch.mockImplementation(async () =>
+		Response.json({
+			metadata: { duration: 30, width: 640, height: 360, fps: 29.97 },
+		}),
+	);
+	await invalidateVideoCache(video.id, prepared.replacementToken);
+	expect(await current()).toMatchObject({
+		duration: 30,
+		width: 640,
+		height: 360,
+		fps: 30,
+		metadata: { editingBase: { sourceKey: token.outputKey, duration: 30 } },
+	});
+	expect(mocks.fetch).toHaveBeenCalledWith(
+		"https://media.test/video/probe",
+		expect.objectContaining({
+			body: JSON.stringify({
+				videoUrl: `https://storage.test/canonical/${token.outputKey}`,
+			}),
+		}),
+	);
+});
+it("releases only its unpublished reservation after probe failure while retaining working media and edits", async () => {
+	const oldOriginal = `${video.ownerId}/${video.id}/source/original.mp4`;
+	await change({ duration: 5 });
+	await runtime.database
+		.insert(Db.videoEdits)
+		.values({ videoId: video.id, sourceKey: oldOriginal, editSpec });
+	const before = await current(),
+		prepared = await getVideoReplaceUploadUrl(video.id);
+	mocks.fetch.mockImplementationOnce(async () =>
+		Response.json({}, { status: 503 }),
+	);
+	await expect(
+		invalidateVideoCache(video.id, prepared.replacementToken),
+	).rejects.toThrow("could not be verified");
+	expect(await current()).toEqual(before);
+	expect(
+		await runtime.database
+			.select()
+			.from(Db.videoEdits)
+			.where(eq(Db.videoEdits.videoId, video.id)),
+	).toMatchObject([{ sourceKey: oldOriginal }]);
+	expect(
+		await runtime.database
+			.select()
+			.from(Db.videoUploads)
+			.where(eq(Db.videoUploads.videoId, video.id)),
+	).toEqual([]);
+	expect(mocks.deleteObjects).not.toHaveBeenCalled();
+	expect(await getVideoReplaceUploadUrl(video.id)).toHaveProperty(
+		"replacementToken",
+	);
+});
+it("rechecks the current administrator after replacement probing", async () => {
+	vi.stubEnv("CAP_RUNTIME", "cloudflare");
+	vi.stubEnv("CAP_OWNER_EMAIL", "admin@cap.test");
+	await runtime.database
+		.update(Db.users)
+		.set({ emailVerified: new Date() })
+		.where(eq(Db.users.id, User.UserId.make("admin")));
+	const prepared = await getVideoReplaceUploadUrl(video.id),
+		before = await current();
+	mocks.fetch.mockImplementationOnce(async () => {
+		await runtime.database
+			.update(Db.users)
+			.set({ emailVerified: null })
+			.where(eq(Db.users.id, User.UserId.make("admin")));
+		return Response.json({
+			metadata: { duration: 30, width: 640, height: 360, fps: 30 },
+		});
+	});
+	try {
+		await expect(
+			invalidateVideoCache(video.id, prepared.replacementToken),
+		).rejects.toThrow("Unauthorized");
+		expect(await current()).toEqual(before);
+	} finally {
+		await runtime.database
+			.update(Db.users)
+			.set({ emailVerified: new Date() })
+			.where(eq(Db.users.id, User.UserId.make("admin")));
+	}
 });

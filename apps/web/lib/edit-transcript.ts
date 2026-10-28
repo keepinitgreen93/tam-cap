@@ -23,7 +23,7 @@ export type EditTranscriptBackfillStatus = {
 	requestedAt: string;
 };
 
-const MAX_CUT_PADDING_MS = 80;
+const MAX_CUT_PADDING_MS = 150;
 const MIN_PLAYABLE_DURATION_MS = 50;
 const UNKNOWN_SPEECH_MODEL = "unknown";
 

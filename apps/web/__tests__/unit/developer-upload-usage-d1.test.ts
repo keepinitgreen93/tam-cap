@@ -25,22 +25,18 @@ async function input(balance = 10000) {
 	const accountId = nanoId();
 	const videoId = nanoId();
 	await fixture.database.batch([
-		fixture.database
-			.insert(developerApps)
-			.values({
-				id: appId,
-				ownerId: owner.id,
-				name: "SDK",
-				environment: "development",
-			}),
-		fixture.database
-			.insert(developerCreditAccounts)
-			.values({
-				id: accountId,
-				appId,
-				ownerId: owner.id,
-				balanceMicroCredits: balance,
-			}),
+		fixture.database.insert(developerApps).values({
+			id: appId,
+			ownerId: owner.id,
+			name: "SDK",
+			environment: "development",
+		}),
+		fixture.database.insert(developerCreditAccounts).values({
+			id: accountId,
+			appId,
+			ownerId: owner.id,
+			balanceMicroCredits: balance,
+		}),
 		fixture.database.insert(developerVideos).values({ id: videoId, appId }),
 	]);
 	return {
@@ -150,3 +146,31 @@ it("rolls back video publication if its completion receipt fails", async () => {
 		await fixture.binding.prepare("DROP TRIGGER reject_sdk_completion").run();
 	}
 });
+
+it.each([25.06, 29.97])(
+	"finishes developer metadata with fractional fps %s",
+	async (fps) => {
+		const value = await input();
+		await reserveDeveloperUpload(fixture.database, value);
+		await finishDeveloperUpload(fixture.database, {
+			...value,
+			duration: 19.198,
+			width: 1280,
+			height: 720,
+			fps,
+		});
+		const [video] = await fixture.database
+			.select()
+			.from(developerVideos)
+			.where(eq(developerVideos.id, value.videoId));
+		expect(video).toMatchObject({
+			duration: 19.198,
+			fps: Math.round(fps),
+			width: 1280,
+			height: 720,
+		});
+		expect(await reserveDeveloperUpload(fixture.database, value)).toBe(
+			"complete",
+		);
+	},
+);

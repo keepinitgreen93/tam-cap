@@ -365,16 +365,18 @@ describe("Loom import actions on D1", () => {
 		expect(state.dub).not.toHaveBeenCalled();
 	});
 	it("repairs only the matching orphan among many stored source mappings", async () => {
-		await runtime.database.batch(
-			Array.from({ length: 50 }, (_, index) =>
-				runtime.database.insert(importedVideos).values({
-					id: nanoId() as typeof videos.$inferSelect.id,
-					orgId: owner.activeOrganizationId,
-					source: "loom",
-					sourceId: index === 0 ? loomId : `other-source-${index}`,
+		for (let offset = 0; offset < 50; offset += 10)
+			await runtime.database.insert(importedVideos).values(
+				Array.from({ length: 10 }, (_, localIndex) => {
+					const index = offset + localIndex;
+					return {
+						id: nanoId() as typeof videos.$inferSelect.id,
+						orgId: owner.activeOrganizationId,
+						source: "loom" as const,
+						sourceId: index === 0 ? loomId : `other-source-${index}`,
+					};
 				}),
-			),
-		);
+			);
 		expect((await invoke()).success).toBe(true);
 		const rows = await runtime.database
 			.select()

@@ -6,7 +6,7 @@ import {
 } from "@cap/database/cloudflare/schema";
 import { getTranscriptObjectKey } from "@cap/database/cloudflare/transcript-publication";
 import { claimTranscriptionRun } from "@cap/database/cloudflare/transcription-state";
-import type { VideoEditSpec } from "@cap/database/types";
+import type { VideoEditSpec, VideoMetadata } from "@cap/database/types";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
 import {
@@ -45,7 +45,7 @@ const videoRow = vi.hoisted(() => ({
 			requestId: "00000000-0000-4000-8000-000000000001",
 			requestedAt: "2026-07-30T00:00:00.000Z",
 		},
-	},
+	} as VideoMetadata,
 }));
 
 const state = vi.hoisted(() => ({
@@ -473,6 +473,42 @@ describe("transcribeVideoWorkflow", () => {
 		expect(writtenKeys).toContain(await artifactKey("vtt"));
 		expect(await artifactKey("edit")).toBeNull();
 	});
+	it("transcribes a replacement from its current immutable base with no legacy edit row", async () => {
+		const prior = videoRow.metadata;
+		const key = "user-456/video-123/.recording/outputs/replacement/result.mp4";
+		videoRow.metadata = {
+			editingBase: {
+				version: 1,
+				id: "00000000-0000-4000-8000-000000000004",
+				sourceKey: key,
+				duration: 12,
+			},
+		};
+		try {
+			expect(
+				(
+					await transcribeVideoWorkflow({
+						videoId: "video-123",
+						userId: "user-456",
+						aiGenerationEnabled: false,
+					})
+				).success,
+			).toBe(true);
+			expect(mocks.getInternalSignedObjectUrl.mock.calls[0]?.[0]).toBe(key);
+			const { decryptEditTranscriptObject } = await import(
+				"@/lib/edit-transcript-storage"
+			);
+			const stored = state.objects.get((await artifactKey("edit")) ?? "");
+			expect(
+				JSON.parse(
+					decryptEditTranscriptObject(stored ?? "", "user-456", "video-123") ??
+						"{}",
+				).durationMs,
+			).toBe(12000);
+		} finally {
+			videoRow.metadata = prior;
+		}
+	});
 });
 
 describe("backfillEditTranscriptWorkflow", () => {
@@ -559,6 +595,32 @@ describe("backfillEditTranscriptWorkflow", () => {
 		},
 	);
 
+	it("backfills the current immutable editing base after a replacement retires old edits", async () => {
+		const key = "user-456/video-123/.recording/outputs/replacement/result.mp4";
+		videoRow.metadata.editingBase = {
+			version: 1,
+			id: "00000000-0000-4000-8000-000000000003",
+			sourceKey: key,
+			duration: 12,
+		};
+		const result = await backfillEditTranscriptWorkflow({
+			videoId: "video-123",
+			userId: "user-456",
+			requestId: "00000000-0000-4000-8000-000000000001",
+		});
+		expect(result.success).toBe(true);
+		expect(mocks.getInternalSignedObjectUrl.mock.calls[0]?.[0]).toBe(key);
+		const { decryptEditTranscriptObject } = await import(
+			"@/lib/edit-transcript-storage"
+		);
+		const stored = state.objects.get((await artifactKey("edit")) ?? "");
+		expect(
+			JSON.parse(
+				decryptEditTranscriptObject(stored ?? "", "user-456", "video-123") ??
+					"{}",
+			).durationMs,
+		).toBe(12000);
+	});
 	it("does not run a backfill after its database claim is replaced", async () => {
 		const result = await backfillEditTranscriptWorkflow({
 			videoId: "video-123",

@@ -274,4 +274,15 @@ describe("saveVideoEdits original source copy", () => {
 
 		expect(copyObjectMock).not.toHaveBeenCalled();
 	});
+	it("does not replace a missing preserved original with the already-edited result", async () => {
+		setUpVideo({ edited: true });
+		headObjectMock.mockReturnValue(
+			Effect.fail(storageError(s3Error("NotFound", 404))),
+		);
+		await expect(saveTrim(60)).rejects.toThrow(
+			"Original editing base is no longer available",
+		);
+		expect(copyObjectMock).not.toHaveBeenCalled();
+		expect(startMock).not.toHaveBeenCalled();
+	});
 });

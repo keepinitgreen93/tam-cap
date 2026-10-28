@@ -19,6 +19,9 @@
   "trustedDependencies": [
     "node-av",
   ],
+  "patchedDependencies": {
+    "zod@3.25.76": "patches/zod@3.25.76.patch",
+  },
   "packages": {
     "@babel/runtime": ["@babel/runtime@7.29.2", "", {}, "sha512-JiDShH45zKHWyGe4ZNVRrCjBz8Nh9TMmZG1kh4QTK8hCBTWBi8Da+i7s1fJw7/lYpM4ccepSNfqzZ/QvABBi5g=="],
 

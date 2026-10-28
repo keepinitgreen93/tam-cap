@@ -35,6 +35,7 @@ import {
 	recordingVerificationSchema,
 } from "@/lib/desktop-recording-verification";
 import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota-cache";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
@@ -572,7 +573,7 @@ export async function applyDesktopRecordingProgress(input: unknown): Promise<{
 					duration: completion.metadata.duration,
 					width: completion.metadata.width,
 					height: completion.metadata.height,
-					fps: Math.round(completion.metadata.fps),
+					fps: normalizeVideoFps(completion.metadata.fps),
 				})
 				.where(and(eq(videos.id, videoId), eq(videos.ownerId, job.ownerId))),
 		);

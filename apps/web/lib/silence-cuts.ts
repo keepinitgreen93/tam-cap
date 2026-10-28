@@ -104,14 +104,27 @@ export function planSilenceCuts({
 		return { ranges: [], error: "Audio or transcript timing is invalid." };
 	}
 	const normalizedKeeps = mergeRanges(kept);
-	const safeCandidates = mergeRanges(candidates).filter(
-		(range) =>
-			!words.some(
-				(word) =>
-					word.startMs - HANDLE_MS < range.endMs &&
-					word.endMs + HANDLE_MS > range.startMs,
-			),
+	const protectedSpeech = mergeRanges(
+		words.map((word) => ({
+			startMs: Math.max(0, word.startMs - HANDLE_MS),
+			endMs: Math.min(durationMs, word.endMs + HANDLE_MS),
+		})),
 	);
+	const safeCandidates = mergeRanges(candidates).flatMap((candidate) => {
+		const safe: SilenceRange[] = [];
+		let cursor = candidate.startMs;
+		for (const speech of protectedSpeech) {
+			if (speech.endMs <= cursor) continue;
+			if (speech.startMs >= candidate.endMs) break;
+			if (speech.startMs > cursor)
+				safe.push({ startMs: cursor, endMs: speech.startMs });
+			cursor = Math.max(cursor, speech.endMs);
+			if (cursor >= candidate.endMs) break;
+		}
+		if (cursor < candidate.endMs)
+			safe.push({ startMs: cursor, endMs: candidate.endMs });
+		return safe;
+	});
 	const ranges = normalizedKeeps.flatMap((keep) =>
 		safeCandidates.flatMap((range) => {
 			const startMs = Math.max(range.startMs, keep.startMs);

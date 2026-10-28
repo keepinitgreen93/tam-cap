@@ -25,8 +25,10 @@ export function previewHeadersForUrl(url, incomingHeaders, previewKey) {
 }
 
 export function installPrivatePreviewFetch({ origin, previewKey }) {
+	if (globalThis.fetch.__tamPrivatePreview) return;
 	const original = globalThis.fetch.bind(globalThis);
-	globalThis.fetch = (input, init) => {
+	globalThis.__tamPreviewStatuses = [];
+	const wrapped = (input, init) => {
 		const request = new Request(input, init);
 		const headers = new Headers(request.headers);
 		headers.delete("x-cap-preview-key");
@@ -37,8 +39,26 @@ export function installPrivatePreviewFetch({ origin, previewKey }) {
 				headers,
 				...(matchesOrigin ? { redirect: "manual" } : {}),
 			}),
-		);
+		).then((response) => {
+			if (matchesOrigin) {
+				const pathname = new URL(request.url).pathname;
+				const endpoint = [
+					"/api/extension/auth/start",
+					"/api/extension/auth/approve",
+					"/api/extension/bootstrap",
+				].includes(pathname)
+					? pathname
+					: "other_stage_request";
+				globalThis.__tamPreviewStatuses.push({
+					endpoint,
+					status: response.status,
+				});
+			}
+			return response;
+		});
 	};
+	wrapped.__tamPrivatePreview = true;
+	globalThis.fetch = wrapped;
 }
 
 export function permittedOwnerCookies(state) {
@@ -78,6 +98,8 @@ async function poll(check, timeoutMs = 30000) {
 export async function runLiveHarness({
 	capture = false,
 	afterOwnerCapture = false,
+	headed = false,
+	testIdentityReturnShim = false,
 } = {}) {
 	if (
 		[
@@ -106,11 +128,15 @@ export async function runLiveHarness({
 	let step = "launch";
 	let uploadedBytes = 0;
 	let completed = false;
+	let activeWorker = null;
+	const routeStatuses = [];
+	const identityTargets = new Map();
+	let controlledIdentityResponse = null;
 	const context = await chromium.launchPersistentContext(
 		path.join(privateRoot, "profile"),
 		{
 			channel: "chromium",
-			headless: true,
+			headless: !headed,
 			viewport: { width: 1280, height: 720 },
 			args: [
 				`--disable-extensions-except=${path.join(extensionRoot, "dist/staging")}`,
@@ -125,6 +151,32 @@ export async function runLiveHarness({
 		},
 	);
 	try {
+		const browserProtocol = await context.browser()?.newBrowserCDPSession();
+		if (browserProtocol) {
+			const observe = ({ targetInfo }) => {
+				let surface = "other";
+				try {
+					const url = new URL(targetInfo.url);
+					surface =
+						url.origin === stagingOrigin
+							? "stage"
+							: url.protocol === "chrome-extension:"
+								? "extension"
+								: url.hostname.endsWith(".chromiumapp.org")
+									? "identity_callback"
+									: "other";
+				} catch {}
+				identityTargets.set(targetInfo.targetId, {
+					type: targetInfo.type,
+					surface,
+				});
+			};
+			browserProtocol.on("Target.targetCreated", observe);
+			browserProtocol.on("Target.targetInfoChanged", observe);
+			await browserProtocol.send("Target.setDiscoverTargets", {
+				discover: true,
+			});
+		}
 		await context.addCookies(cookies);
 		await context.route("**/*", async (route) => {
 			try {
@@ -149,6 +201,37 @@ export async function runLiveHarness({
 				);
 				if (new URL(request.url()).origin === stagingOrigin) {
 					const response = await route.fetch({ headers, maxRedirects: 0 });
+					if (
+						[
+							"/api/extension/auth/start",
+							"/api/extension/auth/approve",
+							"/login",
+						].includes(target.pathname)
+					)
+						routeStatuses.push({
+							endpoint: target.pathname,
+							status: response.status(),
+						});
+					if (
+						testIdentityReturnShim &&
+						target.pathname === "/api/extension/auth/approve" &&
+						request.method() === "POST" &&
+						response.status() === 302
+					) {
+						const location = response.headers().location;
+						if (
+							location &&
+							new URL(location).origin ===
+								`https://${prepared.extensionId}.chromiumapp.org`
+						) {
+							controlledIdentityResponse = location;
+							await route.fulfill({
+								contentType: "text/html",
+								body: "<!doctype html><title>Private identity transport verification</title><p>The real consent response was captured for the isolated test.</p>",
+							});
+							return;
+						}
+					}
 					await route.fulfill({ response });
 				} else {
 					await route.continue({ headers });
@@ -179,6 +262,7 @@ export async function runLiveHarness({
 				.find((entry) => new URL(entry.url()).host === prepared.extensionId) ??
 			(await context.waitForEvent("serviceworker"));
 		await install(worker);
+		activeWorker = worker;
 		const popup = await context.newPage();
 		await popup.goto(`chrome-extension://${prepared.extensionId}/popup.html`);
 		step = "authentication";
@@ -190,20 +274,57 @@ export async function runLiveHarness({
 			}, stagingOrigin);
 		let signInExecuted = false;
 		if (!(await hasCredential())) {
-			const authWindow = context.waitForEvent("page", { timeout: 30000 });
+			step = "auth_window_request";
+			if (testIdentityReturnShim) {
+				await worker.evaluate(() => {
+					chrome.identity.launchWebAuthFlow = (details, callback) => {
+						globalThis.__tamControlledIdentity = { url: details.url, callback };
+					};
+				});
+			}
+			const authWindow = testIdentityReturnShim
+				? null
+				: context.waitForEvent("page", { timeout: 30000 });
 			await popup
 				.getByRole("button", { name: "Sign in to Cap", exact: true })
 				.click();
-			const consent = await authWindow;
+			step = "auth_window_wait";
+			let consent;
+			if (testIdentityReturnShim) {
+				const url = await poll(() =>
+					worker.evaluate(
+						() => globalThis.__tamControlledIdentity?.url ?? null,
+					),
+				);
+				if (new URL(url).origin !== stagingOrigin)
+					throw new Error("controlled_consent_origin_mismatch");
+				consent = await context.newPage();
+				await consent.goto(url);
+			} else consent = await authWindow;
+			step = "consent_navigation";
 			await consent.waitForURL((url) => url.origin === stagingOrigin, {
 				timeout: 30000,
 			});
+			step = "consent_form";
 			await consent
 				.getByRole("button", { name: "Allow access", exact: true })
 				.waitFor({ state: "visible", timeout: 15000 });
+			step = "consent_approval";
 			await consent
 				.getByRole("button", { name: "Allow access", exact: true })
 				.click();
+			step = "credential_mint";
+			if (testIdentityReturnShim) {
+				const response = await poll(() =>
+					Promise.resolve(controlledIdentityResponse),
+				);
+				await worker.evaluate((url) => {
+					const callback = globalThis.__tamControlledIdentity.callback;
+					delete globalThis.__tamControlledIdentity;
+					callback(url);
+				}, response);
+				controlledIdentityResponse = null;
+			}
 			await poll(hasCredential);
 			signInExecuted = true;
 		}
@@ -228,6 +349,11 @@ export async function runLiveHarness({
 			origin: stagingOrigin,
 			extensionId: prepared.extensionId,
 			signInExecuted,
+			identityFlow: signInExecuted
+				? testIdentityReturnShim
+					? "controlled_return_shim"
+					: "native_chrome_identity"
+				: "existing_private_credential",
 			authenticatedBootstrap: true,
 			syntheticCapture: capture,
 			uploadedBytesObserved: 0,
@@ -373,11 +499,67 @@ export async function runLiveHarness({
 		);
 		return result;
 	} catch {
+		const workerState = await activeWorker
+			?.evaluate(async () => {
+				const session = await chrome.storage.session.get(
+					"cap-extension-auth-error",
+				);
+				const local = await chrome.storage.local.get([
+					"cap-extension-auth",
+					"cap-extension-pending-auth",
+				]);
+				const error = String(
+					session["cap-extension-auth-error"] ?? "",
+				).toLowerCase();
+				const errorCategory = !error
+					? "none"
+					: error.includes("400")
+						? "auth_start_bad_request"
+						: error.includes("503")
+							? "stage_unavailable"
+							: error.includes("could not be loaded")
+								? "auth_page_load_failed"
+								: error.includes("canceled") || error.includes("cancelled")
+									? "auth_cancelled"
+									: "other_redacted_auth_error";
+				return {
+					errorCategory,
+					credentialStored: Boolean(local["cap-extension-auth"]?.authApiKey),
+					authPending: Boolean(local["cap-extension-pending-auth"]),
+					fetchStatuses: globalThis.__tamPreviewStatuses?.slice(-20) ?? [],
+				};
+			})
+			.catch(() => null);
+		const pages = context.pages().map((page) => {
+			const url = new URL(page.url());
+			return url.origin === stagingOrigin
+				? {
+						surface: "stage",
+						page:
+							url.pathname === "/login"
+								? "login"
+								: url.pathname === "/api/extension/auth/start"
+									? "consent"
+									: "other",
+					}
+				: {
+						surface:
+							url.protocol === "chrome-extension:"
+								? "extension"
+								: url.hostname.endsWith(".chromiumapp.org")
+									? "identity_callback"
+									: "other",
+					};
+		});
 		await writeFile(
 			path.join(privateRoot, "failure.json"),
 			JSON.stringify({
 				step,
 				completed: false,
+				routeStatuses,
+				workerState,
+				pages,
+				identityTargets: Array.from(identityTargets.values()),
 				timestamp: new Date().toISOString(),
 			}),
 		);
@@ -403,6 +585,8 @@ if (
 			await runLiveHarness({
 				capture: argumentsSet.has("--capture"),
 				afterOwnerCapture: argumentsSet.has("--after-owner-capture"),
+				headed: argumentsSet.has("--headed"),
+				testIdentityReturnShim: argumentsSet.has("--test-identity-return-shim"),
 			});
 	} catch (error) {
 		console.error(

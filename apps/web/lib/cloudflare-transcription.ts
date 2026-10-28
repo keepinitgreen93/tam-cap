@@ -1,11 +1,11 @@
-export const CLOUDFLARE_SPEECH_MODEL = "@cf/deepgram/nova-3";
+export const CLOUDFLARE_SPEECH_MODEL = "@cf/openai/whisper-large-v3-turbo";
 
 export interface CloudflareTranscriptWord {
 	text: string;
 	start: number;
 	end: number;
 	confidence: number | null;
-	speaker: string | null;
+	speaker: null;
 	channel: string;
 }
 
@@ -42,6 +42,16 @@ function finiteNumber(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value);
 }
 
+function confidence(value: unknown): number | null {
+	if (value === undefined) return null;
+	if (!finiteNumber(value) || value < 0 || value > 1) {
+		throw new CloudflareTranscriptionError(
+			"Invalid Cloudflare word confidence",
+		);
+	}
+	return value;
+}
+
 export function parseCloudflareTranscription(
 	response: unknown,
 	sourceDurationMs?: number,
@@ -51,98 +61,67 @@ export function parseCloudflareTranscription(
 		throw new CloudflareTranscriptionError("Cloudflare transcription failed");
 	}
 	const result = record(envelope.result);
-	const metadata = result.metadata === undefined ? {} : record(result.metadata);
+	const info =
+		result.transcription_info === undefined
+			? {}
+			: record(result.transcription_info);
 	const duration =
-		sourceDurationMs === undefined
-			? metadata.duration
-			: sourceDurationMs / 1000;
+		sourceDurationMs === undefined ? info.duration : sourceDurationMs / 1000;
 	if (!finiteNumber(duration) || duration <= 0) {
 		throw new CloudflareTranscriptionError("Invalid Cloudflare audio duration");
 	}
-	const channels = record(result.results).channels;
-	if (!Array.isArray(channels) || channels.length !== 1) {
+	if (typeof result.text !== "string" || !Array.isArray(result.segments)) {
 		throw new CloudflareTranscriptionError(
-			"Invalid Cloudflare transcription channels",
+			"Missing Cloudflare transcription segments",
 		);
 	}
-	const channel = record(channels[0]);
-	const alternatives = channel.alternatives;
-	if (!Array.isArray(alternatives) || alternatives.length === 0) {
-		throw new CloudflareTranscriptionError(
-			"Missing Cloudflare transcription alternative",
-		);
+	if (info.language_probability !== undefined)
+		confidence(info.language_probability);
+	const words: CloudflareTranscriptWord[] = [];
+	for (const value of result.segments) {
+		const segment = record(value);
+		if (typeof segment.text !== "string" || !Array.isArray(segment.words)) {
+			throw new CloudflareTranscriptionError("Missing Cloudflare word timings");
+		}
+		if (segment.words.length === 0 && segment.text.trim()) {
+			throw new CloudflareTranscriptionError("Missing Cloudflare word timings");
+		}
+		for (const value of segment.words) {
+			const word = record(value);
+			if (
+				typeof word.word !== "string" ||
+				!word.word.trim() ||
+				!finiteNumber(word.start) ||
+				!finiteNumber(word.end) ||
+				word.start < 0 ||
+				word.end <= word.start ||
+				word.end > duration ||
+				Math.round(word.end * 1000) <= Math.round(word.start * 1000)
+			) {
+				throw new CloudflareTranscriptionError(
+					"Invalid Cloudflare word timing",
+				);
+			}
+			words.push({
+				text: word.word.trim(),
+				start: Math.round(word.start * 1000),
+				end: Math.round(word.end * 1000),
+				confidence: confidence(word.confidence),
+				speaker: null,
+				channel: "0",
+			});
+		}
 	}
-	const alternative = record(alternatives[0]);
-	if (
-		!Array.isArray(alternative.words) ||
-		typeof alternative.transcript !== "string"
-	) {
-		throw new CloudflareTranscriptionError(
-			"Missing Cloudflare transcription words",
-		);
-	}
-	if (alternative.words.length === 0 && alternative.transcript.trim()) {
+	if (!words.length && result.text.trim()) {
 		throw new CloudflareTranscriptionError("Missing Cloudflare word timings");
 	}
-	const words = alternative.words.map((value): CloudflareTranscriptWord => {
-		const word = record(value);
-		const text =
-			typeof word.punctuated_word === "string"
-				? word.punctuated_word
-				: word.word;
-		if (
-			typeof text !== "string" ||
-			!text.trim() ||
-			!finiteNumber(word.start) ||
-			!finiteNumber(word.end) ||
-			word.start < 0 ||
-			word.end <= word.start ||
-			word.end > duration ||
-			Math.round(word.end * 1000) <= Math.round(word.start * 1000)
-		) {
-			throw new CloudflareTranscriptionError("Invalid Cloudflare word timing");
-		}
-		if (
-			word.confidence !== undefined &&
-			(!finiteNumber(word.confidence) ||
-				word.confidence < 0 ||
-				word.confidence > 1)
-		) {
-			throw new CloudflareTranscriptionError(
-				"Invalid Cloudflare word confidence",
-			);
-		}
-		if (
-			word.speaker !== undefined &&
-			(!finiteNumber(word.speaker) ||
-				!Number.isInteger(word.speaker) ||
-				word.speaker < 0)
-		) {
-			throw new CloudflareTranscriptionError("Invalid Cloudflare word speaker");
-		}
-		return {
-			text: text.trim(),
-			start: Math.round(word.start * 1000),
-			end: Math.round(word.end * 1000),
-			confidence:
-				word.confidence === undefined ? null : (word.confidence as number),
-			speaker: word.speaker === undefined ? null : String(word.speaker),
-			channel: "0",
-		};
-	});
 	return {
-		id:
-			typeof metadata.request_id === "string"
-				? metadata.request_id
-				: "cloudflare",
+		id: "cloudflare",
 		status: words.length ? "completed" : "error",
 		...(words.length ? {} : { error: "No spoken audio" }),
 		words,
 		audio_duration: duration,
-		language_code:
-			typeof channel.detected_language === "string"
-				? channel.detected_language
-				: null,
+		language_code: typeof info.language === "string" ? info.language : null,
 		speech_model_used: CLOUDFLARE_SPEECH_MODEL,
 	};
 }
@@ -155,7 +134,7 @@ export async function transcribeWithCloudflare(
 		input: RequestInfo | URL,
 		init?: RequestInit,
 	) => Promise<Response> = fetch,
-	contentType = "audio/mpeg",
+	_contentType = "audio/mpeg",
 	sourceDurationMs?: number,
 ): Promise<CloudflareTranscript> {
 	if (
@@ -167,36 +146,30 @@ export async function transcribeWithCloudflare(
 			"Missing or invalid Cloudflare transcription credentials",
 		);
 	}
-	if (audio.byteLength === 0) {
+	if (audio.byteLength === 0)
 		throw new CloudflareTranscriptionError(
 			"Empty Cloudflare transcription audio",
 		);
-	}
 	if (!finiteNumber(sourceDurationMs) || sourceDurationMs <= 0) {
 		throw new CloudflareTranscriptionError(
 			"Missing or invalid source audio duration",
 		);
 	}
-	const endpoint = new URL(
-		`https://api.cloudflare.com/client/v4/accounts/${credentials.accountId}/ai/run/${CLOUDFLARE_SPEECH_MODEL}`,
-	);
-	endpoint.searchParams.set("filler_words", "true");
-	endpoint.searchParams.set("punctuate", "true");
-	endpoint.searchParams.set("diarize", "true");
-	if (language === "auto") {
-		endpoint.searchParams.set("detect_language", "true");
-	} else {
-		endpoint.searchParams.set("language", language);
-	}
+	const endpoint = `https://api.cloudflare.com/client/v4/accounts/${credentials.accountId}/ai/run/${CLOUDFLARE_SPEECH_MODEL}`;
 	let response: Response;
 	try {
 		response = await fetcher(endpoint, {
 			method: "POST",
 			headers: {
 				Authorization: `Bearer ${credentials.apiToken}`,
-				"Content-Type": contentType,
+				"Content-Type": "application/json",
 			},
-			body: new Uint8Array(audio).buffer,
+			body: JSON.stringify({
+				audio: Buffer.from(audio).toString("base64"),
+				task: "transcribe",
+				vad_filter: false,
+				...(language === "auto" ? {} : { language }),
+			}),
 			redirect: "error",
 			signal: AbortSignal.timeout(120_000),
 		});

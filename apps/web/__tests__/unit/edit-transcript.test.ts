@@ -1,5 +1,6 @@
 import type { VideoEditSpec } from "@cap/database/types";
 import { describe, expect, it } from "vitest";
+import { parseCloudflareTranscription } from "@/lib/cloudflare-transcription";
 import {
 	createEditTranscript,
 	editTranscriptWordsToCaptionVtt,
@@ -19,6 +20,7 @@ import {
 	assemblyAIEditResponse,
 	assemblyAIRealFillerResponse,
 } from "../fixtures/assemblyai-edit-response";
+import { cloudflareWhisperResponse } from "../fixtures/cloudflare-whisper-response";
 
 function editSpec(
 	sourceDuration: number,
@@ -173,11 +175,35 @@ describe("edit transcript", () => {
 		const plan = planTranscriptCut(transcript.words, 6, 6, 4_000);
 
 		expect(plan).toEqual({
-			startMs: 2_220,
+			startMs: 2_150,
 			endMs: 2_635,
 			safe: true,
 			reason: null,
 		});
+	});
+
+	it("pads live Whisper filler boundaries while preserving adjacent words", () => {
+		const parsed = parseCloudflareTranscription(
+			cloudflareWhisperResponse,
+			17_134,
+		);
+		const transcript = createEditTranscript(parsed, 17_134);
+		const plan = planFillerCuts(transcript.words, transcript.durationMs);
+		expect(plan).toEqual({
+			ranges: [
+				{ startMs: 810, endMs: 1750, safe: true, reason: null },
+				{ startMs: 6110, endMs: 7040, safe: true, reason: null },
+			],
+			fillerCount: 2,
+			skippedCount: 0,
+		});
+		expect(transcript.words[1]).toMatchObject({ startMs: 960, endMs: 1620 });
+		expect(plan.ranges[0]?.endMs).toBeLessThan(
+			transcript.words[2]?.startMs ?? 0,
+		);
+		expect(plan.ranges[1]?.endMs).toBeLessThan(
+			transcript.words[9]?.startMs ?? 0,
+		);
 	});
 
 	it("marks a cut unsafe when unselected speech overlaps it", () => {
@@ -219,7 +245,7 @@ describe("edit transcript", () => {
 					reason: null,
 				},
 				{
-					startMs: 2_220,
+					startMs: 2_150,
 					endMs: 2_635,
 					safe: true,
 					reason: null,
@@ -239,7 +265,7 @@ describe("edit transcript", () => {
 		expect(planFillerCuts(transcript.words, transcript.durationMs)).toEqual({
 			ranges: [
 				{
-					startMs: 3_380,
+					startMs: 3_330,
 					endMs: 3_980,
 					safe: true,
 					reason: null,

@@ -394,7 +394,7 @@ export default async function ShareVideoPage(props: PageProps<"/s/[videoId]">) {
 					organizationIconUrl: organizations.iconUrl,
 					shareableLinkIconUrl: organizations.shareableLinkIconUrl,
 					hasActiveUpload:
-						sql`${videoUploads.videoId} IS NOT NULL AND ${videos.isScreenshot} = false`.mapWith(
+						sql`${videoUploads.videoId} IS NOT NULL AND ${videoUploads.phase} <> 'complete' AND ${videos.isScreenshot} = false`.mapWith(
 							Boolean,
 						),
 					activeUploadRawFileKey: videoUploads.rawFileKey,
@@ -970,6 +970,7 @@ async function AuthorizedContent({
 			ownerId: video.owner.id,
 			videoId,
 			rawFileKey: video.activeUploadRawFileKey,
+			metadata: video.metadata,
 		}) && !video.isScreenshot;
 
 	const defaultPlaybackSpeed = resolveDefaultPlaybackSpeed(

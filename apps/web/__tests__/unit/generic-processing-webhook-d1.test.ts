@@ -83,6 +83,7 @@ async function complete(
 	token: string,
 	attemptId: string,
 	secret = "secret",
+	fps = 30,
 ) {
 	return POST(
 		new NextRequest(
@@ -98,7 +99,7 @@ async function complete(
 					jobId: `process_${attemptId}`,
 					phase: "complete",
 					progress: 100,
-					metadata: { width: 1920, height: 1080, fps: 30, duration: 20 },
+					metadata: { width: 1920, height: 1080, fps, duration: 20 },
 				}),
 			},
 		),
@@ -172,3 +173,38 @@ it("rejects unauthenticated completion before publishing", async () => {
 		)[0]?.source,
 	).toEqual({ type: "webMP4" });
 });
+
+it.each([25.06, 29.97])(
+	"completes a generic processing callback with fractional fps %s on native D1",
+	async (fps) => {
+		const value = await input();
+		const claimed = await claimVideoProcessing(fixture.database, value);
+		if (!claimed.run) throw new Error("Missing processing run");
+		await fixture.database
+			.update(videoUploads)
+			.set({ phase: "generating_thumbnail", processingProgress: 90 })
+			.where(eq(videoUploads.videoId, value.videoId));
+		const response = await complete(
+			value.videoId,
+			claimed.run.token,
+			claimed.run.attemptId,
+			"secret",
+			fps,
+		);
+		expect(response.status).toBe(200);
+		const [video] = await fixture.database
+			.select()
+			.from(videos)
+			.where(eq(videos.id, value.videoId));
+		const [upload] = await fixture.database
+			.select()
+			.from(videoUploads)
+			.where(eq(videoUploads.videoId, value.videoId));
+		expect(video).toMatchObject({
+			fps: Math.round(fps),
+			source: { outputKey: claimed.run.outputKey },
+			duration: 20,
+		});
+		expect(upload?.phase).toBe("complete");
+	},
+);

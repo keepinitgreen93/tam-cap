@@ -236,8 +236,14 @@ it("public sharing hides private, password, uploading, missing, and tombstoned r
 	expect(await getPublicShareVideo(Video.VideoId.make("missing"))).toBeNull();
 });
 it("metadata changes retain transcript and edit fencing state and validate client fields", async () => {
-	const { videoId } = await fixture();
+	const { videoId, ownerId } = await fixture();
 	const protectedMetadata = {
+		editingBase: {
+			version: 1 as const,
+			id: crypto.randomUUID(),
+			sourceKey: `${ownerId}/${videoId}/.recording/outputs/base/result.mp4`,
+			duration: 12,
+		},
 		transcriptPublication: {
 			version: 1 as const,
 			id: crypto.randomUUID(),
@@ -261,6 +267,7 @@ it("metadata changes retain transcript and edit fencing state and validate clien
 				sourceName: "new.mp4",
 				transcriptPublication: null,
 				editTranscriptBackfill: null,
+				editingBase: null,
 			})
 		).status,
 	).toBe(200);

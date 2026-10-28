@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { TranscriptionEnvironment } from "../../lib/transcription-config";
 import { isTranscriptionConfigured } from "../../lib/transcription-config";
+import { cloudflareWhisperResponse } from "../fixtures/cloudflare-whisper-response";
 
 const state = vi.hoisted(() => ({
 	env: {} as TranscriptionEnvironment,
@@ -34,6 +35,36 @@ describe("transcription provider selection", () => {
 		expect(isTranscriptionConfigured(state.env)).toBe(true);
 		const transcript = await transcribeAudio(new Uint8Array([1]), "auto");
 		expect(transcript.words?.[0]?.text).toBe("existing");
+	});
+
+	it("uses Cloudflare Whisper words for the canonical Cloudflare provider", async () => {
+		state.env = {
+			TRANSCRIPTION_PROVIDER: "cloudflare",
+			CLOUDFLARE_ACCOUNT_ID: "0123456789abcdef0123456789abcdef",
+			CLOUDFLARE_AI_API_TOKEN: "test-token",
+		};
+		let target = "";
+		vi.stubGlobal("fetch", async (url: string) => {
+			target = url;
+			return Response.json(cloudflareWhisperResponse);
+		});
+		try {
+			const transcript = await transcribeAudio(
+				new Uint8Array([1]),
+				"auto",
+				"audio/mpeg",
+				17_134,
+			);
+			expect(target).toContain("/ai/run/@cf/openai/whisper-large-v3-turbo");
+			expect(transcript.speech_model_used).toBe(
+				"@cf/openai/whisper-large-v3-turbo",
+			);
+			expect(transcript.words).toHaveLength(25);
+			expect(transcript.words?.[1]?.text).toBe("Um,");
+			expect(state.assemblyCalls).toBe(0);
+		} finally {
+			vi.unstubAllGlobals();
+		}
 	});
 
 	it("does not use an existing AssemblyAI key when Cloudflare credentials are missing", async () => {

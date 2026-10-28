@@ -697,7 +697,7 @@ export function CapVideoPlayer({
 	const isUploadError = uploadProgress?.status === "error";
 	const showUploadFailureOverlay =
 		isUploadFailed ||
-		(isUploadError && !resolvedSrc.data && !resolvedSrc.isPending);
+		(isUploadError && (blockPlaybackDuringProcessing || !videoLoaded));
 	const canRetryUploadProcessing = canRetryFailedProcessing(
 		uploadProgress,
 		canRetryProcessing,

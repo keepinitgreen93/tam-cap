@@ -63,7 +63,13 @@ export function currentLoomImportArtifactKeys(
 export function loomImportSourcePublication(
 	video: typeof videos.$inferSelect,
 	metadata: VideoMetadata = video.metadata ?? {},
-) {
+	duration: number | null | undefined = video.duration,
+): Partial<
+	Pick<
+		typeof videos.$inferSelect,
+		"metadata" | "source" | "transcriptionStatus"
+	>
+> {
 	const keys = currentLoomImportArtifactKeys(video);
 	if (process.env.CAP_RUNTIME !== "cloudflare" || !keys) return {};
 	const nextMetadata = { ...metadata };
@@ -71,6 +77,17 @@ export function loomImportSourcePublication(
 		!("outputKey" in video.source) || video.source.outputKey !== keys.outputKey;
 	if (changed) {
 		nextMetadata.transcriptPublication = createTranscriptInvalidation();
+		nextMetadata.editingBase = {
+			version: 1,
+			id: nextMetadata.transcriptPublication.id,
+			sourceKey: keys.outputKey,
+			duration:
+				typeof duration === "number" &&
+				Number.isFinite(duration) &&
+				duration > 0
+					? duration
+					: null,
+		};
 		delete nextMetadata.transcriptionRun;
 		delete nextMetadata.editTranscriptBackfill;
 		delete nextMetadata.liveTranscript;
@@ -83,6 +100,7 @@ export function loomImportSourcePublication(
 	return {
 		metadata: nextMetadata,
 		source: {
+			...(changed ? {} : video.source),
 			type: "webMP4" as const,
 			outputKey: keys.outputKey,
 			thumbnailKey: keys.thumbnailKey,

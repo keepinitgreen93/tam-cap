@@ -13,8 +13,8 @@ import { Effect } from "effect";
 import { Hono } from "hono";
 import { z } from "zod";
 import { ownedRecordingPlan } from "@/lib/recording-upload-state";
-
 import { runPromise } from "@/lib/server";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { isFromDesktopSemver, UPLOAD_PROGRESS_VERSION } from "@/utils/desktop";
 import { stringOrNumberOptional } from "@/utils/zod";
@@ -212,7 +212,7 @@ app.post(
 								duration: updateIfDefined(durationInSecs, Db.videos.duration),
 								width: updateIfDefined(width, Db.videos.width),
 								height: updateIfDefined(height, Db.videos.height),
-								fps: updateIfDefined(fps, Db.videos.fps),
+								fps: updateIfDefined(normalizeVideoFps(fps), Db.videos.fps),
 							})
 							.where(
 								and(eq(Db.videos.id, videoId), eq(Db.videos.ownerId, user.id)),

@@ -57,6 +57,7 @@ import {
 	getEditSpecOutputDuration,
 	remapCurrentOutputTimeThroughEdit,
 } from "@/lib/video-edits";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
@@ -872,7 +873,7 @@ export async function saveEditResultAndComplete(
 							source,
 							width: metadata.width,
 							height: metadata.height,
-							fps: metadata.fps,
+							fps: normalizeVideoFps(metadata.fps),
 							metadata: metadataWithTranscriptPublication(
 								lockedVideo,
 								preparedTranscript,

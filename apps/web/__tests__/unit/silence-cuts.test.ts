@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { planFillerCuts } from "@/lib/edit-transcript";
 import { detectPcmSilence, planSilenceCuts } from "@/lib/silence-cuts";
 import {
 	composeEditSpecs,
@@ -54,6 +55,112 @@ const defaults = {
 };
 
 describe("silence cut planning", () => {
+	it("retains measured speech-free portions of the owner recording after unsaved filler cuts", () => {
+		const timings = [
+			[720, 1760],
+			[2240, 2880],
+			[2880, 3120],
+			[3120, 3360],
+			[3360, 3520],
+			[3520, 3920],
+			[3920, 4400],
+			[4400, 4800],
+			[7512, 8072],
+			[8072, 8312],
+			[8312, 8552],
+			[8552, 9112],
+			[9112, 9672],
+			[9672, 9832],
+			[9832, 10072],
+			[10072, 10312],
+			[10312, 11112],
+			[13592, 13832],
+			[13832, 14232],
+			[14232, 14632],
+			[14632, 15032],
+			[15032, 15352],
+			[15352, 15592],
+			[15592, 15992],
+			[15992, 16392],
+		] as const;
+		const words = timings.map(([startMs, endMs], index) => ({
+			id: `word-${index}`,
+			text: index === 1 ? "Um" : index === 8 ? "Uh" : "speech",
+			startMs,
+			endMs,
+			confidence: null,
+			speaker: null,
+			channel: null,
+		}));
+		const candidates = [
+			{ startMs: 690, endMs: 1230 },
+			{ startMs: 4070, endMs: 6610 },
+			{ startMs: 10050, endMs: 12590 },
+		];
+		const input = {
+			candidates,
+			words,
+			durationMs: 17133,
+			keepRanges: [{ start: 0, end: 17.133 }],
+		};
+		const expected = [
+			{ startMs: 4950, endMs: 6610 },
+			{ startMs: 11262, endMs: 12590 },
+		];
+		expect(planSilenceCuts(input)).toEqual({ ranges: expected, error: null });
+		const fillers = planFillerCuts(words, input.durationMs);
+		const afterFillers = deleteTimelineRanges(
+			createTimelineState(17.133),
+			fillers.ranges.map((range) => ({
+				start: range.startMs / 1000,
+				end: range.endMs / 1000,
+			})),
+		);
+		expect(fillers.ranges).toHaveLength(2);
+		expect(
+			planSilenceCuts({
+				...input,
+				keepRanges: getTimelineKeepRanges(afterFillers),
+			}),
+		).toEqual({ ranges: expected, error: null });
+		expect(planSilenceCuts({ ...input, candidates: expected })).toEqual({
+			ranges: expected,
+			error: null,
+		});
+		for (const cut of expected)
+			expect(
+				words.some(
+					(word) =>
+						word.startMs - 150 < cut.endMs && word.endMs + 150 > cut.startMs,
+				),
+			).toBe(false);
+	});
+	it("splits measured quiet around protected speech without moving its boundaries", () => {
+		expect(
+			planSilenceCuts({
+				...defaults,
+				candidates: [{ startMs: 100, endMs: 3900 }],
+				words: [
+					{ startMs: 3500, endMs: 3950 },
+					{ startMs: 1500, endMs: 2000 },
+					{ startMs: 0, endMs: 300 },
+				],
+			}),
+		).toEqual({
+			ranges: [
+				{ startMs: 450, endMs: 1350 },
+				{ startMs: 2150, endMs: 3350 },
+			],
+			error: null,
+		});
+		expect(
+			planSilenceCuts({
+				...defaults,
+				candidates: [{ startMs: 1000, endMs: 2000 }],
+				words: [{ startMs: 900, endMs: 2100 }],
+			}),
+		).toEqual({ ranges: [], error: null });
+	});
 	it("composes current playback cuts onto the immutable original after a saved edit", () => {
 		const previous = {
 			version: 1 as const,
@@ -87,7 +194,7 @@ describe("silence cut planning", () => {
 			{ start: 8, end: 10 },
 		]);
 	});
-	it("excludes overlapping speech and boundary handles", () => {
+	it("subtracts overlapping speech and boundary handles", () => {
 		expect(
 			planSilenceCuts({
 				...defaults,
@@ -97,14 +204,14 @@ describe("silence cut planning", () => {
 					{ startMs: 1800, endMs: 2300 },
 				],
 			}).ranges,
-		).toEqual([]);
+		).toEqual([{ startMs: 1000, endMs: 1650 }]);
 		expect(
 			planSilenceCuts({
 				...defaults,
 				candidates: [{ startMs: 1000, endMs: 2000 }],
 				words: [{ startMs: 2050, endMs: 2500 }],
 			}).ranges,
-		).toEqual([]);
+		).toEqual([{ startMs: 1000, endMs: 1900 }]);
 	});
 
 	it("intersects partial previous cuts and merges overlapping candidates without double counting", () => {

@@ -13,6 +13,7 @@ const serverMetadataKeys = new Set([
 	"agentUpload",
 	"processingRun",
 	"editProcessing",
+	"editingBase",
 	"editTranscriptBackfill",
 	"completedVideoEdit",
 	"desktopRecordingUpload",

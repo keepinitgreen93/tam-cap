@@ -62,6 +62,7 @@ import {
 import { isTranscriptionConfigured } from "@/lib/transcription-config";
 import { dispatchTranscriptionRun } from "@/lib/transcription-dispatch";
 import { transcribeAudio } from "@/lib/transcription-provider";
+import { getVideoEditingBase } from "@/lib/video-editing-base";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
@@ -183,7 +184,18 @@ export async function transcribeVideoWorkflow(
 				videoDurationMs = segments.durationMs ?? 0;
 			}
 		} else {
-			const audio = await extractAudio(videoId, userId, videoData.video);
+			const base = getVideoEditingBase(videoData.video);
+			const sourceBase =
+				base && !(await loadVideoEditForBackfill(videoId)) ? base : null;
+			if (sourceBase)
+				videoDurationMs = durationMilliseconds(sourceBase.duration) ?? 0;
+			const audio = await extractAudio(
+				videoId,
+				userId,
+				videoData.video,
+				undefined,
+				sourceBase?.sourceKey,
+			);
 			audioUrl = audio?.audioUrl ?? null;
 			if (videoDurationMs <= 0) videoDurationMs = audio?.durationMs ?? 0;
 		}
@@ -271,15 +283,14 @@ export async function backfillEditTranscriptWorkflow(
 
 	try {
 		video = await validateEditTranscriptBackfill(videoId, userId, requestId);
-		// Legacy videos only: the transcript must describe the ORIGINAL media, so
-		// edited videos are transcribed from their preserved source mp4.
 		const videoEdit = await loadVideoEditForBackfill(videoId);
+		const base = videoEdit ? null : getVideoEditingBase(video);
 		const audio = await extractAudio(
 			videoId,
 			userId,
 			video,
 			editTranscriptTempAudioFilename(requestId),
-			videoEdit?.sourceKey,
+			videoEdit?.sourceKey ?? base?.sourceKey,
 		);
 		if (!audio) {
 			await saveEditTranscriptBackfillError(videoId, requestId, video);
@@ -289,7 +300,11 @@ export async function backfillEditTranscriptWorkflow(
 		const editTranscript = await transcribeEditTranscriptWithProvider(
 			audio.audioUrl,
 			(durationMilliseconds(
-				videoEdit ? videoEdit.editSpec.sourceDuration : video.duration,
+				videoEdit
+					? videoEdit.editSpec.sourceDuration
+					: base
+						? base.duration
+						: video.duration,
 			) ??
 				audio.durationMs ??
 				0) / 1000,

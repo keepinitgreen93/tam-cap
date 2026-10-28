@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
 	head: vi.fn(),
 	read: vi.fn(),
 	signedUrl: null as string | null,
+	key: "",
 	video: {
 		id: "video",
 		ownerId: "owner",
@@ -31,7 +32,7 @@ vi.mock("@cap/web-backend", async () => {
 		VideosRepo: Effect.succeed({
 			getById: () => Effect.succeed(Option.some([mocks.video])),
 		}),
-		verifyStorageObjectToken: () => null,
+		verifyStorageObjectToken: () => ({ videoId: "video", key: mocks.key }),
 	};
 });
 vi.mock("@cap/env", () => ({
@@ -45,8 +46,10 @@ vi.mock("@/utils/helpers", () => ({ CACHE_CONTROL_HEADERS: {} }));
 
 import { GET, HEAD } from "@/app/api/storage/object/route";
 
-const objectUrl = (key: string) =>
-	`https://cap.test/api/storage/object?videoId=video&key=${encodeURIComponent(key)}`;
+const objectUrl = (key: string) => {
+	mocks.key = key;
+	return `https://cap.test/api/storage/object?videoId=video&key=${encodeURIComponent(key)}&token=header-fixture`;
+};
 
 const upstream = (contentType: string | null, init: ResponseInit = {}) => {
 	const headers = new Headers(init.headers);

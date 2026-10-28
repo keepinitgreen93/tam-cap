@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, type ComponentProps, createElement, createRef } from "react";
+import {
+	act,
+	type ComponentProps,
+	createElement,
+	createRef,
+	useEffect,
+} from "react";
 import { hydrateRoot } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import {
@@ -14,13 +20,30 @@ import {
 	vi,
 } from "vitest";
 import { CapVideoPlayer } from "@/app/s/[videoId]/_components/CapVideoPlayer";
+import type { UploadProgress } from "@/app/s/[videoId]/_components/upload-progress";
+import { getStalledProcessingMessage } from "@/app/s/[videoId]/_components/upload-progress";
 
 vi.mock("@cap/ui", async (importOriginal) => ({
 	...(await importOriginal<typeof import("@cap/ui")>()),
 	LogoSpinner: () => null,
 }));
 
-vi.mock("next/dynamic", () => ({ default: () => () => null }));
+const uploadState = vi.hoisted(() => ({
+	progress: null as UploadProgress | null,
+}));
+vi.mock("next/dynamic", () => ({
+	default: () =>
+		function Tracker({
+			onChange,
+		}: {
+			onChange: (progress: UploadProgress | null) => void;
+		}) {
+			useEffect(() => {
+				queueMicrotask(() => onChange(uploadState.progress));
+			}, [onChange]);
+			return null;
+		},
+}));
 vi.mock("@/actions/video/retry-processing", () => ({
 	retryVideoProcessing: vi.fn(),
 }));
@@ -72,7 +95,6 @@ async function settleFetch(
 
 const SERVER_URL = "https://v.cap.so/owner/video/result.mp4?Signature=fixture";
 const PLAYLIST_PROBE = /^\/api\/playlist\?videoType=mp4&_t=\d+$/;
-const RAW_PROBE = /^\/api\/playlist\?videoType=raw-preview&_t=\d+$/;
 
 function playerProps(
 	overrides: Partial<ComponentProps<typeof CapVideoPlayer>> = {},
@@ -193,6 +215,7 @@ describe("share MP4 source rendered on the server, with the real player", () => 
 	});
 
 	afterEach(() => {
+		uploadState.progress = null;
 		vi.unstubAllGlobals();
 		document.body.replaceChildren();
 	});
@@ -263,4 +286,57 @@ describe("share MP4 source rendered on the server, with the real player", () => 
 			player.client.clear();
 		}
 	});
+	it.each([
+		{ isOwner: true, playlistFallback: false },
+		{ isOwner: false, playlistFallback: false },
+		{ isOwner: true, playlistFallback: true },
+		{ isOwner: false, playlistFallback: true },
+	])(
+		"shows a stale processing failure when the URL is not playable: %j",
+		async ({ isOwner, playlistFallback }) => {
+			vi.stubGlobal(
+				"fetch",
+				playlistFallback
+					? vi
+							.fn<typeof fetch>()
+							.mockRejectedValue(
+								new TypeError("Synthetic redirect CORS failure"),
+							)
+					: vi.fn<typeof fetch>().mockResolvedValue(response(SERVER_URL, 404)),
+			);
+			vi.stubGlobal("ResizeObserver", NoopResizeObserver);
+			const updatedAt = new Date(Date.now() - 30 * 60000);
+			uploadState.progress = {
+				status: "error",
+				lastUpdated: updatedAt,
+				errorMessage: getStalledProcessingMessage({
+					phase: "processing",
+					updatedAt,
+					processingProgress: 0,
+					automaticRetry: false,
+				}),
+				hasRawFallback: false,
+			};
+			const { props } = playerProps({
+				hasActiveUpload: true,
+				canRetryProcessing: isOwner,
+				...(playlistFallback
+					? { serverPlaybackUrl: null, initialPlaybackUrl: undefined }
+					: {}),
+			});
+			const player = await hydratePlayer(props);
+			try {
+				expect(player.container.textContent).toContain(
+					"Video processing did not start. Retry processing.",
+				);
+				const retry = Array.from(
+					player.container.querySelectorAll("button"),
+				).find((button) => button.textContent === "Retry Processing");
+				expect(Boolean(retry)).toBe(isOwner);
+			} finally {
+				await act(async () => player.root?.unmount());
+				player.client.clear();
+			}
+		},
+	);
 });

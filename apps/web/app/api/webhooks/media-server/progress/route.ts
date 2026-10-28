@@ -27,6 +27,7 @@ import {
 } from "@/lib/queue-video-transcription";
 import { isEditSourceKey } from "@/lib/video-edit-processing";
 import { applyEditProgress } from "@/lib/video-edit-progress";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { applyVideoProcessingProgress } from "@/lib/video-processing-state";
 
 interface ProgressWebhookPayload {
@@ -262,6 +263,7 @@ export async function POST(request: NextRequest) {
 			ownerId: currentVideo.ownerId,
 			videoId,
 			rawFileKey: currentUpload?.rawFileKey,
+			metadata: currentVideo.metadata,
 		});
 		const proof = payload.recordingVerification;
 		if (
@@ -372,13 +374,17 @@ export async function POST(request: NextRequest) {
 						.update(videos)
 						.set({
 							metadata,
-							...loomImportSourcePublication(video, metadata),
+							...loomImportSourcePublication(
+								video,
+								metadata,
+								payload.metadata?.duration,
+							),
 							...(receipt ? { source: { type: "desktopMP4" as const } } : {}),
 							...(payload.metadata
 								? {
 										width: payload.metadata.width,
 										height: payload.metadata.height,
-										fps: payload.metadata.fps,
+										fps: normalizeVideoFps(payload.metadata.fps),
 										...(getValidDuration(payload.metadata.duration) !==
 										undefined
 											? {

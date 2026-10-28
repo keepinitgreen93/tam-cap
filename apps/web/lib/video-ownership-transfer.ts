@@ -34,6 +34,7 @@ import {
 } from "./content-transfer";
 import { getOwnerOriginalKey } from "./loom-original-key";
 import { isStorageObjectNotFound } from "./storage-not-found";
+import { getVideoEditingBase } from "./video-editing-base";
 import { runWorkflowPromise } from "./workflow-runtime";
 
 function makeStorageVideo(input: {
@@ -454,6 +455,12 @@ export async function prepareVideoOwnershipTransfer(
 		},
 	});
 	const targetMetadata = { ...video.metadata };
+	const editingBase = getVideoEditingBase(video);
+	if (editingBase)
+		targetMetadata.editingBase = {
+			...editingBase,
+			sourceKey: `${destinationPrefix}${editingBase.sourceKey.slice(sourcePrefix.length)}`,
+		};
 	for (const key of [
 		"transcriptPublication",
 		"transcriptionRun",
@@ -550,6 +557,7 @@ export async function planVideoOwnershipTransfer(
 		destinationPrefix,
 	} = prepared;
 	const videoId = current.video.id;
+	const editingBase = getVideoEditingBase(current.video);
 	if (options.organizationId !== current.video.orgId)
 		throw Error("Ownership transfer must remain in its organization");
 	await requireOrganizationMember(
@@ -611,6 +619,7 @@ export async function planVideoOwnershipTransfer(
 						: [];
 		for (const key of [
 			...references(current.video.source),
+			...(editingBase ? [editingBase.sourceKey] : []),
 			...(current.edit ? [current.edit.sourceKey] : []),
 		])
 			if (!key.startsWith(sourcePrefix) || !keys.has(key))

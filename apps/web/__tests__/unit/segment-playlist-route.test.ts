@@ -1,6 +1,23 @@
+import { createCloudflareDb } from "@cap/database/cloudflare";
+import {
+	createD1BridgeBinding,
+	handleD1BridgeRequest,
+} from "@cap/database/cloudflare/bridge";
+import * as Db from "@cap/database/cloudflare/schema";
+import { Organisation, User, Video } from "@cap/web-domain";
 import type { HttpApi } from "@effect/platform";
+import { eq } from "drizzle-orm";
 import type { Context, Layer as EffectLayer } from "effect";
-import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime";
 
 vi.mock("server-only", () => ({}));
 
@@ -12,6 +29,10 @@ const mocks = vi.hoisted(() => ({
 	storageUnavailable: false,
 	denied: false,
 	defaultBucket: false,
+	owner: false,
+	readUpload: vi.fn(),
+	database: undefined as ReturnType<typeof createCloudflareDb> | undefined,
+	beforeBatch: undefined as (() => Promise<void>) | undefined,
 	source: { type: "desktopSegments" } as {
 		type: "desktopSegments" | "desktopMP4";
 		outputKey?: string;
@@ -30,7 +51,13 @@ vi.mock("@cap/env", () => ({
 vi.mock("@cap/web-backend", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("@cap/web-backend")>();
 	const { Context, Effect, Option } = await import("effect");
-	const { Policy, Storage: StorageDomain } = await import("@cap/web-domain");
+	const {
+		CurrentUser,
+		Organisation,
+		User,
+		Policy,
+		Storage: StorageDomain,
+	} = await import("@cap/web-domain");
 	const bucket = {
 		provider: "s3",
 		getObject: (key: string) =>
@@ -60,9 +87,36 @@ vi.mock("@cap/web-backend", async (importOriginal) => {
 	};
 	return {
 		...actual,
+		CloudflareDatabase: Object.assign(
+			Context.GenericTag("PlaylistTestDatabase"),
+			{
+				testService: {
+					use: <T>(
+						callback: (
+							database: ReturnType<typeof createCloudflareDb>,
+						) => Promise<T>,
+					) =>
+						Effect.tryPromise(async () => {
+							mocks.readUpload();
+							if (!mocks.database) throw new Error("Missing fixture database");
+							return callback(mocks.database);
+						}),
+				},
+			},
+		),
 		provideOptionalAuth: <A, E, R>(
 			effect: import("effect").Effect.Effect<A, E, R>,
-		) => effect,
+		) =>
+			mocks.owner
+				? effect.pipe(
+						Effect.provideService(CurrentUser, {
+							id: User.UserId.make("owner"),
+							email: "owner@example.test",
+							activeOrganizationId: Organisation.OrganisationId.make("org"),
+							iconUrlOrKey: Option.none(),
+						}),
+					)
+				: effect,
 		Storage: Object.assign(Context.GenericTag("PlaylistTestStorage"), {
 			getAccessForVideo: () =>
 				Effect.succeed([
@@ -80,7 +134,11 @@ vi.mock("@cap/web-backend", async (importOriginal) => {
 									{
 										id: "recording",
 										ownerId: "owner",
+										orgId: "org",
+										bucketId: Option.none(),
+										storageIntegrationId: Option.none(),
 										source: mocks.source,
+										metadata: Option.none(),
 									},
 								]),
 							),
@@ -90,7 +148,9 @@ vi.mock("@cap/web-backend", async (importOriginal) => {
 });
 
 vi.mock("@/lib/server", async () => {
-	const { Storage, Videos } = await import("@cap/web-backend");
+	const { CloudflareDatabase, Storage, Videos } = await import(
+		"@cap/web-backend"
+	);
 	const { HttpApiBuilder, HttpServer } = await import("@effect/platform");
 	const { Layer } = await import("effect");
 	return {
@@ -106,6 +166,16 @@ vi.mock("@/lib/server", async () => {
 				testService: Context.Tag.Service<typeof Videos>;
 			};
 			const handler = api.pipe(
+				Layer.provideMerge(
+					Layer.succeed(
+						CloudflareDatabase,
+						(
+							CloudflareDatabase as unknown as {
+								testService: Context.Tag.Service<typeof CloudflareDatabase>;
+							}
+						).testService,
+					),
+				),
 				Layer.provideMerge(
 					Layer.succeed(Storage, {} as Context.Tag.Service<typeof Storage>),
 				),
@@ -128,8 +198,59 @@ const request = (type = "segments-status", suffix = "&requireComplete=1") =>
 		),
 	);
 
+let databaseFixture: Awaited<ReturnType<typeof createTestDatabase>>;
+const recordingId = Video.VideoId.make("recording");
+beforeAll(async () => {
+	databaseFixture = await createTestDatabase();
+	mocks.database = createCloudflareDb(
+		createD1BridgeBinding({
+			fetch: async (request) => {
+				const payload = (await request.clone().json()) as { operation: string };
+				if (payload.operation === "batch" && mocks.beforeBatch) {
+					const hook = mocks.beforeBatch;
+					mocks.beforeBatch = undefined;
+					await hook();
+				}
+				return handleD1BridgeRequest(request, databaseFixture.binding);
+			},
+		}),
+	);
+	const ownerId = User.UserId.make("owner"),
+		orgId = Organisation.OrganisationId.make("org");
+	await databaseFixture.database.insert(Db.users).values({
+		id: ownerId,
+		email: "owner@playlist.test",
+		activeOrganizationId: orgId,
+	});
+	await databaseFixture.database
+		.insert(Db.organizations)
+		.values({ id: orgId, ownerId, name: "Playlist" });
+	await databaseFixture.database.insert(Db.videos).values({
+		id: recordingId,
+		ownerId,
+		orgId,
+		name: "Recording",
+		source: { type: "desktopMP4" },
+	});
+	await databaseFixture.database.insert(Db.videoUploads).values({
+		videoId: recordingId,
+		rawFileKey: "owner/recording/raw-upload.webm",
+		phase: "processing",
+		mode: "singlepart",
+	});
+}, 60000);
+afterAll(async () => databaseFixture?.dispose());
+
 describe("Instant playlist readiness API", () => {
-	beforeEach(() => {
+	beforeEach(async () => {
+		mocks.beforeBatch = undefined;
+		await databaseFixture.database
+			.delete(Db.videoEdits)
+			.where(eq(Db.videoEdits.videoId, recordingId));
+		await databaseFixture.database
+			.update(Db.videos)
+			.set({ source: { type: "desktopMP4" }, metadata: null })
+			.where(eq(Db.videos.id, recordingId));
 		mocks.manifest = {
 			version: 2,
 			video_init_uploaded: true,
@@ -144,9 +265,98 @@ describe("Instant playlist readiness API", () => {
 		mocks.storageUnavailable = false;
 		mocks.denied = false;
 		mocks.defaultBucket = false;
+		mocks.owner = false;
 		mocks.source = { type: "desktopSegments" };
 	});
 	afterAll(() => mocks.dispose());
+	it("keeps a legacy unedited MP4's early segment view while denying an original edit source", async () => {
+		mocks.source = { type: "desktopMP4" };
+		expect((await request("segments-video")).status).toBe(200);
+		await databaseFixture.database.insert(Db.videoEdits).values({
+			videoId: recordingId,
+			sourceKey: "owner/recording/source/original.mp4",
+			editSpec: {
+				version: 1,
+				sourceDuration: 10,
+				keepRanges: [{ start: 0, end: 5 }],
+			},
+		});
+		expect((await request("segments-video")).status).toBe(404);
+	});
+	it.each(["edit", "source"])(
+		"rechecks a concurrent legacy %s publication before issuing segment capabilities",
+		async (change) => {
+			mocks.source = { type: "desktopMP4" };
+			mocks.beforeBatch = async () => {
+				if (change === "edit")
+					await databaseFixture.database.insert(Db.videoEdits).values({
+						videoId: recordingId,
+						sourceKey: "owner/recording/source/original.mp4",
+						editSpec: {
+							version: 1,
+							sourceDuration: 10,
+							keepRanges: [{ start: 0, end: 5 }],
+						},
+					});
+				else
+					await databaseFixture.database
+						.update(Db.videos)
+						.set({
+							source: {
+								type: "desktopMP4",
+								outputKey: "owner/recording/.recording/outputs/new/result.mp4",
+							},
+						})
+						.where(eq(Db.videos.id, recordingId));
+			};
+			expect((await request("segments-video")).status).toBe(404);
+			expect(mocks.sign).not.toHaveBeenCalled();
+			expect(mocks.read).not.toHaveBeenCalled();
+		},
+	);
+	it.each([
+		"raw-preview",
+		"segments-video",
+		"segments-audio",
+		"segments-master",
+		"segments-status",
+	])(
+		"never offers an edited MP4 viewer its retained %s source",
+		async (type) => {
+			mocks.source = {
+				type: "desktopMP4",
+				outputKey: "owner/recording/.recording/outputs/edited/result.mp4",
+			};
+			expect((await request(type)).status).toBe(404);
+			expect(mocks.sign).not.toHaveBeenCalled();
+			expect(mocks.read).not.toHaveBeenCalled();
+		},
+	);
+	it("retains the owner's legacy segment source for an edited recording", async () => {
+		mocks.owner = true;
+		mocks.source = {
+			type: "desktopMP4",
+			outputKey: "owner/recording/.recording/outputs/edited/result.mp4",
+		};
+		expect((await request("segments-video")).status).toBe(200);
+		expect(mocks.sign).toHaveBeenCalled();
+	});
+	it("restricts the raw-upload preview capability to the authenticated owner", async () => {
+		mocks.owner = true;
+		mocks.source = {
+			type: "desktopMP4",
+			outputKey: "owner/recording/.recording/outputs/edited/result.mp4",
+		};
+		const response = await request("raw-preview");
+		expect(response.status).toBe(302);
+		expect(response.headers.get("Location")).toBe(
+			"https://media.example.com/owner/recording/raw-upload.webm",
+		);
+		expect(mocks.readUpload).toHaveBeenCalledOnce();
+		mocks.owner = false;
+		expect((await request("raw-preview")).status).toBe(404);
+		expect(mocks.readUpload).toHaveBeenCalledOnce();
+	});
 
 	it("checks readiness without signing every segment URL", async () => {
 		expect((await request()).status).toBe(204);

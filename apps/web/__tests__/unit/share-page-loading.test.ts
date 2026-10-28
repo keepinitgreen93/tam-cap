@@ -1,9 +1,24 @@
+import { videos, videoUploads } from "@cap/database/cloudflare/schema";
+import { eq } from "drizzle-orm";
 import { Context, Effect, Option } from "effect";
 import { isValidElement, type ReactElement } from "react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+	afterAll,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	it,
+	vi,
+} from "vitest";
+import { createTestDatabase } from "../../../../packages/database/cloudflare/test-runtime.ts";
+import { createTestOwner } from "../helpers/cloudflare-team";
 
 const mocks = vi.hoisted(() => ({
 	select: vi.fn(),
+	database: undefined as
+		| Awaited<ReturnType<typeof createTestDatabase>>["database"]
+		| undefined,
 	policy: vi.fn(),
 	thumbnailUrl: vi.fn(),
 	playbackUrl: vi.fn(),
@@ -25,7 +40,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@cap/database/cloudflare/application", () => ({
-	db: () => ({ select: mocks.select }),
+	db: () => mocks.database ?? { select: mocks.select },
 }));
 vi.mock("@cap/database/auth/session", () => ({ getCurrentUser: mocks.user }));
 vi.mock("@cap/env", () => ({
@@ -184,6 +199,7 @@ async function renderAuthorizedContent() {
 			serverPlaybackUrl?: string | null;
 			screenshotImageUrl?: string | null;
 			data: {
+				hasActiveUpload: boolean;
 				sharedOrganizations: unknown[];
 				ownerIsOverShareLimit: boolean;
 				callToAction: { label: string; url: string } | null;
@@ -440,5 +456,72 @@ describe("share page MP4 source in the HTML", () => {
 		expect(Date.now() - started).toBeLessThan(180);
 		expect(content.props.children.props.serverPlaybackUrl).toBeNull();
 		expect(await content.props.children.props.initialPlaybackUrl).toBe(SIGNED);
+	});
+});
+
+describe("share upload state from native D1", () => {
+	let runtime: Awaited<ReturnType<typeof createTestDatabase>>;
+	let owner: Awaited<ReturnType<typeof createTestOwner>>;
+	beforeAll(async () => {
+		runtime = await createTestDatabase();
+		owner = await createTestOwner(runtime.database);
+	}, 120000);
+	afterAll(async () => {
+		mocks.database = undefined;
+		await runtime.dispose();
+	});
+	beforeEach(async () => {
+		mocks.database = runtime.database;
+		mocks.policy.mockReturnValue(Effect.void);
+		mocks.user.mockResolvedValue(owner);
+		mocks.quota.mockResolvedValue(false);
+		mocks.defaultStorage = true;
+		mocks.ownerIsPro = false;
+		mocks.authenticated = false;
+		mocks.userAgent = "";
+		mocks.buildEnv.NEXT_PUBLIC_IS_CAP = undefined;
+		await runtime.database
+			.delete(videoUploads)
+			.where(
+				eq(videoUploads.videoId, "video" as typeof videos.$inferSelect.id),
+			);
+		await runtime.database
+			.delete(videos)
+			.where(eq(videos.id, "video" as typeof videos.$inferSelect.id));
+		await runtime.database.insert(videos).values({
+			id: "video" as typeof videos.$inferSelect.id,
+			ownerId: owner.id,
+			orgId: owner.activeOrganizationId,
+			name: "Generic stale upload",
+			source: { type: "webMP4" },
+		});
+	});
+	it.each([
+		"processing",
+		"generating_thumbnail",
+		"error",
+		"uploading",
+	] as const)(
+		"passes generic %s uploads to the recovery player without a job or metadata marker",
+		async (phase) => {
+			await runtime.database.insert(videoUploads).values({
+				videoId: "video" as typeof videos.$inferSelect.id,
+				phase,
+				processingProgress: 0,
+				updatedAt: new Date(Date.now() - 30 * 60000),
+			});
+			const content = await renderAuthorizedContent();
+			expect(content.props.children.props.data.hasActiveUpload).toBe(true);
+			expect(content.props.children.props.initialPlaybackUrl).toBeUndefined();
+		},
+	);
+	it("ignores a retained completed receipt for finished playback", async () => {
+		await runtime.database.insert(videoUploads).values({
+			videoId: "video" as typeof videos.$inferSelect.id,
+			phase: "complete",
+			updatedAt: new Date(Date.now() - 30 * 60000),
+		});
+		const content = await renderAuthorizedContent();
+		expect(content.props.children.props.data.hasActiveUpload).toBe(false);
 	});
 });

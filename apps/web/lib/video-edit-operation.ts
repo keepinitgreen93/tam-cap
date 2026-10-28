@@ -21,6 +21,7 @@ import type { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import { FatalError } from "workflow";
 import { z } from "zod";
+import { getVideoEditingBase } from "./video-editing-base";
 
 export interface EditOperation {
 	token: string;
@@ -29,6 +30,7 @@ export interface EditOperation {
 
 const stateSchema = z.object({
 	token: z.string().uuid(),
+	editingBaseId: z.string().uuid().nullable().optional(),
 	startedAt: z.string().datetime(),
 	ownerId: z.string(),
 	bucket: z.string().nullable(),
@@ -70,7 +72,7 @@ export function matchesEditOperation(
 	video: Pick<
 		typeof videos.$inferSelect,
 		"metadata" | "source" | "ownerId" | "bucket" | "storageIntegrationId"
-	>,
+	> & { id?: Video.VideoId },
 	upload:
 		| Pick<typeof videoUploads.$inferSelect, "rawFileKey" | "startedAt">
 		| undefined,
@@ -85,6 +87,15 @@ export function matchesEditOperation(
 	} catch {
 		return false;
 	}
+	let editingBase: ReturnType<typeof getVideoEditingBase> = null;
+	if (video.metadata && Object.hasOwn(video.metadata, "editingBase")) {
+		if (!video.id) return false;
+		try {
+			editingBase = getVideoEditingBase({ ...video, id: video.id });
+		} catch {
+			return false;
+		}
+	}
 	return Boolean(
 		upload &&
 			state.token === operation.token &&
@@ -93,6 +104,10 @@ export function matchesEditOperation(
 			state.bucket === video.bucket &&
 			state.storageIntegrationId === video.storageIntegrationId &&
 			state.sourceKey === sourceKey &&
+			(editingBase
+				? state.editingBaseId === editingBase.id &&
+					sourceKey === editingBase.sourceKey
+				: state.editingBaseId == null) &&
 			isDeepStrictEqual(expectedSource, video.source) &&
 			upload.rawFileKey === sourceKey &&
 			upload.startedAt.toISOString() === operation.startedAt,

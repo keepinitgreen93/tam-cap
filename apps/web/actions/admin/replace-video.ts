@@ -1,10 +1,11 @@
 "use server";
 
 import { db } from "@cap/database/cloudflare/application";
-import { videos, videoUploads } from "@cap/database/cloudflare/schema";
+import type { AtomicSnapshot } from "@cap/database/cloudflare/atomic";
+import { users, videos, videoUploads } from "@cap/database/cloudflare/schema";
 import { Storage } from "@cap/web-backend";
 import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
-import { Video } from "@cap/web-domain";
+import { type User, Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import { Option } from "effect";
 import { requireAdmin } from "@/lib/admin-access";
@@ -18,10 +19,25 @@ import {
 	createDesktopReuploadToken,
 	decodeDesktopReuploadToken,
 } from "@/lib/desktop-reupload-token";
+import { isInstanceAdmin } from "@/lib/instance-admin";
 import { queueVideoTranscription } from "@/lib/queue-video-transcription";
 import { ownedRecordingPlan } from "@/lib/recording-upload-state";
 import { runPromise } from "@/lib/server";
 import { decodeStorageVideo } from "@/lib/video-storage";
+
+async function assertCurrentAdmin(
+	snapshot: AtomicSnapshot,
+	userId: User.UserId,
+) {
+	const [user] = await snapshot.read((reader) =>
+		reader
+			.select({ email: users.email, emailVerified: users.emailVerified })
+			.from(users)
+			.where(eq(users.id, userId))
+			.limit(1),
+	);
+	if (!isInstanceAdmin(user)) throw Error("Unauthorized");
+}
 
 async function getVideoOrThrow(videoId: string) {
 	const [video] = await db()
@@ -33,7 +49,7 @@ async function getVideoOrThrow(videoId: string) {
 }
 
 export async function getVideoReplaceUploadUrl(videoId: string) {
-	await requireAdmin();
+	const admin = await requireAdmin();
 	const video = await getVideoOrThrow(videoId);
 	const [bucket] = await Storage.getAccessForVideo(video, {
 		resolvePublishedOutput: false,
@@ -52,6 +68,7 @@ export async function getVideoReplaceUploadUrl(videoId: string) {
 		database,
 		video,
 		async (snapshot, current) => {
+			await assertCurrentAdmin(snapshot, admin.id);
 			assertDesktopReuploadTarget(
 				token,
 				{ ...video, source: current.source },
@@ -132,7 +149,7 @@ export async function invalidateVideoCache(
 	videoId: string,
 	replacementToken: string,
 ) {
-	await requireAdmin();
+	const admin = await requireAdmin();
 	const token = decodeDesktopReuploadToken(replacementToken);
 	if (!token || token.uploadId !== "singlepart")
 		throw new Error("Invalid replacement token");
@@ -149,7 +166,15 @@ export async function invalidateVideoCache(
 	const head = await bucket.headObject(token.outputKey).pipe(runPromise);
 	if (!head.ETag || !head.ContentLength || head.ContentLength <= 0)
 		throw new Error("Replacement recording has not finished uploading");
-	const published = await publishDesktopReupload(db(), video, token);
+	const published = await publishDesktopReupload(
+		db(),
+		video,
+		token,
+		{},
+		async (snapshot) => {
+			await assertCurrentAdmin(snapshot, admin.id);
+		},
+	);
 	if (!published && Option.isSome(video.transcriptionStatus)) return;
 	await Promise.allSettled([
 		queueVideoTranscription(video.id),

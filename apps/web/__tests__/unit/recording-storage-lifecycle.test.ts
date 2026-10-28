@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import * as S3 from "@aws-sdk/client-s3";
 import * as Db from "@cap/database/cloudflare/schema";
 import { getTranscriptObjectKey } from "@cap/database/cloudflare/transcript-publication";
@@ -1236,6 +1237,33 @@ describe("recording storage lifecycle", () => {
 				`${newPrefix}.transcripts/old-version/transcription.vtt`,
 			),
 		).toBe(false);
+	});
+
+	it("duplicates an unedited replacement base independently of its processed output", async () => {
+		const video = recording();
+		const editingBase = {
+			version: 1 as const,
+			id: randomUUID(),
+			sourceKey: `${prefix}.recording/outputs/replacement/result.mp4`,
+			duration: 30,
+		};
+		const database = databaseFixture({
+			...video,
+			metadata: Option.some({ editingBase }),
+		});
+		const storage = await storageFixture([
+			[outputKey, "processed output"],
+			[thumbnailKey, "thumbnail"],
+			[previewKey, "preview"],
+			[editingBase.sourceKey, "original replacement"],
+		]);
+		expect(Exit.isSuccess(await runVideoOperation("duplicate"))).toBe(true);
+		const targetKey = editingBase.sourceKey.replace(prefix, newPrefix);
+		expect(database.rows.get("duplicate-video")?.metadata).toMatchObject({
+			editingBase: { ...editingBase, sourceKey: targetKey },
+		});
+		expect(storage.objects.get(targetKey)).toBe("original replacement");
+		expect(database.edits.has("duplicate-video")).toBe(false);
 	});
 
 	it("copies a published MP4 snapshot without retaining its original output pointer", async () => {

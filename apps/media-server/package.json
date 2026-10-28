@@ -9,6 +9,9 @@
 		"test": "bun test",
 		"test:watch": "bun test --watch"
 	},
+	"patchedDependencies": {
+		"zod@3.25.76": "patches/zod@3.25.76.patch"
+	},
 	"dependencies": {
 		"@mediabunny/server": "^1.45.2",
 		"hono": "^4.12.12",

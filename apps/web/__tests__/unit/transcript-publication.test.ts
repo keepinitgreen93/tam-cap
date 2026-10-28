@@ -119,6 +119,48 @@ describe("immutable transcript publication", () => {
 			editTranscript: '{"original":"words"}',
 		});
 	});
+	it("rejects publication prepared before the editing base changed", async () => {
+		const video = await videoFixture();
+		const { store } = memoryStore();
+		const prepared = await prepareTranscriptPublication({
+			video,
+			store,
+			vtt: "WEBVTT\n",
+			editTranscript: null,
+		});
+		await fixture.database
+			.update(videos)
+			.set({
+				metadata: {
+					editingBase: {
+						version: 1,
+						id: "00000000-0000-4000-8000-000000000005",
+						sourceKey: `${video.ownerId}/${video.id}/.recording/outputs/replacement/result.mp4`,
+						duration: 12,
+					},
+				},
+			})
+			.where(eq(videos.id, video.id));
+		await expect(
+			atomic(fixture.database, async (snapshot) => {
+				const [current] = await snapshot.read((reader) =>
+					reader.select().from(videos).where(eq(videos.id, video.id)),
+				);
+				if (!current) throw new Error("Fixture missing");
+				return {
+					statements: [
+						fixture.database
+							.update(videos)
+							.set({
+								metadata: metadataWithTranscriptPublication(current, prepared),
+							})
+							.where(eq(videos.id, video.id)),
+					],
+					result: true,
+				};
+			}),
+		).rejects.toThrow(TranscriptPublicationConflictError);
+	});
 	it("only one competing preparation can publish against the same prior version", async () => {
 		const video = await videoFixture();
 		const { store } = memoryStore();

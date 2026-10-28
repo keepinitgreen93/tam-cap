@@ -1,0 +1,31 @@
+{
+	"schemaVersion": 1,
+	"release": "v0.6.1-tam.1",
+	"serverUrl": "https://videos.trulyauthenticmarketing.com",
+	"artifacts": {
+		"windows": {
+			"filename": "TAMCap-Windows-x64-setup.exe",
+			"href": "/downloads/v0.6.1-tam.1/TAMCap-Windows-x64-setup.exe",
+			"bytes": 133799920,
+			"sha256": "e8d7abfa166bedd11e524d20b74cfc8aef7a21fc3ce1d009fe753f4d1a1a4849",
+			"sourceRevision": "fb9d56d1ce086bfd3bbd934e14131f2a48859a3e",
+			"buildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/40592530338"
+		},
+		"macosArm64": {
+			"filename": "TAMCap-macOS-arm64.dmg",
+			"href": "/downloads/v0.6.1-tam.1/TAMCap-macOS-arm64.dmg",
+			"bytes": 114574144,
+			"sha256": "cd427f3c53791cf681e8990facd38ceb0186dff7f9805933c58a4b99c0481cd5",
+			"sourceRevision": "72ff6f57676f5f8e86544371d92f126bd8952d43",
+			"buildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/40598752363"
+		},
+		"chrome": {
+			"filename": "TAMCap-Chrome.zip",
+			"href": "/downloads/v0.6.1-tam.1/TAMCap-Chrome.zip",
+			"bytes": 502935,
+			"sha256": "3d5374db2ed5a03daaee803a69d5a3cccb7851e053537a946b03f3b1a8d804e8",
+			"extensionId": "ffocnmodhfclminiaapbfapkehcppkga",
+			"version": "1.0.4"
+		}
+	}
+}

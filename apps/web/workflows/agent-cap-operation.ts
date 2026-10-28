@@ -27,6 +27,7 @@ import {
 } from "@/actions/organization/domain-utils";
 import { isAiGenerationEnabledForUser } from "@/lib/ai-generation-entitlement";
 import { enqueueVideoStorageNameSync } from "@/lib/sync-video-storage-names";
+import { normalizeVideoFps } from "@/lib/video-metadata";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
 type CapSnapshot = {
@@ -206,7 +207,7 @@ async function createDuplicate(operationId: string, payload: OperationPayload) {
 					duration: snapshot.duration,
 					width: snapshot.width,
 					height: snapshot.height,
-					fps: snapshot.fps,
+					fps: normalizeVideoFps(snapshot.fps),
 					metadata: snapshot.metadata,
 					public: snapshot.public,
 					settings: snapshot.settings,

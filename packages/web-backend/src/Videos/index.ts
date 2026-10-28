@@ -1,3 +1,4 @@
+import { getVideoEditingBase } from "@cap/database/cloudflare/editing-base";
 import * as Db from "@cap/database/cloudflare/schema";
 import {
 	metadataWithTranscriptPublication,
@@ -360,6 +361,27 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					height: Option.getOrNull(video.height),
 				};
 				const copiedMetadata = { ...sourceReference.metadata };
+				const editingBase = yield* Effect.try({
+					try: () => getVideoEditingBase(sourceReference),
+					catch: (cause) => new StorageDomain.StorageError({ cause }),
+				});
+				if (
+					editingBase &&
+					sourceEdit &&
+					sourceEdit.sourceKey !== editingBase.sourceKey
+				)
+					return yield* Effect.fail(
+						new StorageDomain.StorageError({
+							cause: new Error(
+								"Original edit source does not match its editing base",
+							),
+						}),
+					);
+				if (editingBase)
+					copiedMetadata.editingBase = {
+						...editingBase,
+						sourceKey: `${newPrefix}${editingBase.sourceKey.slice(prefix.length)}`,
+					};
 				delete copiedMetadata.desktopRecordingUpload;
 				delete copiedMetadata.customCreatedAt;
 				delete copiedMetadata.editProcessing;
@@ -371,6 +393,13 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 				delete copiedMetadata.agentUpload;
 				delete copiedMetadata.loomImportRun;
 				delete copiedMetadata.loomImportUpload;
+				delete copiedMetadata.aiGenerationRun;
+				if (
+					copiedMetadata.aiGenerationStatus === "QUEUED" ||
+					copiedMetadata.aiGenerationStatus === "PROCESSING" ||
+					copiedMetadata.aiGenerationStatus === "ERROR"
+				)
+					delete copiedMetadata.aiGenerationStatus;
 				const targetReference: TranscriptVideo = {
 					...sourceReference,
 					id: newVideoId,
@@ -399,6 +428,12 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 					for (const key of publishedKeys) yield* copyObject(key);
 					if (sourceEdit && !publishedKeys.has(sourceEdit.sourceKey))
 						yield* copyObject(sourceEdit.sourceKey);
+					if (
+						editingBase &&
+						!publishedKeys.has(editingBase.sourceKey) &&
+						editingBase.sourceKey !== sourceEdit?.sourceKey
+					)
+						yield* copyObject(editingBase.sourceKey);
 					let continuationToken: string | undefined;
 					const seenTokens = new Set<string>();
 					do {
@@ -423,6 +458,7 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 								isInternalRecordingKey(key) ||
 								publishedKeys.has(key) ||
 								key === sourceEdit?.sourceKey ||
+								key === editingBase?.sourceKey ||
 								key.startsWith(`${prefix}transcription`) ||
 								(publishedKeys.size > 0 && key.startsWith(`${prefix}segments/`))
 							) {

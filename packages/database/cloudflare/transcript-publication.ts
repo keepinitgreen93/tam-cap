@@ -144,6 +144,9 @@ export function transcriptMediaRevision(video: TranscriptVideo): string {
 							source: video.metadata.editProcessing.source,
 						}
 					: null,
+				...(video.metadata?.editingBase === undefined
+					? {}
+					: { editingBase: video.metadata.editingBase }),
 				completedEdit: video.metadata?.completedVideoEdit ?? null,
 				recording: video.metadata?.desktopRecordingUpload ?? null,
 				processingToken: video.metadata?.processingRun?.token ?? null,

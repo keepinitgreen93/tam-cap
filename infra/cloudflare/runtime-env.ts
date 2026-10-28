@@ -32,6 +32,7 @@ export function webEnvironment(serialized: string, mediaSecret: string) {
 		WORKFLOW_TARGET_WORLD: "@cap/workflow-cloudflare",
 		CAP_WORKFLOW_URL: "http://cap.workflow/rpc",
 		MEDIA_SERVER_URL: "http://cap.media",
+		MEDIA_SERVER_WEBHOOK_URL: "http://cap.web",
 		MEDIA_SERVER_WEBHOOK_SECRET: mediaSecret,
 	};
 }

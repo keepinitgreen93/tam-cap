@@ -1,6 +1,7 @@
 "use server";
 
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { db } from "@cap/database/cloudflare/application";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
@@ -27,6 +28,7 @@ import {
 	type EditOperation,
 } from "@/lib/video-edit-operation";
 import { getEditSourceKey, isEditSourceKey } from "@/lib/video-edit-processing";
+import { getVideoEditingBase } from "@/lib/video-editing-base";
 import {
 	areEditSpecsEquivalent,
 	composeEditSpecs,
@@ -74,12 +76,15 @@ async function getVideoBucket(video: typeof videos.$inferSelect) {
 
 async function ensureOriginalSourceCopy(
 	video: typeof videos.$inferSelect,
-	sourceKey = getEditSourceKey(video.ownerId, video.id),
+	sourceKey = getEditSourceKey(video.ownerId, video.id, video.metadata),
+	copyIfMissing = false,
 ) {
 	const bucket = await getVideoBucket(video);
 	const hasSource = await objectExists(bucket, sourceKey);
 
 	if (!hasSource) {
+		if (!copyIfMissing)
+			throw new Error("Original editing base is no longer available");
 		const resultKey = getResultKey(video.ownerId, video.id);
 		await bucket
 			.copyObject(`${bucket.bucketName}/${resultKey}`, sourceKey)
@@ -116,7 +121,11 @@ async function markEditProcessing({
 			current.ownerId !== video.ownerId ||
 			current.bucket !== video.bucket ||
 			current.storageIntegrationId !== video.storageIntegrationId ||
-			JSON.stringify(current.source) !== JSON.stringify(video.source)
+			JSON.stringify(current.source) !== JSON.stringify(video.source) ||
+			!isDeepStrictEqual(
+				getVideoEditingBase(current),
+				getVideoEditingBase(video),
+			)
 		) {
 			throw new Error("Video changed before the edit could start");
 		}
@@ -144,11 +153,21 @@ async function markEditProcessing({
 		const [currentEdit] = await snapshot.read((reader) =>
 			reader.select().from(videoEdits).where(eq(videoEdits.videoId, video.id)),
 		);
+		const base = getVideoEditingBase(current);
+		if (
+			(base && base.sourceKey !== sourceKey) ||
+			(currentEdit && currentEdit.sourceKey !== sourceKey)
+		)
+			throw new Error(
+				"Video editing base changed before this edit could start",
+			);
 		if (
 			!areEditSpecsEquivalent(
 				currentEdit?.editSpec ??
 					createIdentityEditSpec(
-						current.duration ?? previousSpec.sourceDuration,
+						getVideoEditingBase(current)?.duration ??
+							current.duration ??
+							previousSpec.sourceDuration,
 					),
 				previousSpec,
 			)
@@ -174,6 +193,7 @@ async function markEditProcessing({
 			...(current.metadata ?? {}),
 			editProcessing: {
 				...operation,
+				editingBaseId: base?.id ?? null,
 				sourceKey,
 				ownerId: current.ownerId,
 				bucket: current.bucket,
@@ -226,6 +246,7 @@ async function loadEditableVideo(
 			ownerId: video.ownerId,
 			videoId,
 			rawFileKey: activeUpload.rawFileKey,
+			metadata: video.metadata,
 		})
 	) {
 		if (
@@ -263,10 +284,16 @@ export async function saveVideoEdits(
 
 	const previousSpec =
 		existingEdit?.editSpec ??
-		createIdentityEditSpec(video.duration ?? editSpec.sourceDuration);
+		createIdentityEditSpec(
+			getVideoEditingBase(video)?.duration ??
+				video.duration ??
+				editSpec.sourceDuration,
+		);
 	const expectedCurrentDuration = existingEdit
 		? getEditSpecOutputDuration(previousSpec)
-		: (video.duration ?? editSpec.sourceDuration);
+		: (getVideoEditingBase(video)?.duration ??
+			video.duration ??
+			editSpec.sourceDuration);
 	const currentOutputSpec = normalizeKeepRanges(
 		editSpec.keepRanges,
 		expectedCurrentDuration,
@@ -286,7 +313,8 @@ export async function saveVideoEdits(
 	}
 
 	const sourceKey =
-		existingEdit?.sourceKey ?? getEditSourceKey(video.ownerId, video.id);
+		existingEdit?.sourceKey ??
+		getEditSourceKey(video.ownerId, video.id, video.metadata);
 	const aiGenerationEnabled = await isAiGenerationEnabled(user);
 	const operation = await markEditProcessing({
 		video,
@@ -294,7 +322,11 @@ export async function saveVideoEdits(
 		previousSpec,
 	});
 	try {
-		await ensureOriginalSourceCopy(video, sourceKey);
+		await ensureOriginalSourceCopy(
+			video,
+			sourceKey,
+			!existingEdit && !getVideoEditingBase(video),
+		);
 	} catch (error) {
 		await clearPendingEdit(videoId, sourceKey, operation);
 		throw error;
@@ -341,12 +373,16 @@ export async function restoreVideoToOriginal(videoId: Video.VideoId) {
 	}
 
 	const sourceKey =
-		existingEdit?.sourceKey ?? getEditSourceKey(video.ownerId, video.id);
+		existingEdit?.sourceKey ??
+		getEditSourceKey(video.ownerId, video.id, video.metadata);
 	const bucket = await getVideoBucket(video);
 	if (!(await objectExists(bucket, sourceKey)))
 		throw new Error("Original video is no longer available");
 	let sourceDuration =
-		existingEdit?.editSpec.sourceDuration ?? video.duration ?? 0;
+		existingEdit?.editSpec.sourceDuration ??
+		getVideoEditingBase(video)?.duration ??
+		video.duration ??
+		0;
 	if (legacyUpload) {
 		const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
 		if (!mediaServerUrl)
@@ -382,7 +418,9 @@ export async function restoreVideoToOriginal(videoId: Video.VideoId) {
 	}
 	const previousSpec =
 		existingEdit?.editSpec ??
-		createIdentityEditSpec(video.duration ?? sourceDuration);
+		createIdentityEditSpec(
+			getVideoEditingBase(video)?.duration ?? video.duration ?? sourceDuration,
+		);
 	const restoredSpec = createIdentityEditSpec(sourceDuration);
 	if (getEditSpecOutputDuration(restoredSpec) <= 0)
 		throw new Error("Original video is no longer available");

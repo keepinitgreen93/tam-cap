@@ -13,6 +13,7 @@ import { eq } from "drizzle-orm";
 import { Effect } from "effect";
 import { runPromise } from "@/lib/server";
 import { canUserDownloadVideo } from "@/lib/video-download-permissions";
+import { getVideoEditingBase } from "@/lib/video-editing-base";
 import { decodeStorageVideo } from "@/lib/video-storage";
 
 export type VideoDownloadVariant = "current" | "original";
@@ -128,19 +129,20 @@ export async function getVideoDownloadInfo(
 	let filename = `${video.name}.mp4`;
 
 	if (variant === "original") {
+		const base = getVideoEditingBase(video);
 		const [existingEdit] = await db()
 			.select({ sourceKey: videoEdits.sourceKey })
 			.from(videoEdits)
 			.where(eq(videoEdits.videoId, videoId));
 
-		if (!existingEdit) {
+		if (!existingEdit && !base) {
 			return {
 				success: false,
 				error: "Original video is no longer available.",
 			};
 		}
 
-		downloadKey = existingEdit.sourceKey;
+		downloadKey = base?.sourceKey ?? existingEdit?.sourceKey ?? downloadKey;
 		filename = `${video.name} (original).mp4`;
 	}
 

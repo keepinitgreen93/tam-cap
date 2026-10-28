@@ -21,6 +21,7 @@ import {
 } from "@/lib/edit-transcript";
 import { runPromise } from "@/lib/server";
 import { readOriginalEditTranscript } from "@/lib/transcript-publication";
+import { getVideoEditingBase } from "@/lib/video-editing-base";
 import { decodeStorageVideo } from "@/lib/video-storage";
 import { backfillEditTranscriptWorkflow } from "@/workflows/transcribe";
 
@@ -119,7 +120,10 @@ async function readCurrentEditTranscript(
 		.where(eq(videoEdits.videoId, video.id));
 
 	if (!edit?.editSpec) {
-		return isDurationCurrent(transcript.durationMs, video.duration ?? 0)
+		return isDurationCurrent(
+			transcript.durationMs,
+			getVideoEditingBase(video)?.duration ?? video.duration ?? 0,
+		)
 			? transcript
 			: null;
 	}
