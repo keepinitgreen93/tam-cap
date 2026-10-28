@@ -202,7 +202,15 @@ export async function analyzeSilenceFile(
 		},
 	);
 	const probe = probeSchema.parse(JSON.parse(probeOutput));
-	if (Math.abs(probe.format.duration * 1000 - durationMs) > 50)
+	const video = probe.streams.find((stream) => stream.codec_type === "video");
+	const videoDurationMs = (video?.duration ?? probe.format.duration) * 1000;
+	const containerDifferenceMs = Math.abs(
+		probe.format.duration * 1000 - durationMs,
+	);
+	if (
+		containerDifferenceMs > 50 &&
+		(Math.abs(videoDurationMs - durationMs) > 50 || containerDifferenceMs > 100)
+	)
 		throw new Error("Video duration changed");
 	const tracks = probe.streams.filter(
 		(stream) => stream.codec_type === "audio",

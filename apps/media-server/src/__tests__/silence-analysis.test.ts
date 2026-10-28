@@ -150,7 +150,12 @@ describe("FFmpeg silence integration", () => {
 	afterAll(async () => {
 		await rm(directory, { recursive: true, force: true });
 	});
-	async function fixture(name: string, withAudio: boolean, extraTrack = false) {
+	async function fixture(
+		name: string,
+		withAudio: boolean,
+		extraTrack = false,
+		audioDuration = 4,
+	) {
 		const path = join(directory, name);
 		const args = [
 			"ffmpeg",
@@ -166,7 +171,7 @@ describe("FFmpeg silence integration", () => {
 				"-f",
 				"lavfi",
 				"-i",
-				"aevalsrc=if(between(t\\,1\\,2)\\,0.1*sin(2*PI*440*t)\\,0):s=16000:d=4",
+				`aevalsrc=if(between(t\\,1\\,2)\\,0.1*sin(2*PI*440*t)\\,0):s=16000:d=${audioDuration}`,
 			);
 		if (extraTrack)
 			args.push(
@@ -205,6 +210,34 @@ describe("FFmpeg silence integration", () => {
 		);
 		expect(result.audioTracks).toBe(2);
 		expect(result.ranges).toEqual([]);
+	});
+	test("analyzes a desktop video timeline with a slightly longer AAC tail", async () => {
+		const result = await analyzeSilenceFile(
+			await fixture("aac-tail.mp4", true, false, 4.06),
+			4000,
+			new AbortController().signal,
+		);
+		expect(result.durationMs).toBe(4000);
+		expect(result.ranges).toHaveLength(2);
+		expect(result.ranges.every((range) => range.endMs <= 4000)).toBe(true);
+	});
+	test("preserves container-based timelines with a slightly shorter video track", async () => {
+		const result = await analyzeSilenceFile(
+			await fixture("container-aac-tail.mp4", true, false, 4.06),
+			4060,
+			new AbortController().signal,
+		);
+		expect(result.durationMs).toBe(4060);
+		expect(result.ranges).toHaveLength(2);
+	});
+	test("rejects audio tails outside the bounded timeline tolerance", async () => {
+		await expect(
+			analyzeSilenceFile(
+				await fixture("long-aac-tail.mp4", true, false, 4.2),
+				4000,
+				new AbortController().signal,
+			),
+		).rejects.toThrow("duration");
 	});
 	test("rejects absent audio, timing mismatch and aborted work", async () => {
 		await expect(
