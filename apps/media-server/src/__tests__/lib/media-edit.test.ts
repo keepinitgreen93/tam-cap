@@ -176,7 +176,7 @@ describe("media edit helpers", () => {
 
 describe("renderEditedVideo integration tests", () => {
 	test("renders an edited mp4 with audio using the real ffmpeg path", async () => {
-		const metadata = await probeVideo(`file://${TEST_VIDEO_WITH_AUDIO}`);
+		const metadata = await probeVideo(TEST_VIDEO_WITH_AUDIO);
 		const progressUpdates: number[] = [];
 
 		const editedFile = await renderEditedVideo({
@@ -195,7 +195,7 @@ describe("renderEditedVideo integration tests", () => {
 		});
 		tempFiles.push(editedFile.path);
 
-		const outputMetadata = await probeVideo(`file://${editedFile.path}`);
+		const outputMetadata = await probeVideo(editedFile.path);
 		expect(outputMetadata.videoCodec).toBe("h264");
 		expect(outputMetadata.audioCodec).toBe("aac");
 		expect(outputMetadata.duration).toBeGreaterThan(0.3);
@@ -210,7 +210,7 @@ describe("renderEditedVideo integration tests", () => {
 	}, 60000);
 
 	test("renders an edited mp4 without adding an audio track", async () => {
-		const metadata = await probeVideo(`file://${TEST_VIDEO_NO_AUDIO}`);
+		const metadata = await probeVideo(TEST_VIDEO_NO_AUDIO);
 
 		const editedFile = await renderEditedVideo({
 			inputPath: TEST_VIDEO_NO_AUDIO,
@@ -219,7 +219,7 @@ describe("renderEditedVideo integration tests", () => {
 		});
 		tempFiles.push(editedFile.path);
 
-		const outputMetadata = await probeVideo(`file://${editedFile.path}`);
+		const outputMetadata = await probeVideo(editedFile.path);
 		expect(outputMetadata.videoCodec).toBe("h264");
 		expect(outputMetadata.audioCodec).toBeNull();
 		expect(outputMetadata.duration).toBeGreaterThan(0.2);

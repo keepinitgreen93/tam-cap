@@ -2,6 +2,7 @@ import { writeFile } from "node:fs/promises";
 import { file, spawn } from "bun";
 import { FfmpegExitError, ffmpegErrorLines } from "./ffmpeg-errors";
 import type { VideoMetadata } from "./job-manager";
+import { decodeThreadsFromEnv } from "./media-common";
 import {
 	buildNvencEncodeArgs,
 	logNvencFallback,
@@ -34,6 +35,12 @@ const MAX_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_OUTPUT_FPS = 30;
 const MAX_TRANSCODE_RANGES_PER_BATCH = 4;
 const EDIT_CRF = 18;
+
+function editPreset() {
+	return process.env.MEDIA_SERVER_EDIT_PRESET === "veryfast"
+		? "veryfast"
+		: "fast";
+}
 
 function roundTime(value: number) {
 	return Math.round(value * 1000) / 1000;
@@ -187,6 +194,8 @@ export function buildTranscodeEditArgs(
 		"-hide_banner",
 		"-y",
 		...ranges.flatMap((range) => [
+			"-threads",
+			decodeThreadsFromEnv("MEDIA_SERVER_EDIT_DECODE_THREADS", 1),
 			"-ss",
 			formatTime(range.start),
 			"-t",
@@ -194,17 +203,31 @@ export function buildTranscodeEditArgs(
 			"-i",
 			inputPath,
 		]),
+		"-filter_complex_threads",
+		"1",
 		"-filter_complex",
 		[...filters, concat].join(";"),
 		"-map",
 		"[v]",
 		...(nvenc
 			? buildNvencEncodeArgs(nvenc, EDIT_CRF)
-			: ["-c:v", "libx264", "-preset", "fast", "-crf", String(EDIT_CRF)]),
+			: [
+					"-c:v",
+					"libx264",
+					"-preset",
+					editPreset(),
+					"-crf",
+					String(EDIT_CRF),
+					"-threads",
+					decodeThreadsFromEnv("MEDIA_SERVER_EDIT_ENCODE_THREADS", 0),
+				]),
 		"-pix_fmt",
 		"yuv420p",
 		"-enc_time_base:v",
 		`1/${getOutputFps(fps)}`,
+		"-progress",
+		"pipe:1",
+		"-nostats",
 		...(hasAudio ? ["-map", "[a]", "-c:a", "aac", "-b:a", "160k"] : ["-an"]),
 		"-movflags",
 		"+faststart",
@@ -233,13 +256,28 @@ function buildConcatArgs(listPath: string, outputPath: string) {
 	];
 }
 
-async function drainStream(stream: ReadableStream<Uint8Array> | null) {
+async function drainStream(
+	stream: ReadableStream<Uint8Array> | null,
+	onEncodedSeconds?: (seconds: number) => void,
+) {
 	if (!stream) return;
 	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	let pending = "";
 	try {
 		while (true) {
-			const { done } = await reader.read();
+			const { done, value } = await reader.read();
 			if (done) break;
+			if (!onEncodedSeconds) continue;
+			pending += decoder.decode(value, { stream: true });
+			const lines = pending.split("\n");
+			pending = lines.pop() ?? "";
+			for (const line of lines) {
+				if (!line.startsWith("out_time_us=")) continue;
+				const seconds =
+					Number(line.slice("out_time_us=".length).trim()) / 1_000_000;
+				if (Number.isFinite(seconds) && seconds >= 0) onEncodedSeconds(seconds);
+			}
 		}
 	} finally {
 		reader.releaseLock();
@@ -297,6 +335,7 @@ async function runFfmpegCommand(
 	args: string[],
 	timeoutMs: number,
 	abortSignal?: AbortSignal,
+	onEncodedSeconds?: (seconds: number) => void,
 ) {
 	abortSignal?.throwIfAborted();
 
@@ -321,9 +360,10 @@ async function runFfmpegCommand(
 			(async () => {
 				const [stderrText, exitCode] = await Promise.all([
 					readStream(proc.stderr as ReadableStream<Uint8Array>),
-					drainStream(proc.stdout as ReadableStream<Uint8Array>).then(
-						() => proc.exited,
-					),
+					drainStream(
+						proc.stdout as ReadableStream<Uint8Array>,
+						onEncodedSeconds,
+					).then(() => proc.exited),
 				]);
 
 				if (exitCode !== 0) {
@@ -414,10 +454,15 @@ async function renderTranscodedEdit(
 	const batches = createTranscodeBatches(keepRanges);
 	const batchFiles: TempFileHandle[] = [];
 	const startedAt = performance.now();
+	const totalDuration = getTotalRangeDuration(keepRanges);
+	let completedDuration = 0;
+	let lastProgressAt = 0;
 
 	try {
 		onProgress?.(5, "Preparing edit...");
 		for (const [index, batch] of batches.entries()) {
+			const batchDuration = getTotalRangeDuration(batch);
+			const message = `Encoding edit (${index + 1}/${batches.length})...`;
 			const batchFile = await createTempFile(".mp4");
 			batchFiles.push(batchFile);
 			await runFfmpegCommand(
@@ -431,11 +476,21 @@ async function renderTranscodedEdit(
 				),
 				getRemainingTimeoutMs(startedAt, timeoutMs),
 				abortSignal,
+				(seconds) => {
+					const now = performance.now();
+					if (now - lastProgressAt < 2000) return;
+					lastProgressAt = now;
+					onProgress?.(
+						5 +
+							((completedDuration + Math.min(seconds, batchDuration)) /
+								totalDuration) *
+								65,
+						message,
+					);
+				},
 			);
-			onProgress?.(
-				5 + ((index + 1) / batches.length) * 65,
-				"Preparing edit...",
-			);
+			completedDuration += batchDuration;
+			onProgress?.(5 + (completedDuration / totalDuration) * 65, message);
 		}
 
 		if (batchFiles.length === 1) {

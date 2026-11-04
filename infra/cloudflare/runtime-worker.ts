@@ -51,7 +51,7 @@ function hasPreviewAccess(request: Request, configuredKey: string | undefined) {
 }
 
 class CapContainer extends Container<RuntimeBindings> {
-	instance: "standard-1" | "standard-2" = "standard-1";
+	instance: "standard-1" | "standard-2" | "standard-4" = "standard-1";
 	private starting?: Promise<void>;
 
 	async fetch(request: Request): Promise<Response> {
@@ -222,12 +222,16 @@ async function workflowRpc(
 }
 
 export class CapMedia extends CapContainer {
+	instance = "standard-4" as const;
 	defaultPort = 3456;
-	sleepAfter = "5m";
+	sleepAfter = "1m";
 	envVars = {
 		MEDIA_SERVER_WEBHOOK_SECRET: this.env.MEDIA_SERVER_WEBHOOK_SECRET,
 		MEDIA_SERVER_MAX_CONCURRENT_VIDEO_PROCESSES: "1",
 		MEDIA_SERVER_MAX_CONCURRENT_DIRECT_CONVERSIONS: "1",
+		MEDIA_SERVER_EDIT_PRESET: "veryfast",
+		MEDIA_SERVER_EDIT_DECODE_THREADS: "1",
+		MEDIA_SERVER_EDIT_ENCODE_THREADS: "4",
 	};
 
 	async onActivityExpired() {

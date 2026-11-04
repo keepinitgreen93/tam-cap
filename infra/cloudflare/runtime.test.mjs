@@ -139,6 +139,40 @@ async function loadWebContainerContract() {
 	return (await loadRuntimeContract()).CapWeb;
 }
 
+test("media uses burst CPU but never sleeps while a render is active", async () => {
+	const { CapMedia } = await loadRuntimeContract();
+	const fixture = webConfigurationFixture();
+	let started;
+	fixture.container.start = (options) => {
+		started = options;
+		fixture.container.running = true;
+	};
+	const app = new CapMedia(fixture.ctx, fixture.env);
+	await app.fetch(new Request("http://cap.media/video/status"));
+	assert.equal(started.instance, "standard-4");
+	assert.equal(started.env.MEDIA_SERVER_MAX_CONCURRENT_VIDEO_PROCESSES, "1");
+	assert.equal(started.env.MEDIA_SERVER_EDIT_PRESET, "veryfast");
+	assert.equal(app.sleepAfter, "1m");
+	let activeJobs = 1;
+	let renewed = 0;
+	app.containerFetch = async () =>
+		Response.json({
+			runtime: {
+				activeJobs,
+				activeSubprocesses: 0,
+				backgroundTasks: 0,
+				inFlightRequests: 0,
+			},
+		});
+	app.renewActivityTimeout = () => renewed++;
+	await app.onActivityExpired();
+	assert.equal(fixture.calls.stops, 0);
+	assert.equal(renewed, 1);
+	activeJobs = 0;
+	await app.onActivityExpired();
+	assert.equal(fixture.calls.stops, 1);
+});
+
 test("named-image startup coalesces concurrent requests and configures private egress first", async () => {
 	const CapWeb = await loadWebContainerContract();
 	const events = [];
