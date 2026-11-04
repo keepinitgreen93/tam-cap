@@ -5,7 +5,7 @@ export const selfHostedDownloads: Record<
 	DownloadArtifact | null
 > = {
 	windows: {
-		href: "/downloads/v0.6.1-tam.2/TAMCap-Windows-x64-setup.exe",
+		href: "/downloads/v0.6.1-tam.3/TAMCap-Windows-x64-setup.exe",
 	},
 	macosArm64: {
 		href: "/downloads/v0.6.1-tam.2/TAMCap-macOS-arm64.dmg",
