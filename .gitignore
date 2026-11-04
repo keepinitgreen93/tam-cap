@@ -76,6 +76,7 @@ scripts/seo/
 **/.wrangler/
 **/.dev.vars*
 /.secrets/
+/.codex-remote-attachments/
 /.playwright-cli/
 /output/playwright/
 /.growth-agent/

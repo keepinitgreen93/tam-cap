@@ -8,7 +8,7 @@ To activate OpenRouter, save the API key in an ignored local file and publish it
 ./scripts/cloudflare/runtime-secrets.ps1 -Operation Publish -AiProvider OpenRouter -AiModel z-ai/glm-5.3-flash -AiApiKeyPath .secrets/openrouter-api-key.txt
 ```
 
-Deploy an application image containing OpenRouter support before publishing those settings. The operation preserves the transcription credentials and existing authentication settings, publishes the key through stdin, and reseals the encrypted runtime backup. Verify the running application has adopted the new configuration before retrying generation. OpenRouter requests disable reasoning and prefer low latency for this metadata workload.
+Deploy an application image containing OpenRouter support before publishing those settings. The operation preserves the transcription credentials and existing authentication settings, publishes the key through stdin, and reseals the encrypted runtime backup. Verify the running application has adopted the new configuration before retrying generation. OpenRouter requests use low reasoning effort and prefer low latency; GLM-5.3 Flash rejects requests that disable reasoning. To restore the prior Cloudflare text model, use `-Operation Publish -AiProvider Cloudflare`.
 
 The November 3 repair addresses three independent processing issues:
 

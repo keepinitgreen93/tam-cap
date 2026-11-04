@@ -7,7 +7,7 @@ param(
 	[switch]$RestartWeb,
 	[ValidatePattern('^[a-p]{32}$')]
 	[string]$ChromeExtensionId,
-	[ValidateSet('OpenRouter')]
+	[ValidateSet('OpenRouter', 'Cloudflare')]
 	[string]$AiProvider,
 	[ValidatePattern('^[a-zA-Z0-9-]+/[a-zA-Z0-9._:-]+$')]
 	[string]$AiModel = 'z-ai/glm-5.3-flash',
@@ -59,7 +59,16 @@ try {
 		@{ verified = $true; owner = $capPayload.web.CAP_OWNER_EMAIL; origin = $capPayload.web.WEB_URL; maintenanceConfigured = [bool]$capPayload.web.CRON_SECRET } | ConvertTo-Json
 		return
 	}
-	if ($AiProvider) {
+	if ($AiProvider -eq 'Cloudflare') {
+		if ($Operation -ne 'Publish') { throw 'AI configuration requires Publish.' }
+		$capPayload.web.AI_PROVIDER = 'openai-compatible'
+		$capPayload.web.AI_BASE_URL = "https://api.cloudflare.com/client/v4/accounts/$($capPayload.web.CLOUDFLARE_ACCOUNT_ID)/ai/v1"
+		$capPayload.web.AI_API_KEY = $capPayload.web.CLOUDFLARE_AI_API_TOKEN
+		$capPayload.web.AI_MODEL = '@cf/meta/llama-3.1-8b-instruct-fp8'
+		$capPayload.web.AI_CHAT_MODEL = $capPayload.web.AI_MODEL
+		$capPayload.web.AI_STREAM_MODEL = $capPayload.web.AI_MODEL
+	}
+	if ($AiProvider -eq 'OpenRouter') {
 		if ($Operation -ne 'Publish' -or -not $AiApiKeyPath) { throw 'OpenRouter configuration requires Publish and AiApiKeyPath.' }
 		$capAiKey = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AiApiKeyPath).Path).Trim()
 		if (-not $capAiKey -or $capAiKey -match '\s') { throw 'The OpenRouter key file must contain only the API key.' }

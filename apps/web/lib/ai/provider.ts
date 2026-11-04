@@ -280,7 +280,7 @@ function createModel(
 					? {
 							transformRequestBody: (body: Record<string, unknown>) => ({
 								...body,
-								reasoning: { enabled: false },
+								reasoning: { effort: "low" },
 								provider: { sort: "latency" },
 							}),
 						}
