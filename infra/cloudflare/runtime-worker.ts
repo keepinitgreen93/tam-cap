@@ -177,7 +177,21 @@ export class CapWeb extends CapContainer {
 		const headers = new Headers(request.headers);
 		headers.delete(WEB_CONFIGURATION_HEADER);
 		headers.delete(WEB_VERSION_HEADER);
+		if (new URL(request.url).protocol === "https:")
+			await this.ctx.storage.put(
+				"cap.runtime.interactive-until",
+				Date.now() + 10 * 60_000,
+			);
 		return super.fetch(new Request(request, { headers }));
+	}
+
+	async onActivityExpired() {
+		await this.configurationReady;
+		const interactiveUntil = await this.ctx.storage.get<number>(
+			"cap.runtime.interactive-until",
+		);
+		if (Date.now() < (interactiveUntil ?? 0)) this.renewActivityTimeout();
+		else await this.stop();
 	}
 }
 
@@ -293,7 +307,10 @@ export default {
 		const previewResponse = new Response(response.body, response);
 		previewResponse.headers.set("Cache-Control", "private, no-store");
 		if (env.CF_VERSION_METADATA?.id)
-			previewResponse.headers.set("X-Cap-Worker-Version", env.CF_VERSION_METADATA.id);
+			previewResponse.headers.set(
+				"X-Cap-Worker-Version",
+				env.CF_VERSION_METADATA.id,
+			);
 		return previewResponse;
 	},
 	async scheduled(event: ScheduledController, env: RuntimeBindings) {
@@ -347,11 +364,23 @@ export default {
 					env,
 				);
 				if (!response.ok) {
+					console.error("Workflow delivery rejected", {
+						status: response.status,
+						kind,
+						attempt: message.attempts,
+					});
 					message.retry({ delaySeconds: 30 });
 					continue;
 				}
 				message.ack();
-			} catch {
+			} catch (error) {
+				console.error("Workflow delivery failed", {
+					message:
+						error instanceof Error
+							? error.message.slice(0, 200)
+							: "Unknown failure",
+					attempt: message.attempts,
+				});
 				message.retry({ delaySeconds: 30 });
 			}
 		}

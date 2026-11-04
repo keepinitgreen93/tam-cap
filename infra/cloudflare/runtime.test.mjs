@@ -251,6 +251,37 @@ function webConfigurationFixture(running = false) {
 	return { ctx, env, storage, calls, container };
 }
 
+test("interactive requests stay warm but maintenance still sleeps and the grace period expires", async (context) => {
+	context.mock.timers.enable({ apis: ["Date"] });
+	const CapWeb = await loadWebContainerContract();
+	for (const interactive of [false, true]) {
+		const fixture = webConfigurationFixture();
+		let app = new CapWeb(fixture.ctx, fixture.env);
+		await app.fetch(
+			await webConfigurationRequest(
+				new Request(
+					interactive
+						? "https://cap.example/dashboard"
+						: "http://cap.web/api/cron/recover-failed-video-processing",
+				),
+				fixture.env,
+			),
+		);
+		context.mock.timers.tick(125_000);
+		app = new CapWeb(fixture.ctx, fixture.env);
+		let renewals = 0;
+		app.renewActivityTimeout = () => renewals++;
+		await app.onActivityExpired();
+		assert.equal(renewals, interactive ? 1 : 0);
+		assert.equal(fixture.calls.stops, interactive ? 0 : 1);
+		if (interactive) {
+			context.mock.timers.tick(600_000);
+			await app.onActivityExpired();
+			assert.equal(fixture.calls.stops, 1);
+		}
+	}
+});
+
 test(
 	"web configuration refresh stops once and fences all requests until the replacement is ready",
 	{ timeout: 5000 },
@@ -305,7 +336,10 @@ test(
 			forwards: 2,
 			egress: 1,
 		});
-		assert.deepEqual([...fixture.storage.keys()], ["cap.runtime.web-config"]);
+		assert.deepEqual(
+			[...fixture.storage.keys()],
+			["cap.runtime.web-config", "cap.runtime.interactive-until"],
+		);
 		assert.match(
 			fixture.storage.get("cap.runtime.web-config"),
 			/^[0-9a-f]{64}$/,

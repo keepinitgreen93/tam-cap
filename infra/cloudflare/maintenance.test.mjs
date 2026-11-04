@@ -37,8 +37,22 @@ test("maintenance sends only protected internal requests, consumes bodies, and r
 		assert.equal(new URL(request.url).origin, "http://cap.web");
 		assert.equal(request.method, "GET");
 		assert.equal(request.headers.get("authorization"), "Bearer test-cron");
-		assert.equal(request.redirect, "error");
+		assert.equal(request.redirect, "manual");
 	}
+});
+
+test("maintenance rejects redirects instead of sending credentials to another origin", async () => {
+	await assert.rejects(
+		runMaintenance(
+			Date.now(),
+			JSON.stringify({ CRON_SECRET: "test-cron" }),
+			async (request) => {
+				assert.equal(request.redirect, "manual");
+				return Response.redirect("https://elsewhere.example/", 302);
+			},
+		),
+		/:302/,
+	);
 });
 
 test("maintenance fails closed before starting web without a credential", async () => {

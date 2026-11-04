@@ -30,13 +30,20 @@ export async function runMaintenance(
 			const response = await fetchInternal(
 				new Request(`http://cap.web${path}`, {
 					headers: { authorization: `Bearer ${env.CRON_SECRET}` },
-					redirect: "error",
+					redirect: "manual",
 					signal: AbortSignal.timeout(60_000),
 				}),
 			);
 			if (!response.ok) failures.push(`${path}:${response.status}`);
 			await response.body?.cancel();
-		} catch {
+		} catch (error) {
+			console.error("Maintenance request failed", {
+				path,
+				message:
+					error instanceof Error
+						? error.message.slice(0, 200)
+						: "Unknown failure",
+			});
 			failures.push(`${path}:unavailable`);
 		}
 	}

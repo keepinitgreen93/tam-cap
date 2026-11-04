@@ -4,7 +4,7 @@ Checked 2026-10-28. Target: roughly $20/month. This is a usage estimate, not a s
 
 ## Runtime envelope
 
-The deployed web and media containers each use standard-1 (4 GiB RAM, 0.5 vCPU, 8 GB disk), with one primary instance per service. Web sleeps after two idle minutes. Media sleeps after five idle minutes and retains active jobs. CPU is charged for actual use; RAM and disk for provisioned running time.
+The deployed web and media containers each use standard-1 (4 GiB RAM, 0.5 vCPU, 8 GB disk), with one primary instance per service. Web checks for inactivity after two minutes; public website and desktop API requests keep it warm for ten minutes, with shutdown at the next inactivity check. Internal maintenance and callbacks do not extend that grace period. Media sleeps after five idle minutes and retains active jobs. CPU is charged for actual use; RAM and disk for provisioned running time.
 
 [Cloudflare container pricing](https://developers.cloudflare.com/containers/platform/pricing/) includes 25 GiB-hours RAM, 375 vCPU-minutes and 200 GB-hours disk in Workers Paid ($5/month). Overage rates are $0.0000025/GiB-second, $0.000020/vCPU-second and $0.00000007/GB-second respectively. Workers, Durable Objects, queues, AI and storage have separate meters.
 
@@ -60,6 +60,8 @@ The web process already peaked above 1 GiB in these tests, so the 1 GiB basic in
 ### Sign-in responsiveness
 
 A production probe on 2026-10-28 waited135 seconds before loading login: the first response took10.726 seconds and the next156 milliseconds. This is the cost of waking the sleeping web service, separate from email delivery. The repaired desktop sign-in polls only while an explicit sign-in is pending, at three-second intervals for at most ten minutes, so the service stays responsive during that flow. It stops on success, cancellation or expiry. The two-minute idle policy is retained; no always-on hosting commitment was added.
+
+On November 3, 2026, the web runtime gained the ten-minute interactive grace period described above. The initial request after a longer idle period can still require a cold start. This increases running time around real visits without extending maintenance-only wakeups or committing to always-on hosting. The historical measurements above describe the earlier two-minute policy.
 
 ## Controls and review
 
