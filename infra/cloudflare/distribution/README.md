@@ -1,6 +1,8 @@
 # TAM Cap client distribution
 
-The `v0.6.1-tam.2` desktop packages connect to `https://videos.trulyauthenticmarketing.com`. The unchanged Chrome extension remains at its `v0.6.1-tam.1` URL. `manifest.json` records each exact URL, byte count, SHA-256 hash, and native CI source revision. `checksums.txt` covers the exact download filenames. The R2 bucket `tam-cap-downloads` stays private; the application Worker serves only allowlisted `/downloads/` paths through its existing readiness boundary.
+The Windows package is `v0.6.1-tam.3`; macOS remains `v0.6.1-tam.2` and Chrome remains `v0.6.1-tam.1`. They connect to `https://videos.trulyauthenticmarketing.com`. `manifest.json` records each exact URL, byte count, SHA-256 hash, and native CI source revision. `checksums.txt` covers the exact download filenames. The R2 bucket `tam-cap-downloads` stays private; the application Worker serves only allowlisted `/downloads/` paths through its existing readiness boundary.
+
+The November 3 Windows update hides the webcam toolbar and resize brackets from recording startup through finalization, including when the pointer hovers over the bubble. It was installed with settings and authentication preserved; an Instant recording completed and its saved frame showed the camera bubble without editing controls. Existing recordings retain any controls already captured in their pixels.
 
 Desktop sign-in now opens the instance's HTTPS approval page. After the owner signs in and approves, the app exchanges its private verifier for a desktop credential through HTTPS; the browser finishes at `/desktop/complete`. No localhost callback or reusable credential appears in the browser URL. Requests expire after ten minutes and are consumed once. Old desktop clients show an update-required page when starting sign-in. Existing valid sessions are preserved by an installer update.
 

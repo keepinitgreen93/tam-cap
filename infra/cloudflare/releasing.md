@@ -59,8 +59,8 @@ Both targets retain the existing application/resource IDs. Deploying a staging c
 3. With readiness and maintenance still false, validate and deploy the reviewed config using the operator's existing authenticated profile:
 
    ```powershell
-   wrangler deploy --config $releaseConfig --dry-run --containers-rollout none
-   wrangler deploy --config $releaseConfig --containers-rollout none
+   wrangler deploy --config $releaseConfig --dry-run --containers-rollout immediate
+   wrangler deploy --config $releaseConfig --containers-rollout immediate
    ```
 
 4. Keep the application closed while old/new Worker, Durable Object and container state converge. The runtime compares a fingerprint of effective environment, image revision and deployment ID. A new Worker reaching an old configuration receives a temporary non-cacheable 503. Preserve the fingerprint, DO bindings and migration history. A successful Worker deployment or an elapsed idle timeout does not identify the running Node/media images.
@@ -76,6 +76,8 @@ wrangler deploy --config $releaseConfig --containers-rollout none
 ```
 
 For staging use `--target staging`. Enable scheduled maintenance only when its acceptance is complete by adding `--maintenance` to the generation command. Every later forced generation must state both desired flags explicitly. Confirm private workspace rules and fresh requests after opening the public gate.
+
+Use `--containers-rollout immediate` whenever a pinned container image changes. `none` skips preparing and updating container images; it is appropriate only for Worker/configuration changes after the intended images have been registered. Verify an application behavior unique to the new image after deployment. An updated Worker version and matching configuration fingerprint alone do not prove the image changed.
 
 ## Recovery and rollback
 

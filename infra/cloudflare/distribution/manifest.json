@@ -1,15 +1,15 @@
 {
 	"schemaVersion": 1,
-	"release": "v0.6.1-tam.2",
+	"release": "v0.6.1-tam.3",
 	"serverUrl": "https://videos.trulyauthenticmarketing.com",
 	"artifacts": {
 		"windows": {
 			"filename": "TAMCap-Windows-x64-setup.exe",
-			"href": "/downloads/v0.6.1-tam.2/TAMCap-Windows-x64-setup.exe",
-			"bytes": 133829850,
-			"sha256": "c886e5fd18b53b227bebe475d2529a76b17610c627f59613bd334c017f41405c",
-			"sourceRevision": "897476c07a78ded0e8a10ca203dc021ae9c5f182",
-			"buildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/40699431188"
+			"href": "/downloads/v0.6.1-tam.3/TAMCap-Windows-x64-setup.exe",
+			"bytes": 133833636,
+			"sha256": "4fcbb07ada19f941045af912188caaaad2050072dffa8a4079fdeedc53488dc6",
+			"sourceRevision": "fcdcb8a94e2c093c6b104516bc986166c396d01b",
+			"buildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/41754391791"
 		},
 		"macosArm64": {
 			"filename": "TAMCap-macOS-arm64.dmg",
