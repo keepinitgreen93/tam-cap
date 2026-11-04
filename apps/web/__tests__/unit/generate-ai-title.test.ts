@@ -69,6 +69,16 @@ describe("parseAiResponse", () => {
 });
 
 describe("shouldReplaceVideoTitle", () => {
+	it("replaces Windows capture filenames with dot-separated times but preserves manual names", () => {
+		const input = {
+			currentTitle: "Example Monitor (Display) 2026-11-03 08.09 PM",
+			nextAiTitle: "Campaign performance and next steps",
+		};
+		expect(shouldReplaceVideoTitle(input)).toBe(true);
+		expect(
+			shouldReplaceVideoTitle({ ...input, titleManuallyEdited: true }),
+		).toBe(false);
+	});
 	it("replaces default Cap titles", () => {
 		expect(
 			shouldReplaceVideoTitle({

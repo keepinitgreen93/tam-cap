@@ -94,19 +94,28 @@ export function parseCloudflareTranscription(
 				!finiteNumber(word.start) ||
 				!finiteNumber(word.end) ||
 				word.start < 0 ||
-				word.end <= word.start ||
+				word.end < word.start ||
 				word.end > duration ||
-				Math.round(word.end * 1000) <= Math.round(word.start * 1000)
+				(word.end !== word.start &&
+					Math.round(word.end * 1000) <= Math.round(word.start * 1000))
 			) {
 				throw new CloudflareTranscriptionError(
 					"Invalid Cloudflare word timing",
 				);
 			}
+			const suppliedConfidence = confidence(word.confidence);
+			const pointTiming = word.end === word.start;
+			// Whisper can emit real words with zero-width timings. Keep a display marker, never an automatic cut target.
+			const end = pointTiming
+				? Math.min(Math.round(duration * 1000), Math.round(word.end * 1000) + 1)
+				: Math.round(word.end * 1000);
 			words.push({
 				text: word.word.trim(),
-				start: Math.round(word.start * 1000),
-				end: Math.round(word.end * 1000),
-				confidence: confidence(word.confidence),
+				start: pointTiming
+					? Math.max(0, end - 1)
+					: Math.round(word.start * 1000),
+				end,
+				confidence: pointTiming ? 0 : suppliedConfidence,
 				speaker: null,
 				channel: "0",
 			});

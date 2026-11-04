@@ -38,7 +38,7 @@ import {
 	type EditTranscriptWord,
 	getDeletedTranscriptWordIds,
 	groupEditTranscriptWords,
-	isFillerWord,
+	isRemovableFillerWord,
 	normalizeTranscriptSelection,
 	planFillerCuts,
 	planTranscriptCut,
@@ -55,6 +55,7 @@ type TranscriptResponse = Awaited<ReturnType<typeof getEditTranscript>>;
 
 type TranscriptSidebarProps = {
 	videoId: Video.VideoId;
+	durationMs: number;
 	sourceRevision?: string | null;
 	videoRef: RefObject<HTMLVideoElement | null>;
 	keepRanges: VideoEditRange[];
@@ -184,9 +185,9 @@ const TranscriptGroupRow = memo(function TranscriptGroupRow({
 						const isSelectionEnd = isSelected && index === selectionEndIndex;
 						const isActive = activeWordIndex === index;
 						const isDeleted = deletedWordIds.has(word.id);
-						const isFiller = isFillerWord(word.text);
 						const isSearchMatch = searchMatchSet.has(index);
-						const willRemoveAsFiller = previewFillers && isFiller && !isDeleted;
+						const willRemoveAsFiller =
+							previewFillers && isRemovableFillerWord(word) && !isDeleted;
 
 						let stateClassName: string;
 						if (isSelected) {
@@ -563,6 +564,7 @@ function SilenceCleanup({
 
 export function TranscriptSidebar({
 	videoId,
+	durationMs,
 	sourceRevision,
 	videoRef,
 	keepRanges,
@@ -589,7 +591,14 @@ export function TranscriptSidebar({
 	);
 
 	const loadTranscript = useCallback(async () => {
-		setResponse(await getEditTranscript(videoId));
+		try {
+			setResponse(await getEditTranscript(videoId));
+		} catch {
+			setResponse({
+				status: "error",
+				message: "Could not load the transcript. Try again.",
+			});
+		}
 	}, [videoId]);
 
 	useEffect(() => {
@@ -647,7 +656,7 @@ export function TranscriptSidebar({
 	const availableFillerCount = useMemo(
 		() =>
 			transcript?.words.filter(
-				(word) => isFillerWord(word.text) && !deletedWordIds.has(word.id),
+				(word) => isRemovableFillerWord(word) && !deletedWordIds.has(word.id),
 			).length ?? 0,
 		[deletedWordIds, transcript],
 	);
@@ -760,7 +769,7 @@ export function TranscriptSidebar({
 		let activeRangeIndex = 0;
 		let removedCount = 0;
 		for (const word of transcript.words) {
-			if (!isFillerWord(word.text) || deletedWordIds.has(word.id)) continue;
+			if (!isRemovableFillerWord(word) || deletedWordIds.has(word.id)) continue;
 			const midpointMs = (word.startMs + word.endMs) / 2;
 			while (
 				activeRangeIndex < activeRanges.length &&
@@ -891,6 +900,15 @@ export function TranscriptSidebar({
 						You can keep editing while precise word timings are generated.
 					</p>
 				</div>
+				<SilenceCleanup
+					videoId={videoId}
+					sourceRevision={sourceRevision}
+					videoRef={videoRef}
+					keepRanges={keepRanges}
+					onDeleteRanges={onDeleteRanges}
+					words={[]}
+					durationMs={durationMs}
+				/>
 			</aside>
 		);
 	}
@@ -918,6 +936,15 @@ export function TranscriptSidebar({
 					{isRequesting && <LoaderCircle className="size-3.5 animate-spin" />}
 					Try again
 				</button>
+				<SilenceCleanup
+					videoId={videoId}
+					sourceRevision={sourceRevision}
+					videoRef={videoRef}
+					keepRanges={keepRanges}
+					onDeleteRanges={onDeleteRanges}
+					words={[]}
+					durationMs={durationMs}
+				/>
 			</aside>
 		);
 	}

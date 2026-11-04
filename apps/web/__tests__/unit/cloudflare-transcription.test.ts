@@ -4,6 +4,10 @@ import {
 	parseCloudflareTranscription,
 	transcribeWithCloudflare,
 } from "../../lib/cloudflare-transcription";
+import {
+	createEditTranscript,
+	planFillerCuts,
+} from "../../lib/edit-transcript";
 import { cloudflareWhisperLongFixture } from "../fixtures/cloudflare-whisper-long-response";
 import { cloudflareWhisperResponse } from "../fixtures/cloudflare-whisper-response";
 
@@ -33,6 +37,38 @@ function response(
 }
 
 describe("Cloudflare Whisper transcription", () => {
+	it("retains zero-width words while excluding uncertain fillers from automatic cuts", () => {
+		const parsed = parseCloudflareTranscription(
+			response([
+				{ word: "bringing", start: 0.4, end: 0.4 },
+				{ word: "in", start: 0.4, end: 0.8 },
+				{ word: "um,", start: 1, end: 1 },
+				{ word: "faster", start: 1.2, end: 1.8 },
+				{ word: "now", start: 2, end: 2 },
+			]),
+			2000,
+		);
+		expect(parsed.words.map((word) => word.text)).toEqual([
+			"bringing",
+			"in",
+			"um,",
+			"faster",
+			"now",
+		]);
+		expect(parsed.words[2]).toMatchObject({
+			start: 1000,
+			end: 1001,
+			confidence: 0,
+		});
+		expect(parsed.words[4]).toMatchObject({
+			start: 1999,
+			end: 2000,
+			confidence: 0,
+		});
+		const editable = createEditTranscript(parsed, 2000);
+		expect(editable.words).toHaveLength(5);
+		expect(planFillerCuts(editable.words, 2000).ranges).toHaveLength(0);
+	});
 	it("preserves every spoken reference token from the real 200-second VAD regression", () => {
 		const { response, sourceDurationMs, expectedNormalizedTokens } =
 			cloudflareWhisperLongFixture;

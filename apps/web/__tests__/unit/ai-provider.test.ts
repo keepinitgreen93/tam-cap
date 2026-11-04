@@ -40,6 +40,31 @@ describe("Cloudflare deployment provider boundary", () => {
 		}
 	});
 
+	it("uses explicitly configured OpenRouter without adding other providers", () => {
+		vi.stubEnv("CAP_RUNTIME", "cloudflare");
+		envWith({
+			...configured,
+			AI_BASE_URL: "https://openrouter.ai/api/v1",
+			AI_MODEL: "z-ai/glm-5.3-flash",
+		});
+		for (const role of ["generation", "chat", "chat-streaming"] as const) {
+			expect(getAiProviderChain(role).map(({ modelId }) => modelId)).toEqual([
+				"z-ai/glm-5.3-flash",
+			]);
+		}
+		for (const baseURL of [
+			"https://openrouter.ai.example/api/v1",
+			"https://openrouter.ai/api/v1?redirect=1",
+		]) {
+			envWith({
+				...configured,
+				AI_BASE_URL: baseURL,
+				AI_MODEL: "z-ai/glm-5.3-flash",
+			});
+			expect(getConfiguredAiProviders()).toEqual([]);
+		}
+	});
+
 	it("rejects another account, credentials in URLs, redirects through URLs and remote providers", () => {
 		vi.stubEnv("CAP_RUNTIME", "cloudflare");
 		for (const endpoint of [

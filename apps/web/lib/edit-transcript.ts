@@ -126,6 +126,10 @@ export function isFillerWord(text: string) {
 	return isExactFillerToken(normalizeToken(text));
 }
 
+export function isRemovableFillerWord(word: EditTranscriptWord) {
+	return word.confidence !== 0 && isFillerWord(word.text);
+}
+
 export function createEditTranscript(
 	result: AssemblyAIEditResult,
 	durationMs: number,
@@ -360,7 +364,7 @@ export function editTranscriptWordsToCaptionVtt(
 ): string {
 	return formatToWebVTT({
 		words: words
-			.filter((word) => !isFillerWord(word.text))
+			.filter((word) => !isRemovableFillerWord(word))
 			.map((word) => ({
 				text: word.text,
 				start: word.startMs,
@@ -594,7 +598,7 @@ export function planFillerCuts(
 		const word = words[index];
 		if (!word) continue;
 
-		if (isFillerWord(word.text)) {
+		if (isRemovableFillerWord(word)) {
 			const nextWord = words[index + 1];
 			const overlappingSpeech =
 				previousMaxEnd > word.startMs ||

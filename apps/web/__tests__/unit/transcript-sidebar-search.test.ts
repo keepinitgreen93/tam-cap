@@ -164,6 +164,7 @@ beforeEach(async () => {
 		root.render(
 			createElement(TranscriptSidebar, {
 				videoId,
+				durationMs: 5000,
 				sourceRevision,
 				videoRef,
 				keepRanges: [{ start: 0, end: 5 }],

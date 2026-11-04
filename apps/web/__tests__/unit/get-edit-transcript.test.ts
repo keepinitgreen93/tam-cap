@@ -323,6 +323,25 @@ describe("requestEditTranscript", () => {
 });
 
 describe("getEditTranscript", () => {
+	it("reports pending word timings without starting a duplicate job or exposing provisional words", async () => {
+		const { database } = createDatabase({
+			...video,
+			transcriptionStatus: "PROCESSING",
+		});
+		const bucket = createBucket(
+			new Map([[TRANSCRIPT_KEY, storedOriginalTranscript()]]),
+		);
+		mocks.db.mockReturnValue(database);
+		mocks.getAccessForVideo.mockReturnValue(pipeValue([bucket]));
+		const { getEditTranscript } = await import(
+			"@/actions/videos/get-edit-transcript"
+		);
+		expect(await getEditTranscript("video-1" as never)).toEqual({
+			status: "processing",
+		});
+		expect(bucket.getObject).not.toHaveBeenCalled();
+		expect(mocks.start).not.toHaveBeenCalled();
+	});
 	it.each([true, false])(
 		"uses only the current transcript publication (edit=%s)",
 		async (edit) => {

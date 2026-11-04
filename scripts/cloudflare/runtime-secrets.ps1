@@ -6,7 +6,12 @@ param(
 	[switch]$RotateAuthSecret,
 	[switch]$RestartWeb,
 	[ValidatePattern('^[a-p]{32}$')]
-	[string]$ChromeExtensionId
+	[string]$ChromeExtensionId,
+	[ValidateSet('OpenRouter')]
+	[string]$AiProvider,
+	[ValidatePattern('^[a-zA-Z0-9-]+/[a-zA-Z0-9._:-]+$')]
+	[string]$AiModel = 'z-ai/glm-5.3-flash',
+	[string]$AiApiKeyPath
 )
 
 $ErrorActionPreference = 'Stop'
@@ -53,6 +58,17 @@ try {
 	if ($Operation -eq 'Verify') {
 		@{ verified = $true; owner = $capPayload.web.CAP_OWNER_EMAIL; origin = $capPayload.web.WEB_URL; maintenanceConfigured = [bool]$capPayload.web.CRON_SECRET } | ConvertTo-Json
 		return
+	}
+	if ($AiProvider) {
+		if ($Operation -ne 'Publish' -or -not $AiApiKeyPath) { throw 'OpenRouter configuration requires Publish and AiApiKeyPath.' }
+		$capAiKey = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $AiApiKeyPath).Path).Trim()
+		if (-not $capAiKey -or $capAiKey -match '\s') { throw 'The OpenRouter key file must contain only the API key.' }
+		$capPayload.web.AI_PROVIDER = 'openai-compatible'
+		$capPayload.web.AI_BASE_URL = 'https://openrouter.ai/api/v1'
+		$capPayload.web.AI_API_KEY = $capAiKey
+		$capPayload.web.AI_MODEL = $AiModel
+		$capPayload.web.AI_CHAT_MODEL = $AiModel
+		$capPayload.web.AI_STREAM_MODEL = $AiModel
 	}
 	if (-not $capPayload.web.CRON_SECRET) {
 		$capPayload.web.CRON_SECRET = [Convert]::ToHexString([Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLowerInvariant()

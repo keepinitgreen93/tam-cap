@@ -61,7 +61,10 @@ function isPublicError(error: unknown): error is Error {
 	return error instanceof Error && PUBLIC_ERROR_MESSAGES.has(error.message);
 }
 
-async function loadEditableTranscriptVideo(videoId: Video.VideoId) {
+async function loadEditableTranscriptVideo(
+	videoId: Video.VideoId,
+	allowPending = false,
+) {
 	const user = await getCurrentUser();
 	if (!user) throw new Error("Unauthorized");
 	if (!userIsPro(user)) throw new Error("Cap Pro is required");
@@ -71,7 +74,16 @@ async function loadEditableTranscriptVideo(videoId: Video.VideoId) {
 		.from(videos)
 		.where(eq(videos.id, videoId));
 	if (!video || video.ownerId !== user.id) throw new Error("Video not found");
-	if (!isEditableTranscriptVideo(video)) {
+	if (
+		!isEditableTranscriptVideo(video) &&
+		!(
+			allowPending &&
+			!video.isScreenshot &&
+			isMp4BackedVideo(video.source) &&
+			video.duration &&
+			video.duration > 0
+		)
+	) {
 		if (video.transcriptionStatus !== "COMPLETE") {
 			throw new Error("Transcript is not ready");
 		}
@@ -137,7 +149,21 @@ export async function getEditTranscript(
 	videoId: Video.VideoId,
 ): Promise<EditTranscriptResponse> {
 	try {
-		const { video, bucket } = await loadEditableTranscriptVideo(videoId);
+		const { video, bucket } = await loadEditableTranscriptVideo(videoId, true);
+		if (video.transcriptionStatus !== "COMPLETE") {
+			if (
+				!video.transcriptionStatus ||
+				video.transcriptionStatus === "PROCESSING"
+			)
+				return { status: "processing" };
+			return {
+				status: "error",
+				message:
+					video.transcriptionStatus === "NO_AUDIO"
+						? "No spoken audio was detected. Silence cleanup and timeline editing are still available."
+						: "The transcript is unavailable. Silence cleanup and timeline editing are still available.",
+			};
+		}
 		const transcript = await readCurrentEditTranscript(bucket, video);
 
 		if (transcript) {

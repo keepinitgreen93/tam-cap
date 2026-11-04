@@ -136,6 +136,13 @@ export function getConfiguredAiProviders(
 	if (process.env.CAP_RUNTIME === "cloudflare") {
 		const env = serverEnv();
 		if (
+			env.AI_PROVIDER === "openai-compatible" &&
+			env.AI_BASE_URL === "https://openrouter.ai/api/v1" &&
+			env.AI_API_KEY?.trim() &&
+			openAiCompatibleModelId(role)?.match(/^[a-z0-9-]+\/[a-z0-9._:-]+$/i)
+		)
+			return ["openai-compatible"];
+		if (
 			env.AI_PROVIDER !== "openai-compatible" ||
 			!env.CLOUDFLARE_ACCOUNT_ID?.match(/^[a-f0-9]{32}$/i) ||
 			!env.AI_API_KEY?.trim() ||
@@ -269,6 +276,15 @@ function createModel(
 				name: "openai-compatible",
 				baseURL,
 				apiKey: env.AI_API_KEY,
+				...(baseURL === "https://openrouter.ai/api/v1"
+					? {
+							transformRequestBody: (body: Record<string, unknown>) => ({
+								...body,
+								reasoning: { enabled: false },
+								provider: { sort: "latency" },
+							}),
+						}
+					: {}),
 			})(modelId);
 		}
 	}

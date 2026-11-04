@@ -1624,9 +1624,7 @@ export function EditVideoClient({
 			<main
 				className={[
 					"mx-auto flex w-full flex-1 flex-col px-3 pt-3 pb-4 sm:px-5 sm:pt-4 sm:pb-5",
-					video.transcriptionStatus === "COMPLETE"
-						? "max-w-[1500px] xl:pr-[400px]"
-						: "max-w-6xl",
+					"max-w-[1500px] xl:pr-[400px]",
 				].join(" ")}
 			>
 				<section className="flex min-h-0 flex-1 items-center justify-center">
@@ -1991,15 +1989,14 @@ export function EditVideoClient({
 				</div>
 			</main>
 
-			{video.transcriptionStatus === "COMPLETE" && (
-				<TranscriptSidebar
-					sourceRevision={silenceSourceRevision}
-					videoId={video.id}
-					videoRef={videoRef}
-					keepRanges={keepRanges}
-					onDeleteRanges={handleTranscriptDelete}
-				/>
-			)}
+			<TranscriptSidebar
+				durationMs={Math.round(video.duration * 1000)}
+				sourceRevision={silenceSourceRevision}
+				videoId={video.id}
+				videoRef={videoRef}
+				keepRanges={keepRanges}
+				onDeleteRanges={handleTranscriptDelete}
+			/>
 
 			<Dialog
 				open={showRestoreConfirm}
