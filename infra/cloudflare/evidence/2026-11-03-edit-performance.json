@@ -1,0 +1,34 @@
+{
+	"comparison": {
+		"scope": "Same original source and normalized keep ranges, replayed on a private benchmark copy",
+		"sourceDurationSeconds": 529.766,
+		"keepRangeCount": 47,
+		"beforeSeconds": 690.587,
+		"afterSeconds": 124.432,
+		"measurement": "Edit operation start to saved video_edits publication timestamp; excludes subsequent AI generation",
+		"beforeOutputDurationSeconds": 502.3575,
+		"afterOutputDurationSeconds": 502.3575,
+		"playback": "Seeked playback advanced with readyState 4 and no media error"
+	},
+	"encoderBenchmark": {
+		"keptDurationSeconds": 60,
+		"encoderThreads": 2,
+		"resolution": "1920x1080",
+		"crf": 18,
+		"fastSeconds": 12.4,
+		"veryfastSeconds": 6.6,
+		"fastBytes": 5085035,
+		"veryfastBytes": 4574273,
+		"fastSsimFirstFiveSeconds": 0.998477,
+		"veryfastSsimFirstFiveSeconds": 0.997324
+	},
+	"productionMedia": {
+		"vcpu": 4,
+		"memoryMiB": 12288,
+		"diskMB": 20000,
+		"maxVideoJobs": 1,
+		"idleSleep": "1m",
+		"idleStateObserved": "stopped",
+		"mediaImageRevision": "a72295c"
+	}
+}

@@ -4,7 +4,9 @@ Checked 2026-10-28. Target: roughly $20/month. This is a usage estimate, not a s
 
 ## Runtime envelope
 
-The deployed web and media containers each use standard-1 (4 GiB RAM, 0.5 vCPU, 8 GB disk), with one primary instance per service. Web checks for inactivity after two minutes; public website and desktop API requests keep it warm for ten minutes, with shutdown at the next inactivity check. Internal maintenance and callbacks do not extend that grace period. Media sleeps after five idle minutes and retains active jobs. CPU is charged for actual use; RAM and disk for provisioned running time.
+Web uses standard-1 (4 GiB RAM, 0.5 vCPU, 8 GB disk). Media now uses standard-4 (12 GiB RAM, 4 vCPU, 20 GB disk), with one primary instance and one video job at a time. Web checks for inactivity after two minutes; public website and desktop API requests keep it warm for ten minutes, with shutdown at the next inactivity check. Internal maintenance and callbacks do not extend that grace period. Media sleeps after one idle minute and retains active jobs. CPU is charged for actual use; RAM and disk for provisioned running time.
+
+The larger media worker has a higher running-hour price and is intended to finish encoding sooner. At full CPU utilization its CPU/RAM/disk cost is approximately $0.00668 per running minute before allowances, versus $0.00123 for the previous half-core worker. Actual CPU billing depends on use. Its one-minute idle tail uses 12 GiB-minutes of RAM, versus 20 GiB-minutes for the old five-minute tail. The historical combined-hour tables below describe the earlier configuration and must not be used as a current forecast.
 
 [Cloudflare container pricing](https://developers.cloudflare.com/containers/platform/pricing/) includes 25 GiB-hours RAM, 375 vCPU-minutes and 200 GB-hours disk in Workers Paid ($5/month). Overage rates are $0.0000025/GiB-second, $0.000020/vCPU-second and $0.00000007/GB-second respectively. Workers, Durable Objects, queues, AI and storage have separate meters.
 
