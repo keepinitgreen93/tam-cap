@@ -63,6 +63,7 @@ use crate::{
     camera_loading,
     feeds::Feeds,
     platform,
+    session::{Phase, RecordingSession},
     store::{self, BlurMode, CameraShape, CameraWindowState},
     theme::Theme,
 };
@@ -1785,6 +1786,15 @@ impl CameraWindow {
         })
         .detach();
 
+        let recording_session = RecordingSession::global(cx);
+        cx.observe(&recording_session, |this, _, cx| {
+            this.chrome_visible = false;
+            this.resizing = None;
+            this.hovered_handle = None;
+            cx.notify();
+        })
+        .detach();
+
         Self {
             theme,
             state,
@@ -2484,9 +2494,11 @@ impl CameraWindow {
                     .border_1()
                     .border_color(gpui::hsla(0., 0., 1., 0.2))
                     .text_color(theme.gray_10)
-                    .when(!self.chrome_visible && self.resizing.is_none(), |this| {
-                        this.invisible()
-                    })
+                    .when(
+                        RecordingSession::global(cx).read(cx).phase != Phase::Idle
+                            || (!self.chrome_visible && self.resizing.is_none()),
+                        |this| this.invisible(),
+                    )
                     .child(self.toolbar_button(
                         "close",
                         "icons/circle-x.svg",
@@ -2579,6 +2591,10 @@ impl CameraWindow {
             .bottom_0()
             .left_0()
             .right_0();
+
+        if RecordingSession::global(cx).read(cx).phase != Phase::Idle {
+            return layer.invisible();
+        }
 
         for corner in ResizeCorner::ALL {
             let id: &'static str = match corner {
@@ -2809,8 +2825,10 @@ impl Render for CameraWindow {
             // `.occlude()` on any control would flip this false while the
             // cursor is over that control and hide the chrome under it.
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if this.chrome_visible != *hovered {
-                    this.chrome_visible = *hovered;
+                let visible =
+                    *hovered && RecordingSession::global(cx).read(cx).phase == Phase::Idle;
+                if this.chrome_visible != visible {
+                    this.chrome_visible = visible;
                     cx.notify();
                 }
             }))
