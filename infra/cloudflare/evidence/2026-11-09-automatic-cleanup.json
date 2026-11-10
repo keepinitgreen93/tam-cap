@@ -1,0 +1,38 @@
+{
+	"date": "2026-11-09",
+	"sourceRevision": "c6b57b45976e5a4f3b89bc07dbeebee62b800987",
+	"workerVersion": "ef4f9fd1-8a3b-4872-bdd6-0f9612a20ad5",
+	"buildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/42742862684",
+	"videoId": "8sj17x32p890vrz",
+	"rootCause": "Early desktop transcription raced final MP4 publication. A revision conflict became a workflow StepError, bypassing the original recovery branch. Cleanup existed only as manual actions.",
+	"behavior": "Cloudflare waits for finalized MP4, serializes publication conflicts, then automatically cleans conservative filler tokens, measured quiet ranges and reliable word gaps. Originals and manual edits are protected.",
+	"originalDurationSeconds": 95.71002222222222,
+	"editedDurationSeconds": 94.11879166666667,
+	"automaticCleanupStatus": "complete",
+	"fillerCuts": 0,
+	"pauseCuts": 3,
+	"transcriptWordsBefore": 262,
+	"transcriptWordsAfter": 262,
+	"allWordsRetained": true,
+	"originalSha256": "2cc4e20a0c984a3e28ef40ce2ea227db04af84dda4dd6aeb7a393878840d47b3",
+	"preservedOriginalSha256": "2cc4e20a0c984a3e28ef40ce2ea227db04af84dda4dd6aeb7a393878840d47b3",
+	"editedVideo": {
+		"width": 1920,
+		"height": 1080,
+		"videoCodec": "h264",
+		"audioCodec": "aac",
+		"fullDecodeExit": 0
+	},
+	"titleAndSummaryNameCorrected": "Shawn",
+	"verification": {
+		"focusedTests": 92,
+		"productionTypecheck": "passed",
+		"imageBuild": "passed",
+		"anonymousPlayback": "readyState 4, no media error, reached last video frame"
+	},
+	"notes": [
+		"No fillers were detected in this particular recording.",
+		"ASR timing is approximate; uncertain words are excluded from automatic filler cuts.",
+		"Original recording preserved. Existing share URL unchanged."
+	]
+}
