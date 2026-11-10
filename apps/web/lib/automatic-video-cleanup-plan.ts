@@ -1,11 +1,45 @@
 import type { VideoEditSpec } from "@cap/database/types";
-import { type EditTranscript, planFillerCuts } from "@/lib/edit-transcript";
+import {
+	type EditTranscript,
+	type EditTranscriptWord,
+	planFillerCuts,
+} from "@/lib/edit-transcript";
 import { planSilenceCuts, type SilenceRange } from "@/lib/silence-cuts";
 import {
 	createIdentityEditSpec,
 	getEditSpecOutputDuration,
 	subtractRanges,
 } from "@/lib/video-edits";
+
+function isReliableGapBoundary(word: EditTranscriptWord) {
+	return (
+		word.endMs - word.startMs > 1 &&
+		(word.confidence === null || word.confidence >= 0.8)
+	);
+}
+
+function planTranscriptGaps(words: readonly EditTranscriptWord[]) {
+	const ranges: SilenceRange[] = [];
+	let previousMaxEnd = 0;
+	for (let index = 1; index < words.length; index++) {
+		const previous = words[index - 1];
+		const current = words[index];
+		if (!previous || !current) continue;
+		previousMaxEnd = Math.max(previousMaxEnd, previous.endMs);
+		if (
+			isReliableGapBoundary(previous) &&
+			isReliableGapBoundary(current) &&
+			previousMaxEnd <= previous.endMs &&
+			current.startMs - previous.endMs >= 800
+		) {
+			ranges.push({
+				startMs: previous.endMs + 150,
+				endMs: current.startMs - 150,
+			});
+		}
+	}
+	return ranges;
+}
 
 export function planAutomaticCleanup(
 	transcript: EditTranscript,
@@ -32,7 +66,7 @@ export function planAutomaticCleanup(
 		),
 	}));
 	const plannedSilence = planSilenceCuts({
-		candidates: silence,
+		candidates: [...silence, ...planTranscriptGaps(transcript.words)],
 		words: protectedWords,
 		keepRanges: previousSpec.keepRanges,
 		durationMs: transcript.durationMs,
