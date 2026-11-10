@@ -48,6 +48,17 @@ export interface TranscriptPublication {
 }
 
 export interface VideoMetadata {
+	automaticCleanup?: {
+		version: 1;
+		requestId: string;
+		transcriptId: string;
+		status: "processing" | "complete" | "skipped" | "error";
+		operation: { token: string; startedAt: string };
+		sourceKey: string;
+		editSpec: VideoEditSpec;
+		fillerCount: number;
+		silenceCount: number;
+	};
 	editingBase?: {
 		version: 1;
 		id: string;

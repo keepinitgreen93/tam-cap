@@ -2,6 +2,8 @@ import * as Db from "@cap/database/cloudflare/schema";
 import { User, Video } from "@cap/web-domain";
 import { Effect } from "effect";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { markEditProcessing } from "@/lib/video-edit-start";
+import { createIdentityEditSpec } from "@/lib/video-edits";
 import { createRecordingD1Model } from "../helpers/recording-d1-model";
 
 const mocks = vi.hoisted(() => ({
@@ -84,6 +86,10 @@ vi.mock("@/lib/video-storage", () => ({
 }));
 vi.mock("@/lib/video-edit-operation", () => ({
 	clearPendingEdit: mocks.clear,
+}));
+vi.mock("server-only", () => ({}));
+vi.mock("@/lib/workflow-runtime", async () => ({
+	runWorkflowPromise: (await import("effect")).Effect.runPromise,
 }));
 vi.mock("@/utils/flags", () => ({ isAiGenerationEnabled: async () => false }));
 
@@ -252,4 +258,56 @@ describe("video edit claims and recovery", () => {
 		expect(mocks.quiescent).not.toHaveBeenCalled();
 		expect(mocks.writes).toEqual([]);
 	});
+});
+
+describe("automatic edit atomic fencing", () => {
+	it.each(["transcript", "restored", "duplicate", "organization"])(
+		"rejects a %s change after planning without modifying the video",
+		async (change) => {
+			mocks.video.orgId = "organization-1";
+			mocks.video.metadata = { transcriptPublication: { id: "transcript-1" } };
+			const snapshot = structuredClone(
+				mocks.video,
+			) as typeof Db.videos.$inferSelect;
+			if (change === "transcript")
+				mocks.video.metadata = {
+					transcriptPublication: { id: "transcript-2" },
+				};
+			if (change === "restored")
+				mocks.video.metadata = {
+					transcriptPublication: { id: "transcript-1" },
+					completedVideoEdit: { token: "manual-restore" },
+				};
+			if (change === "duplicate")
+				mocks.video.metadata = {
+					transcriptPublication: { id: "transcript-1" },
+					automaticCleanup: { requestId: "another-run" },
+				};
+			if (change === "organization") mocks.video.orgId = "organization-2";
+			await expect(
+				markEditProcessing({
+					video: snapshot,
+					sourceKey,
+					previousSpec: createIdentityEditSpec(10),
+					automaticCleanup: {
+						version: 1,
+						requestId: "cleanup-1",
+						transcriptId: "transcript-1",
+						status: "processing",
+						sourceKey,
+						editSpec: trim,
+						fillerCount: 0,
+						silenceCount: 1,
+						operation: {
+							token: "e0e1981f-4193-473e-945e-a8e45ec8f16d",
+							startedAt: "2026-11-10T00:00:00.000Z",
+						},
+					},
+				}),
+			).rejects.toThrow(
+				change === "organization" ? "Video changed" : "superseded",
+			);
+			expect(mocks.writes).toEqual([]);
+		},
+	);
 });

@@ -76,6 +76,9 @@ vi.mock("@cap/database/cloudflare/application", () => ({
 }));
 
 vi.mock("server-only", () => ({}));
+vi.mock("@/lib/automatic-video-cleanup", () => ({
+	queueAutomaticVideoCleanup: vi.fn(async () => ({ queued: false })),
+}));
 
 vi.mock("workflow", async () => {
 	const { runInNewContext } = await import("node:vm");
@@ -333,32 +336,17 @@ describe("transcribeVideoWorkflow", () => {
 					return Response.json({
 						success: true,
 						result: {
-							metadata: { duration: 4 },
-							results: {
-								channels: [
-									{
-										alternatives: [
-											{
-												transcript: "Um, hello.",
-												words: [
-													{
-														word: "um",
-														punctuated_word: "Um,",
-														start: 0.1,
-														end: 0.3,
-													},
-													{
-														word: "hello",
-														punctuated_word: "hello.",
-														start: 0.5,
-														end: 1,
-													},
-												],
-											},
-										],
-									},
-								],
-							},
+							text: "Um, hello.",
+							transcription_info: { duration: 4 },
+							segments: [
+								{
+									text: "Um, hello.",
+									words: [
+										{ word: "Um,", start: 0.1, end: 0.3 },
+										{ word: "hello.", start: 0.5, end: 1 },
+									],
+								},
+							],
 						},
 					});
 				},
@@ -371,7 +359,9 @@ describe("transcribeVideoWorkflow", () => {
 				});
 				expect(result.success).toBe(true);
 				expect(requests).toHaveLength(1);
-				expect(requests[0]?.headers.get("Content-Type")).toBe("audio/mp4");
+				expect(requests[0]?.headers.get("Content-Type")).toBe(
+					"application/json",
+				);
 				expect(mocks.transcribe).not.toHaveBeenCalled();
 				const writes = new Map(
 					mocks.putObject.mock.calls.map((call) => [

@@ -5,11 +5,11 @@ This directory contains the platform foundation and the application runtime for 
 ## Start using Cap
 
 1. Open https://videos.trulyauthenticmarketing.com and sign in as `hello@trulyauthenticmarketing.com` using the Resend verification email.
-2. Record in the browser at `/dashboard/caps/record`. After processing, open Edit to review transcript-based filler removal and selected quiet cuts, then save and share the resulting link. Original downloads remain available to the owner.
+2. Record in the browser at `/dashboard/caps/record` or the desktop app. After the final recording publishes, transcription generates the title and metadata and automatically removes clear hesitation fillers and measured quiet gaps. Original downloads and Restore remain available to the owner. Wait for editing to finish and review playback before sharing.
 3. Optional clients are at `/download`: Windows x64, Apple Silicon macOS and a manually installed Chrome extension. The browser recorder requires no installation or local Docker. Desktop builds are unsigned/ad hoc signed, with manual updates and local operating-system permission setup; see `distribution/README.md`.
 4. The first ordinary-member invitation is delivered and awaiting the recipient's acceptance. Invite additional teammates from organization settings when needed.
 
-On a recording, use **Manage Cap → Edit video**. The transcript panel includes **Remove fillers** when fillers are detected, otherwise an explicit message. **Silence cleanup → Find quiet ranges** suggests cuts; review/listen and select them before removing, then choose **Done** to render. Nothing is cut automatically. The panel moves below the player in a narrow window. The integrations page distinguishes the configured default Cloudflare R2 storage from optional organization storage; Google Drive needs a configured Google OAuth app before Connect is available.
+On a recording, use **Manage Cap → Edit video**. The transcript panel includes **Remove fillers** when fillers are detected, otherwise an explicit message. **Silence cleanup → Find quiet ranges** suggests cuts; review/listen and select them before removing, then choose **Done** to render. New Cloudflare recordings are cleaned automatically after their original word transcript is ready. Cleanup uses measured quiet ranges of at least 800 ms, protects speech boundaries, and only removes unambiguous hesitation fillers with usable timing. Uncertain words and pauses containing audible background sound may remain. Automatic cleanup runs once; manual edits and Restore do not trigger it again. The panel moves below the player in a narrow window. The integrations page distinguishes the configured default Cloudflare R2 storage from optional organization storage; Google Drive needs a configured Google OAuth app before Connect is available.
 
 Existing Loom videos remain in Loom until the separately deferred migration. Costs are usage-based with a roughly $20 monthly target, not a hard cap; see `COSTS.md`.
 
@@ -71,6 +71,8 @@ For guarded staging verification, optionally set the `CAP_PREVIEW_KEY` Worker se
 Database, analytics, workflow and media calls use private container outbound handlers at `cap.database`, `cap.analytics`, `cap.workflow`, and `cap.media`. Media can call `cap.web` for callbacks. Public workflow execution, database RPC and cron paths are rejected, including percent-encoded variants. The underlying application still validates media webhook secrets and resource ownership. Geography headers are replaced with URI-encoded values from trusted Cloudflare request metadata.
 
 Cloudflare cron enqueues maintenance every fifteen minutes when `CAP_MAINTENANCE_ENABLED=true`. Recovery runs for stale desktop segments and failed processing; daily03:00UTC also runs agent credential cleanup, developer storage accounting and90-day analytics cleanup. Deliveries use the durable queue and authenticated internal requests with `CRON_SECRET` from the protected environment. Maintenance is enabled on the public release. It can wake the web container even without user traffic; account for that in costs.
+
+Desktop transcription waits for the finalized MP4 in this deployment. Expected source-revision conflicts cross the durable step boundary as explicit outcomes, allowing the workflow to release the old claim and queue the final media instead of remaining stuck in processing.
 
 ## Durable workflow contract
 

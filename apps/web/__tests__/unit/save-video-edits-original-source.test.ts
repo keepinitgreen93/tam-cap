@@ -138,6 +138,9 @@ vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 vi.mock("workflow/api", () => ({ start: startMock }));
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/server", () => ({ runPromise: Effect.runPromise }));
+vi.mock("@/lib/workflow-runtime", () => ({
+	runWorkflowPromise: Effect.runPromise,
+}));
 vi.mock("@/lib/video-storage", () => ({ decodeStorageVideo: vi.fn() }));
 vi.mock("@/lib/legacy-video-edit-recovery", () => ({
 	assertLegacyEditsQuiescent: vi.fn(),
@@ -207,6 +210,25 @@ describe("saveVideoEdits original source copy", () => {
 		vi.clearAllMocks();
 		state.rows.clear();
 		copyObjectMock.mockReturnValue(Effect.succeed({}));
+	});
+
+	it("preserves the current immutable published output when no editing base exists", async () => {
+		setUpVideo({ edited: false });
+		const video = state.rows.get(tables.videos)?.[0] as {
+			source: { type: string; outputKey?: string };
+		};
+		video.source = {
+			type: "desktopMP4",
+			outputKey: "user-1/video-1/.recording/outputs/current.mp4",
+		};
+		headObjectMock.mockReturnValue(
+			Effect.fail(storageError(s3Error("NotFound", 404))),
+		);
+		await saveTrim(60);
+		expect(copyObjectMock).toHaveBeenCalledWith(
+			"cap-bucket/user-1/video-1/.recording/outputs/current.mp4",
+			sourceKey,
+		);
 	});
 
 	it("keeps the preserved original when its HEAD request fails transiently", async () => {

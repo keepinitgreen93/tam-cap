@@ -25,6 +25,7 @@ const state = vi.hoisted(() => ({
 		| undefined,
 	configured: true,
 	start: vi.fn(),
+	cleanup: vi.fn(),
 	queue: vi.fn(),
 	getRun: vi.fn(),
 }));
@@ -37,6 +38,9 @@ vi.mock("@cap/env", () => ({
 	}),
 }));
 vi.mock("@/workflows/transcribe", () => ({ transcribeVideoWorkflow: vi.fn() }));
+vi.mock("@/lib/automatic-video-cleanup", () => ({
+	queueAutomaticVideoCleanup: state.cleanup,
+}));
 vi.mock("workflow/api", () => ({ start: state.start, getRun: state.getRun }));
 vi.mock("workflow/runtime", () => ({
 	getWorld: () => ({ queue: state.queue }),
@@ -190,7 +194,8 @@ describe("transcription dispatcher on D1", () => {
 			expect(state.start).not.toHaveBeenCalled();
 		},
 	);
-	it("permits the explicit early-segment path while the mux is processing", async () => {
+	it("permits the explicit early-segment path outside Cloudflare", async () => {
+		vi.stubEnv("CAP_RUNTIME", "local");
 		await fixture.database
 			.insert(videoUploads)
 			.values({ videoId: video.id, phase: "processing" });
@@ -200,6 +205,22 @@ describe("transcription dispatcher on D1", () => {
 			earlyFromSegments: true,
 			aiGenerationEnabled: false,
 		});
+	});
+	it("waits for finalized media before claiming Cloudflare transcription", async () => {
+		await invoke(false, true);
+		expect(state.start).not.toHaveBeenCalled();
+		expect((await currentVideo()).transcriptionStatus).toBeNull();
+		await invoke(true);
+		expect(state.start).toHaveBeenCalledTimes(1);
+	});
+	it("queues cleanup for a completed MP4 transcript without another ASR pass", async () => {
+		await fixture.database
+			.update(videos)
+			.set({ transcriptionStatus: "COMPLETE" })
+			.where(eq(videos.id, video.id));
+		await invoke(true);
+		expect(state.start).not.toHaveBeenCalled();
+		expect(state.cleanup).toHaveBeenCalledWith(video.id, video.ownerId, true);
 	});
 	it("only dispatches once under concurrent callers and records the full durable receipt", async () => {
 		const results = await Promise.all(

@@ -1,33 +1,31 @@
 "use server";
 
-import { randomUUID } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { db } from "@cap/database/cloudflare/application";
-import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
 	videoEdits,
 	videos,
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
-import type { VideoEditSpec, VideoProcessingRun } from "@cap/database/types";
+import type { VideoEditSpec } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
-import { Storage } from "@cap/web-backend";
 import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import type { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
-import { Effect } from "effect";
 import { revalidatePath } from "next/cache";
 import { start } from "workflow/api";
 import { assertLegacyEditsQuiescent } from "@/lib/legacy-video-edit-recovery";
 import { runPromise } from "@/lib/server";
-import { isStorageObjectNotFound } from "@/lib/storage-not-found";
-import {
-	clearPendingEdit,
-	type EditOperation,
-} from "@/lib/video-edit-operation";
+import { clearPendingEdit } from "@/lib/video-edit-operation";
 import { getEditSourceKey, isEditSourceKey } from "@/lib/video-edit-processing";
+import {
+	ensureOriginalSourceCopy,
+	getCompletedProcessingReceipt,
+	getVideoBucket,
+	markEditProcessing,
+	objectExists,
+} from "@/lib/video-edit-start";
 import { getVideoEditingBase } from "@/lib/video-editing-base";
 import {
 	areEditSpecsEquivalent,
@@ -36,8 +34,6 @@ import {
 	getEditSpecOutputDuration,
 	normalizeKeepRanges,
 } from "@/lib/video-edits";
-import { decodeStorageVideo } from "@/lib/video-storage";
-import { isVideoStorageKey } from "@/lib/video-storage-key";
 import { isAiGenerationEnabled } from "@/utils/flags";
 import { editVideoWorkflow } from "@/workflows/edit-video";
 
@@ -51,221 +47,6 @@ const ACTIVE_UPLOAD_PHASES = new Set([
 
 function isMp4BackedVideo(source: typeof videos.$inferSelect.source) {
 	return source.type === "desktopMP4" || source.type === "webMP4";
-}
-
-function getResultKey(ownerId: string, videoId: string) {
-	return `${ownerId}/${videoId}/result.mp4`;
-}
-
-type CompletedProcessingReceipt = {
-	upload: typeof videoUploads.$inferSelect;
-	run: VideoProcessingRun;
-};
-
-function getCompletedProcessingReceipt(
-	video: typeof videos.$inferSelect,
-	upload: typeof videoUploads.$inferSelect | undefined,
-): CompletedProcessingReceipt | undefined {
-	const run = video.metadata?.processingRun;
-	const completedAt = Date.parse(run?.completedAt ?? "");
-	if (
-		!upload ||
-		upload.videoId !== video.id ||
-		upload.phase !== "complete" ||
-		upload.processingProgress !== 100 ||
-		upload.processingError !== null ||
-		video.metadata?.editProcessing ||
-		!run ||
-		run.state !== "complete" ||
-		!run.token ||
-		!run.attemptId ||
-		run.error ||
-		!Number.isFinite(completedAt) ||
-		upload.startedAt.getTime() > completedAt ||
-		upload.updatedAt.getTime() < completedAt ||
-		run.ownerId !== video.ownerId ||
-		run.organizationId !== video.orgId ||
-		run.bucketId !== video.bucket ||
-		run.storageIntegrationId !== video.storageIntegrationId ||
-		upload.rawFileKey !== run.rawFileKey ||
-		!isVideoStorageKey(video, run.rawFileKey) ||
-		!run.outputKey.startsWith(
-			`${video.ownerId}/${video.id}/.recording/outputs/`,
-		) ||
-		!isVideoStorageKey(video, run.outputKey) ||
-		(video.source.type !== "desktopMP4" && video.source.type !== "webMP4") ||
-		video.source.outputKey !== run.outputKey
-	)
-		return undefined;
-	return { upload, run };
-}
-
-async function objectExists(
-	bucket: Awaited<ReturnType<typeof getVideoBucket>>,
-	key: string,
-) {
-	return await bucket.headObject(key).pipe(
-		Effect.as(true),
-		Effect.catchIf(isStorageObjectNotFound, () => Effect.succeed(false)),
-		runPromise,
-	);
-}
-
-async function getVideoBucket(video: typeof videos.$inferSelect) {
-	const [bucket] = await Storage.getAccessForVideo(
-		decodeStorageVideo(video),
-	).pipe(runPromise);
-	return bucket;
-}
-
-async function ensureOriginalSourceCopy(
-	video: typeof videos.$inferSelect,
-	sourceKey = getEditSourceKey(video.ownerId, video.id, video.metadata),
-	copyIfMissing = false,
-) {
-	const bucket = await getVideoBucket(video);
-	const hasSource = await objectExists(bucket, sourceKey);
-
-	if (!hasSource) {
-		if (!copyIfMissing)
-			throw new Error("Original editing base is no longer available");
-		const resultKey = getResultKey(video.ownerId, video.id);
-		await bucket
-			.copyObject(`${bucket.bucketName}/${resultKey}`, sourceKey)
-			.pipe(runPromise);
-	}
-
-	return sourceKey;
-}
-
-async function markEditProcessing({
-	video,
-	sourceKey,
-	previousSpec,
-	legacyUpload,
-	completedUpload,
-}: {
-	video: typeof videos.$inferSelect;
-	sourceKey: string;
-	previousSpec: VideoEditSpec;
-	legacyUpload?: typeof videoUploads.$inferSelect;
-	completedUpload?: CompletedProcessingReceipt;
-}): Promise<EditOperation> {
-	const startedAt = new Date(Math.floor(Date.now() / 1000) * 1000);
-	const operation = { token: randomUUID(), startedAt: startedAt.toISOString() };
-	const database = db();
-	await atomic(database, async (snapshot) => {
-		const statements: AtomicStatement[] = [];
-		const [current] = await snapshot.read((reader) =>
-			reader
-				.select()
-				.from(videos)
-				.where(and(writableVideo, eq(videos.id, video.id))),
-		);
-		if (
-			!current ||
-			current.ownerId !== video.ownerId ||
-			current.bucket !== video.bucket ||
-			current.storageIntegrationId !== video.storageIntegrationId ||
-			JSON.stringify(current.source) !== JSON.stringify(video.source) ||
-			!isDeepStrictEqual(
-				getVideoEditingBase(current),
-				getVideoEditingBase(video),
-			)
-		) {
-			throw new Error("Video changed before the edit could start");
-		}
-		const [upload] = await snapshot.read((reader) =>
-			reader
-				.select()
-				.from(videoUploads)
-				.where(eq(videoUploads.videoId, video.id)),
-		);
-		const completedCurrent = getCompletedProcessingReceipt(current, upload);
-		if (
-			completedUpload &&
-			completedCurrent &&
-			isDeepStrictEqual(completedCurrent, completedUpload)
-		) {
-			statements.push(
-				database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
-			);
-		} else if (
-			legacyUpload &&
-			upload &&
-			!current.metadata?.editProcessing &&
-			upload.rawFileKey === legacyUpload.rawFileKey &&
-			upload.startedAt.getTime() === legacyUpload.startedAt.getTime() &&
-			upload.updatedAt.getTime() === legacyUpload.updatedAt.getTime() &&
-			upload.phase === legacyUpload.phase
-		) {
-			statements.push(
-				database.delete(videoUploads).where(eq(videoUploads.videoId, video.id)),
-			);
-		} else if (upload || current.metadata?.editProcessing) {
-			throw new Error("Video is already uploading or processing");
-		}
-		const [currentEdit] = await snapshot.read((reader) =>
-			reader.select().from(videoEdits).where(eq(videoEdits.videoId, video.id)),
-		);
-		const base = getVideoEditingBase(current);
-		if (
-			(base && base.sourceKey !== sourceKey) ||
-			(currentEdit && currentEdit.sourceKey !== sourceKey)
-		)
-			throw new Error(
-				"Video editing base changed before this edit could start",
-			);
-		if (
-			!areEditSpecsEquivalent(
-				currentEdit?.editSpec ??
-					createIdentityEditSpec(
-						getVideoEditingBase(current)?.duration ??
-							current.duration ??
-							previousSpec.sourceDuration,
-					),
-				previousSpec,
-			)
-		) {
-			throw new Error("Video edits changed before this edit could start");
-		}
-		statements.push(
-			database.insert(videoUploads).values({
-				videoId: video.id,
-				uploaded: 0,
-				total: 0,
-				mode: "singlepart",
-				phase: "processing",
-				processingProgress: 0,
-				processingMessage: "Starting video edit...",
-				processingError: null,
-				rawFileKey: sourceKey,
-				startedAt,
-				updatedAt: startedAt,
-			}),
-		);
-		const metadata = {
-			...(current.metadata ?? {}),
-			editProcessing: {
-				...operation,
-				editingBaseId: base?.id ?? null,
-				sourceKey,
-				ownerId: current.ownerId,
-				bucket: current.bucket,
-				storageIntegrationId: current.storageIntegrationId,
-				source: JSON.stringify(current.source),
-				dispatch: "pending" as const,
-			},
-		};
-		statements.push(
-			database
-				.update(videos)
-				.set({ metadata })
-				.where(and(writableVideo, eq(videos.id, video.id))),
-		);
-		return { statements, result: undefined };
-	});
-	return operation;
 }
 
 async function loadEditableVideo(

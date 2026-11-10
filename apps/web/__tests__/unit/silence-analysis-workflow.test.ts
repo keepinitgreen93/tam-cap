@@ -24,6 +24,8 @@ vi.mock("@/lib/workflow-runtime", () => ({
 
 import { silenceAnalysisWorkflow } from "@/workflows/silence-analysis";
 
+vi.mock("server-only", () => ({}));
+
 const revision = "a".repeat(64);
 const payload = {
 	videoId: "video-1",
@@ -40,6 +42,8 @@ const result = {
 };
 const source = {
 	video: {
+		id: "video-1",
+		ownerId: "owner-1",
 		metadata: {
 			silenceAnalysis: {
 				revision,

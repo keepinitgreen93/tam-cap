@@ -12,6 +12,7 @@ import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { transcribeVideoWorkflow } from "@/workflows/transcribe";
+import { queueAutomaticVideoCleanup } from "./automatic-video-cleanup";
 import { isTranscriptionConfigured } from "./transcription-config";
 import {
 	dispatchTranscriptionRun,
@@ -84,6 +85,17 @@ export async function transcribeVideo(
 	const { video } = result;
 	if (video.ownerId !== userId)
 		return { success: false, message: "Video owner does not match" };
+	if (options.earlyFromSegments && process.env.CAP_RUNTIME === "cloudflare")
+		return {
+			success: true,
+			message: "Transcription waits for finalized recording",
+		};
+	if (
+		video.transcriptionStatus === "COMPLETE" &&
+		(video.source.type === "desktopMP4" || video.source.type === "webMP4")
+	) {
+		await queueAutomaticVideoCleanup(videoId, userId, aiGenerationEnabled);
+	}
 	if (
 		video.transcriptionStatus === "PROCESSING" &&
 		video.metadata?.transcriptionRun &&

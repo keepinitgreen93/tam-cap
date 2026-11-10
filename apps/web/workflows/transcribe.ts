@@ -34,6 +34,7 @@ import {
 	enhanceAudioFromUrl,
 } from "@/lib/audio-enhance";
 import { checkHasAudioTrack, extractAudioFromUrl } from "@/lib/audio-extract";
+import { queueAutomaticVideoCleanup } from "@/lib/automatic-video-cleanup";
 import {
 	createEditTranscript,
 	editTranscriptWordsToCaptionVtt,
@@ -220,6 +221,20 @@ export async function transcribeVideoWorkflow(
 			videoData.video,
 			transcription,
 		);
+		if (published === "source-changed") {
+			const released = await releaseSupersededTranscription(
+				videoId,
+				userId,
+				payload.runId,
+			);
+			await cleanupTempAudio(videoId, userId, videoData.video);
+			if (released)
+				await requeueAfterEarlyDefer(videoId, userId, aiGenerationEnabled);
+			return {
+				success: true,
+				message: "Recording changed; transcription requeued",
+			};
+		}
 		if (!published)
 			return {
 				success: true,
@@ -269,6 +284,8 @@ export async function transcribeVideoWorkflow(
 	if (aiGenerationEnabled) {
 		await queueAiGeneration(videoId, userId);
 	}
+
+	await queueAutomaticCleanup(videoId, userId, aiGenerationEnabled);
 
 	return { success: true, message: "Transcription completed successfully" };
 }
@@ -876,12 +893,12 @@ async function transcribeEditTranscriptWithProvider(
 	return serializeEditTranscript(createEditTranscript(transcript, durationMs));
 }
 
-async function saveTranscription(
+export async function saveTranscription(
 	videoId: string,
 	userId: string,
 	video: typeof videos.$inferSelect,
 	transcription: TranscriptionArtifacts,
-): Promise<boolean> {
+): Promise<boolean | "source-changed"> {
 	"use step";
 	if (video.id !== videoId || video.ownerId !== userId)
 		throw new FatalError("Transcription owner changed");
@@ -970,6 +987,9 @@ async function saveTranscription(
 	} catch (error) {
 		const outcome = await readTranscriptPublicationOutcome(database, prepared);
 		if (outcome.state === "published") return true;
+		// Expected revision conflicts must survive the workflow step boundary without becoming StepError.
+		if (error instanceof TranscriptPublicationConflictError)
+			return "source-changed" as const;
 		throw error;
 	}
 }
@@ -1224,4 +1244,13 @@ async function _enhanceAndSaveAudio(
 			})
 			.where(eq(videos.id, videoId as Video.VideoId));
 	}
+}
+
+async function queueAutomaticCleanup(
+	videoId: string,
+	ownerId: string,
+	aiGenerationEnabled: boolean,
+) {
+	"use step";
+	await queueAutomaticVideoCleanup(videoId, ownerId, aiGenerationEnabled);
 }

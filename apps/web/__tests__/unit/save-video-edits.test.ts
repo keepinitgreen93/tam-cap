@@ -43,6 +43,8 @@ vi.mock("@/lib/video-storage", () => ({
 }));
 
 vi.mock("server-only", () => ({}));
+vi.mock("@/lib/workflow-runtime", () => ({ runWorkflowPromise: vi.fn() }));
+vi.mock("@/workflows/edit-video", () => ({ editVideoWorkflow: vi.fn() }));
 
 describe("saveVideoEdits", () => {
 	beforeEach(() => {

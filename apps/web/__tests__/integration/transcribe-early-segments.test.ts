@@ -78,6 +78,9 @@ vi.mock("@/lib/transcription-dispatch", () => ({
 }));
 
 vi.mock("server-only", () => ({}));
+vi.mock("@/lib/automatic-video-cleanup", () => ({
+	queueAutomaticVideoCleanup: vi.fn(async () => ({ queued: false })),
+}));
 
 vi.mock("workflow", () => ({
 	FatalError: class FatalError extends Error {},
@@ -409,21 +412,17 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 					return Response.json({
 						success: true,
 						result: {
-							results: {
-								channels: [
-									{
-										alternatives: [
-											{
-												transcript: "um hello",
-												words: [
-													{ word: "um", start: 0.1, end: 0.3 },
-													{ word: "hello", start: 0.5, end: 1 },
-												],
-											},
-										],
-									},
-								],
-							},
+							text: "Um, hello.",
+							transcription_info: { duration: 4 },
+							segments: [
+								{
+									text: "Um, hello.",
+									words: [
+										{ word: "Um,", start: 0.1, end: 0.3 },
+										{ word: "hello.", start: 0.5, end: 1 },
+									],
+								},
+							],
 						},
 					});
 				}
@@ -453,7 +452,7 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 			);
 			expect(stored.durationMs).toBe(4500);
 			expect(stored.words[0]).toMatchObject({
-				text: "um",
+				text: "Um,",
 				startMs: 100,
 				endMs: 300,
 			});
@@ -476,5 +475,59 @@ describe("transcribeVideoWorkflow earlyFromSegments", () => {
 		expect(writtenKeys).toContain(await artifactKey("vtt"));
 		expect((await currentVideo()).transcriptionStatus).toBe("COMPLETE");
 		expect((await currentVideo()).transcriptionStatus).not.toBe("ERROR");
+	});
+	it("returns a serializable outcome when the recording changes before publication", async () => {
+		await transcribeVideoWorkflow({
+			videoId: "video-123",
+			userId: "user-456",
+			aiGenerationEnabled: false,
+			earlyFromSegments: true,
+		});
+		const original = await currentVideo();
+		await fixture.database
+			.update(videos)
+			.set({
+				source: {
+					type: "desktopMP4",
+					outputKey: "user-456/video-123/final.mp4",
+				},
+				duration: 4.5,
+			})
+			.where(eq(videos.id, original.id));
+		const { saveTranscription } = await import("@/workflows/transcribe");
+		await expect(
+			saveTranscription(original.id, original.ownerId, original, {
+				vtt: "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello\n",
+				editTranscript: "{}",
+			}),
+		).resolves.toBe("source-changed");
+	});
+
+	it("requeues the completed MP4 when it replaces segments during transcription", async () => {
+		mocks.transcribe.mockImplementationOnce(async () => {
+			await fixture.database
+				.update(videos)
+				.set({
+					source: {
+						type: "desktopMP4",
+						outputKey: "user-456/video-123/final.mp4",
+					},
+					duration: 4.5,
+				})
+				.where(eq(videos.id, "video-123" as typeof videos.$inferSelect.id));
+			return { ...assemblyAIEditResponse, audio_duration: 4 };
+		});
+		const result = await transcribeVideoWorkflow({
+			videoId: "video-123",
+			userId: "user-456",
+			aiGenerationEnabled: true,
+			earlyFromSegments: true,
+		});
+		expect(result.message).toContain("requeued");
+		expect(mocks.startWorkflow).toHaveBeenCalledTimes(1);
+		expect(mocks.startAiGeneration).not.toHaveBeenCalled();
+		expect(mocks.startWorkflow.mock.calls[0]?.[1].source.type).toBe(
+			"desktopMP4",
+		);
 	});
 });
