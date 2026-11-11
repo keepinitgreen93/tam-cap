@@ -949,7 +949,7 @@ export function TranscriptSidebar({
 				</p>
 				<button
 					type="button"
-					onClick={() => void handleRequest()}
+					onClick={() => void handleRequest(true)}
 					disabled={isRequesting}
 					className="mt-5 inline-flex h-9 items-center justify-center gap-2 rounded-full border border-gray-5 px-4 text-xs font-semibold text-gray-12 transition hover:bg-gray-3 active:bg-gray-4 disabled:pointer-events-none disabled:opacity-50"
 				>
