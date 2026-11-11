@@ -1,0 +1,60 @@
+{
+	"date": "2026-11-11",
+	"sourceRevision": "d425b50ca7299ffcd53b8eb9827846c4ee033d73",
+	"workerVersion": "4af9673a-a925-46fa-95dc-4d5dd78e6245",
+	"buildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/43035560810",
+	"videoId": "8sj17x32p890vrz",
+	"supersedes": "2026-11-09-automatic-cleanup.json: zero detected fillers was not proof of absence in audio",
+	"rootCause": "Whisper omitted audible hesitations without verbatim context. Several detected filler timestamps covered only part of the sound; bounded word-gap padding removes the remainder while protecting adjacent speech.",
+	"before": {
+		"publishedDurationSeconds": 94.11879166666667,
+		"defaultTranscriptFillerCount": 0,
+		"verbatimFillerCount": 15
+	},
+	"after": {
+		"publishedDurationSeconds": 83.5558125,
+		"removedFillers": 15,
+		"beforeWords": 282,
+		"afterWords": 267,
+		"removed": 15,
+		"allOrdinaryWordsRetained": true,
+		"exportAudioChecks": [
+			{
+				"mode": "verbatim-vad",
+				"remainingFillers": 0
+			},
+			{
+				"mode": "verbatim-no-vad",
+				"remainingFillers": 0
+			}
+		],
+		"width": 1920,
+		"height": 1080,
+		"videoCodec": "h264",
+		"audioCodec": "aac",
+		"decodeExit": 0,
+		"mp4PacketsNonIncreasingDts": 0,
+		"anonymousPlayback": {
+			"readyState": 4,
+			"ended": true,
+			"error": null
+		}
+	},
+	"original": {
+		"preserved": true,
+		"sha256": "2cc4e20a0c984a3e28ef40ce2ea227db04af84dda4dd6aeb7a393878840d47b3"
+	},
+	"checks": {
+		"focusedTests": 99,
+		"additionalSidebarChecks": 7,
+		"typecheck": "passed",
+		"productionBuild": "passed",
+		"promptedSilentAudioReturnedWords": 0
+	},
+	"qualifications": [
+		"Audio verification used two fresh ASR passes on the published output, not a human listening test.",
+		"FFmpeg null/MP3 output muxers warned about rounded timestamps; actual MP4 packet DTS values were strictly increasing and browser playback reached the end without a media error.",
+		"Ordinary words retained is measured against the refreshed timed transcript.",
+		"Existing edits and the original were retained; this old recording was corrected through the authenticated refresh and edit actions. New recordings use the revised automatic path."
+	]
+}
