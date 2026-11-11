@@ -222,7 +222,7 @@ describe("Cloudflare Whisper transcription", () => {
 		expect(() => parseCloudflareTranscription(shape)).toThrow("confidence");
 	});
 	it.each(["en", "es", "auto"])(
-		"sends base64 JSON to Cloudflare with language %s and no fixture prompt",
+		"requests verbatim filler-preserving transcription with language %s",
 		async (language) => {
 			const audio = new Uint8Array([1, 2, 3]);
 			let request: Request | undefined;
@@ -248,6 +248,8 @@ describe("Cloudflare Whisper transcription", () => {
 				audio: "AQID",
 				task: "transcribe",
 				vad_filter: true,
+				initial_prompt:
+					"Um, uh, erm, er. A verbatim transcript preserves every spoken word, including hesitations and filler sounds.",
 				...(language === "auto" ? {} : { language }),
 			});
 		},

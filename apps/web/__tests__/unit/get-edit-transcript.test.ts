@@ -195,6 +195,42 @@ beforeEach(() => {
 });
 
 describe("requestEditTranscript", () => {
+	it("refreshes cached original word timings once and polls the pending refresh", async () => {
+		const { database } = createDatabase(video);
+		const bucket = createBucket(
+			new Map([[TRANSCRIPT_KEY, storedOriginalTranscript()]]),
+		);
+		mocks.db.mockReturnValue(database);
+		mocks.getAccessForVideo.mockReturnValue(pipeValue([bucket]));
+		const { requestEditTranscript, getEditTranscript } = await import(
+			"@/actions/videos/get-edit-transcript"
+		);
+		const results = await Promise.all([
+			requestEditTranscript("video-1" as never, true),
+			requestEditTranscript("video-1" as never, true),
+		]);
+		expect(results).toEqual([
+			{ status: "processing" },
+			{ status: "processing" },
+		]);
+		expect(mocks.start).toHaveBeenCalledTimes(1);
+		expect(await getEditTranscript("video-1" as never)).toEqual({
+			status: "processing",
+		});
+	});
+
+	it("does not refresh another owner's transcript", async () => {
+		const { database } = createDatabase({ ...video, ownerId: "other-owner" });
+		mocks.db.mockReturnValue(database);
+		const { requestEditTranscript } = await import(
+			"@/actions/videos/get-edit-transcript"
+		);
+		expect((await requestEditTranscript("video-1" as never, true)).status).toBe(
+			"error",
+		);
+		expect(mocks.start).not.toHaveBeenCalled();
+	});
+
 	it("serializes concurrent requests and starts one paid transcript job", async () => {
 		const objects = new Map<string, string>();
 		const { database, isTransactionActive, applied } = createDatabase(video);

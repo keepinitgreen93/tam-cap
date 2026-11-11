@@ -177,6 +177,8 @@ export async function transcribeWithCloudflare(
 				audio: Buffer.from(audio).toString("base64"),
 				task: "transcribe",
 				vad_filter: true,
+				initial_prompt:
+					"Um, uh, erm, er. A verbatim transcript preserves every spoken word, including hesitations and filler sounds.",
 				...(language === "auto" ? {} : { language }),
 			}),
 			redirect: "error",

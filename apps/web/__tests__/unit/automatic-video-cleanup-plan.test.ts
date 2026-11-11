@@ -41,7 +41,7 @@ describe("automatic cleanup planning", () => {
 		expect(plan.fillerCount).toBe(1);
 		expect(plan.editSpec.keepRanges).toEqual([
 			{ start: 0, end: 0.15 },
-			{ start: 0.85, end: 1.85 },
+			{ start: 0.85, end: 1.575 },
 			{ start: 3.85, end: 4.65 },
 			{ start: 9.85, end: 10 },
 		]);

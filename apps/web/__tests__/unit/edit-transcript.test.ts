@@ -30,6 +30,34 @@ function editSpec(
 }
 
 describe("edit transcript", () => {
+	it("covers under-timed hesitation sounds without entering adjacent words", () => {
+		const transcript = createEditTranscript(
+			{
+				words: [
+					{ text: "before", start: 17620, end: 17920 },
+					{ text: "um", start: 18160, end: 18280 },
+					{ text: "after", start: 18740, end: 19000 },
+					{ text: "before", start: 80540, end: 80680 },
+					{ text: "uh", start: 80680, end: 80800 },
+					{ text: "after", start: 81300, end: 81460 },
+				],
+			},
+			95000,
+		);
+		const plan = planFillerCuts(transcript.words, 95000, "word-gap");
+		expect(plan.ranges).toEqual([
+			{ startMs: 17995, endMs: 18665, safe: true, reason: null },
+			{ startMs: 80680, endMs: 81225, safe: true, reason: null },
+		]);
+		expect(
+			getDeletedTranscriptWordIds(transcript.words, [
+				{ start: 0, end: 17.995 },
+				{ start: 18.665, end: 80.68 },
+				{ start: 81.225, end: 95 },
+			]).size,
+		).toBe(2);
+	});
+
 	it("normalizes and preserves AssemblyAI word timing", () => {
 		const transcript = createEditTranscript(assemblyAIEditResponse, 4_000);
 

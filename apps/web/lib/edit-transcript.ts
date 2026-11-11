@@ -589,6 +589,7 @@ export function planTranscriptCut(
 export function planFillerCuts(
 	words: readonly EditTranscriptWord[],
 	durationMs: number,
+	padding: "bounded" | "word-gap" = "bounded",
 ): FillerCutPlan {
 	const ranges: TranscriptCutPlan[] = [];
 	let skippedCount = 0;
@@ -607,8 +608,13 @@ export function planFillerCuts(
 			if (overlappingSpeech) {
 				skippedCount++;
 			} else {
-				const startPadding = getCutPadding(word.startMs - previousMaxEnd);
-				const endPadding = getCutPadding(
+				// Whisper can timestamp only part of a hesitation. Expand within the word gap, retaining a handle before adjacent speech.
+				const getFillerPadding =
+					padding === "word-gap"
+						? (gapMs: number) => Math.max(0, Math.min(500, gapMs - 75))
+						: getCutPadding;
+				const startPadding = getFillerPadding(word.startMs - previousMaxEnd);
+				const endPadding = getFillerPadding(
 					(nextWord?.startMs ?? durationMs) - word.endMs,
 				);
 				ranges.push({

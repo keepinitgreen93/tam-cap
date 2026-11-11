@@ -164,12 +164,6 @@ export async function getEditTranscript(
 						: "The transcript is unavailable. Silence cleanup and timeline editing are still available.",
 			};
 		}
-		const transcript = await readCurrentEditTranscript(bucket, video);
-
-		if (transcript) {
-			return { status: "ready", transcript };
-		}
-
 		const status = getEditTranscriptBackfillStatus(video.metadata);
 		if (status && isFreshProcessingStatus(status)) {
 			return { status: "processing" };
@@ -186,6 +180,8 @@ export async function getEditTranscript(
 				message: "Transcript preparation failed. Try again.",
 			};
 		}
+		const transcript = await readCurrentEditTranscript(bucket, video);
+		if (transcript) return { status: "ready", transcript };
 		return { status: "missing" };
 	} catch (error) {
 		if (!isPublicError(error)) {
@@ -278,11 +274,12 @@ async function clearEditTranscriptBackfill(
 
 export async function requestEditTranscript(
 	videoId: Video.VideoId,
+	refresh = false,
 ): Promise<EditTranscriptResponse> {
 	try {
 		const { user, video, bucket } = await loadEditableTranscriptVideo(videoId);
 		const transcript = await readCurrentEditTranscript(bucket, video);
-		if (transcript) {
+		if (transcript && !refresh) {
 			return { status: "ready", transcript };
 		}
 
@@ -296,7 +293,7 @@ export async function requestEditTranscript(
 			refreshed.bucket,
 			refreshed.video,
 		);
-		if (transcriptAfterClaim) {
+		if (transcriptAfterClaim && !refresh) {
 			await clearEditTranscriptBackfill(videoId, claim.requestId);
 			return { status: "ready", transcript: transcriptAfterClaim };
 		}

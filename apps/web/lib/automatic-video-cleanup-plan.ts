@@ -56,7 +56,7 @@ export function planAutomaticCleanup(
 				? word.confidence
 				: 0,
 	}));
-	const fillers = planFillerCuts(words, transcript.durationMs);
+	const fillers = planFillerCuts(words, transcript.durationMs, "word-gap");
 	const protectedWords = transcript.words.map((word) => ({
 		startMs: Math.max(0, word.startMs - (word.confidence === 0 ? 350 : 0)),
 		endMs: Math.min(

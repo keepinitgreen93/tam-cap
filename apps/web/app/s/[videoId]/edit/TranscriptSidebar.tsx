@@ -756,7 +756,11 @@ export function TranscriptSidebar({
 
 	const deleteFillers = useCallback(() => {
 		if (!transcript) return;
-		const plan = planFillerCuts(transcript.words, transcript.durationMs);
+		const plan = planFillerCuts(
+			transcript.words,
+			transcript.durationMs,
+			"word-gap",
+		);
 		const activeRanges = plan.ranges.filter((range) =>
 			isTimeKept((range.startMs + range.endMs) / 2, keepRanges),
 		);
@@ -847,12 +851,28 @@ export function TranscriptSidebar({
 		],
 	);
 
-	const handleRequest = useCallback(async () => {
-		setIsRequesting(true);
-		const nextResponse = await requestEditTranscript(videoId);
-		setResponse(nextResponse);
-		setIsRequesting(false);
-	}, [videoId]);
+	const handleRequest = useCallback(
+		async (refresh = false) => {
+			if (refresh) {
+				clearSelection();
+				setSearchQuery("");
+				setSearchMatchIndex(-1);
+				setPreviewFillers(false);
+			}
+			setIsRequesting(true);
+			try {
+				setResponse(await requestEditTranscript(videoId, refresh));
+			} catch {
+				setResponse({
+					status: "error",
+					message: "Could not refresh the transcript. Try again.",
+				});
+			} finally {
+				setIsRequesting(false);
+			}
+		},
+		[videoId, clearSelection],
+	);
 
 	// The verbatim pass only exists to serve this editor, so kick it off the
 	// moment we learn it hasn't run yet instead of asking the user to.
@@ -1041,6 +1061,14 @@ export function TranscriptSidebar({
 					)}
 				</div>
 
+				<button
+					type="button"
+					disabled={isRequesting}
+					onClick={() => void handleRequest(true)}
+					className="mt-2 text-[11px] text-gray-10 underline hover:text-gray-12"
+				>
+					{isRequesting ? "Rechecking fillers..." : "Recheck fillers"}
+				</button>
 				<div className="mt-3 flex h-8 items-center gap-2 rounded-lg bg-gray-3 px-2.5 ring-1 ring-transparent transition focus-within:bg-gray-1 focus-within:ring-blue-500/50">
 					<Search className="size-3.5 shrink-0 text-gray-9" />
 					<input
