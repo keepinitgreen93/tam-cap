@@ -3,7 +3,7 @@ import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import clsx from "clsx";
 import moment from "moment";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 import { editDate } from "@/actions/videos/edit-date";
 import { editTitle } from "@/actions/videos/edit-title";
@@ -39,6 +39,12 @@ export const CapCardContent: React.FC<CapContentProps> = ({
 	const [showFullDate, setShowFullDate] = useState(false);
 	const [title, setTitle] = useState(cap.name);
 	const [isEditing, setIsEditing] = useState(false);
+	const isEditingRef = useRef(isEditing);
+	isEditingRef.current = isEditing;
+
+	useEffect(() => {
+		if (!isEditingRef.current) setTitle(cap.name);
+	}, [cap.name]);
 
 	const handleTitleBlur = async (capName: string) => {
 		if (!title || capName === title) {

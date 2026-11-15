@@ -48,6 +48,10 @@ import {
 } from "@/components/VideoThumbnail";
 import { useEffectMutation, useRpcClient } from "@/lib/EffectRuntime";
 import type { MoveLocation } from "@/lib/move-items";
+import {
+	getRecordingPipelineLabel,
+	type RecordingPipelineStage,
+} from "@/lib/recording-pipeline-stage";
 import { ThumbnailRequest } from "@/lib/Requests/ThumbnailRequest";
 import {
 	copyRichVideoLink,
@@ -111,6 +115,7 @@ export interface CapCardProps extends PropsWithChildren {
 			Record<ViewerSettingKey, SpaceRuleSource[]>
 		>;
 		hasActiveUpload: boolean | undefined;
+		pipelineStage?: RecordingPipelineStage | null;
 		duration?: number;
 		settings?: {
 			disableComments?: boolean;
@@ -825,6 +830,39 @@ export const CapCard = ({
 								uploadProgress.status !== "error"
 							}
 						/>
+						{cap.pipelineStage && !hasVisibleUploadProgress && (
+							<span className="flex absolute bottom-3 left-3 z-30 gap-1.5 items-center px-2 py-1 max-w-[calc(100%-1.5rem)] text-xs font-semibold text-white rounded-full bg-black/70 backdrop-blur-sm">
+								<svg
+									className="w-3 h-3 animate-spin shrink-0"
+									viewBox="0 0 20 20"
+									aria-hidden="true"
+								>
+									<circle
+										cx="10"
+										cy="10"
+										r="8"
+										stroke="currentColor"
+										strokeWidth="3"
+										fill="none"
+										className="text-white/30"
+									/>
+									<circle
+										cx="10"
+										cy="10"
+										r="8"
+										stroke="currentColor"
+										strokeWidth="3"
+										fill="none"
+										strokeLinecap="round"
+										className="text-white"
+										strokeDasharray="12.5 37.5"
+									/>
+								</svg>
+								<span className="truncate">
+									{getRecordingPipelineLabel(cap.pipelineStage)}
+								</span>
+							</span>
+						)}
 						{cap.isScreenshot === true && !hasVisibleUploadProgress && (
 							<span
 								title="Screenshot"

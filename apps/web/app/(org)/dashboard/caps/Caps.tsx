@@ -14,6 +14,7 @@ import { toast } from "sonner";
 import { ChromeRecorderButton } from "@/components/ChromeRecorderButton";
 import { CHROME_EXTENSION_BUTTON_CLASS } from "@/lib/chrome-extension";
 import { useEffectMutation, useRpcClient } from "@/lib/EffectRuntime";
+import type { RecordingPipelineStage } from "@/lib/recording-pipeline-stage";
 import { useVideosAnalyticsQuery } from "@/lib/Queries/Analytics";
 import { useDashboardContext } from "../Contexts";
 import {
@@ -62,6 +63,7 @@ export type VideoData = {
 	inheritedPasswordSources?: SpaceRuleSource[];
 	inheritedSpaceSettings?: Partial<Record<ViewerSettingKey, SpaceRuleSource[]>>;
 	hasActiveUpload: boolean;
+	pipelineStage?: RecordingPipelineStage | null;
 	settings?: Partial<Record<ViewerSettingKey, boolean>> | null;
 }[];
 
@@ -224,6 +226,16 @@ export const Caps = ({
 			window.removeEventListener("keydown", handleKeyDown);
 		};
 	}, [selectedCaps, data, deleteCaps]);
+
+	const hasRecordingInPipeline = data.some((video) => video.pipelineStage);
+
+	useEffect(() => {
+		if (!hasRecordingInPipeline) return;
+		const timer = window.setInterval(() => {
+			if (document.visibilityState === "visible") router.refresh();
+		}, 5000);
+		return () => window.clearInterval(timer);
+	}, [hasRecordingInPipeline, router]);
 
 	useEffect(() => {
 		const handleDragStart = () => setIsDraggingCap(true);

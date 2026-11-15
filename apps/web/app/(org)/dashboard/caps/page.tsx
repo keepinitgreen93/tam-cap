@@ -8,6 +8,7 @@ import {
 	spaces,
 	spaceVideos,
 	users,
+	videoProcessingJobs,
 	videos,
 	videoUploads,
 } from "@cap/database/cloudflare/schema";
@@ -22,6 +23,7 @@ import { and, count, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { type Array, Effect } from "effect";
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
+import { getRecordingPipelineStage } from "@/lib/recording-pipeline-stage";
 import { runPromise } from "@/lib/server";
 import { Caps } from "./Caps";
 
@@ -197,6 +199,8 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 			isScreenshot: videos.isScreenshot,
 			duration: videos.duration,
 			public: videos.public,
+			transcriptionStatus: videos.transcriptionStatus,
+			updatedAt: videos.updatedAt,
 			totalComments: sql<number>`COUNT(DISTINCT CASE WHEN ${comments.type} = 'text' THEN ${comments.id} END)`,
 			totalReactions: sql<number>`COUNT(DISTINCT CASE WHEN ${comments.type} = 'emoji' THEN ${comments.id} END)`,
 			organization: {
@@ -229,6 +233,8 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 			videos.isScreenshot,
 			videos.duration,
 			videos.public,
+			videos.transcriptionStatus,
+			videos.updatedAt,
 			videos.password,
 			videos.settings,
 			videos.orgId,
@@ -286,6 +292,21 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 	const videoIds = videoData.map((video) => video.id);
 	const sharedSpacesMap =
 		await getSharedSpacesForVideos(videoIds).pipe(runPromise);
+	const finalizationJobs =
+		videoIds.length > 0
+			? await db()
+					.select({
+						videoId: videoProcessingJobs.videoId,
+						state: videoProcessingJobs.state,
+						updatedAt: videoProcessingJobs.updatedAt,
+					})
+					.from(videoProcessingJobs)
+					.where(inArray(videoProcessingJobs.videoId, videoIds))
+			: [];
+	const finalizationByVideo = new Map(
+		finalizationJobs.map((job) => [job.videoId as string, job]),
+	);
+	const pipelineCheckedAt = Date.now();
 
 	const processedVideoData = await Effect.all(
 		videoData.map(
@@ -295,8 +316,11 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 				const {
 					effectiveDate: _effectiveDate,
 					organization,
+					transcriptionStatus,
+					updatedAt,
 					...videoWithoutEffectiveDate
 				} = video;
+				const finalization = finalizationByVideo.get(video.id);
 				const sharedSpaces = sharedSpacesMap[video.id] ?? [];
 				const rules = resolveEffectiveVideoRules({
 					videoSettings: video.settings,
@@ -307,6 +331,17 @@ export default async function CapsPage(props: PageProps<"/dashboard/caps">) {
 				return {
 					...videoWithoutEffectiveDate,
 					id: Video.VideoId.make(video.id),
+					pipelineStage: getRecordingPipelineStage(
+						{
+							isScreenshot: video.isScreenshot,
+							transcriptionStatus,
+							metadata: video.metadata,
+							updatedAt,
+							finalizationState: finalization?.state,
+							finalizationUpdatedAt: finalization?.updatedAt,
+						},
+						pipelineCheckedAt,
+					),
 					foldersData,
 					settings: video.settings,
 					hasInheritedPassword: rules.hasInheritedPassword,
