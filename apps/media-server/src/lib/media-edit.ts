@@ -36,10 +36,11 @@ const DEFAULT_OUTPUT_FPS = 30;
 const MAX_TRANSCODE_RANGES_PER_BATCH = 4;
 const EDIT_CRF = 18;
 
+const EDIT_PRESETS = new Set(["veryfast", "ultrafast"]);
+
 function editPreset() {
-	return process.env.MEDIA_SERVER_EDIT_PRESET === "veryfast"
-		? "veryfast"
-		: "fast";
+	const preset = process.env.MEDIA_SERVER_EDIT_PRESET;
+	return preset && EDIT_PRESETS.has(preset) ? preset : "fast";
 }
 
 function roundTime(value: number) {
