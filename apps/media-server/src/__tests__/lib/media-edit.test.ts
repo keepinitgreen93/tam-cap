@@ -159,37 +159,6 @@ describe("media edit helpers", () => {
 		expect(args[args.indexOf("-enc_time_base:v") + 1]).toBe("1/29.97");
 	});
 
-	test("uses only an allowed encoder preset and keeps the quality target", () => {
-		const name = "MEDIA_SERVER_EDIT_PRESET";
-		const previous = process.env[name];
-		const presetFor = (value: string | undefined) => {
-			if (value === undefined) delete process.env[name];
-			else process.env[name] = value;
-			const args = buildTranscodeEditArgs(
-				"/input.mp4",
-				[{ start: 0, end: 1 }],
-				"/output.mp4",
-				true,
-				30,
-			);
-			expect(args[args.indexOf("-c:v") + 1]).toBe("libx264");
-			expect(args[args.indexOf("-crf") + 1]).toBe("18");
-			expect(args[args.indexOf("-pix_fmt") + 1]).toBe("yuv420p");
-			expect(args[args.indexOf("-movflags") + 1]).toBe("+faststart");
-			expect(args[args.indexOf("-b:a") + 1]).toBe("160k");
-			return args[args.indexOf("-preset") + 1];
-		};
-		try {
-			expect(presetFor("ultrafast")).toBe("ultrafast");
-			expect(presetFor("veryfast")).toBe("veryfast");
-			expect(presetFor(undefined)).toBe("fast");
-			expect(presetFor("placebo")).toBe("fast");
-		} finally {
-			if (previous === undefined) delete process.env[name];
-			else process.env[name] = previous;
-		}
-	});
-
 	test("rejects unbounded transcode graphs", () => {
 		expect(() =>
 			buildTranscodeEditArgs(

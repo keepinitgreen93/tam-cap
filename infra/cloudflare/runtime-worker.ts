@@ -229,10 +229,7 @@ export class CapMedia extends CapContainer {
 		MEDIA_SERVER_WEBHOOK_SECRET: this.env.MEDIA_SERVER_WEBHOOK_SECRET,
 		MEDIA_SERVER_MAX_CONCURRENT_VIDEO_PROCESSES: "1",
 		MEDIA_SERVER_MAX_CONCURRENT_DIRECT_CONVERSIONS: "1",
-		// ultrafast renders the cleanup cut about a third faster than veryfast at
-		// the same CRF with equal or better similarity to the source; the files
-		// are about 3.5 times larger. Needs a media image that accepts it.
-		MEDIA_SERVER_EDIT_PRESET: "ultrafast",
+		MEDIA_SERVER_EDIT_PRESET: "veryfast",
 		MEDIA_SERVER_EDIT_DECODE_THREADS: "1",
 		MEDIA_SERVER_EDIT_ENCODE_THREADS: "4",
 		// The finished recording is decoded once to verify it before it is
