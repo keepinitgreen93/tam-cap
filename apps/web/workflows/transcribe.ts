@@ -34,7 +34,10 @@ import {
 	enhanceAudioFromUrl,
 } from "@/lib/audio-enhance";
 import { checkHasAudioTrack, extractAudioFromUrl } from "@/lib/audio-extract";
-import { queueAutomaticVideoCleanup } from "@/lib/automatic-video-cleanup";
+import {
+	queueAutomaticVideoCleanup,
+	startAutomaticCleanupSilencePrewarm,
+} from "@/lib/automatic-video-cleanup";
 import {
 	createEditTranscript,
 	editTranscriptWordsToCaptionVtt,
@@ -196,6 +199,7 @@ export async function transcribeVideoWorkflow(
 				videoData.video,
 				undefined,
 				sourceBase?.sourceKey,
+				true,
 			);
 			audioUrl = audio?.audioUrl ?? null;
 			if (videoDurationMs <= 0) videoDurationMs = audio?.durationMs ?? 0;
@@ -279,13 +283,16 @@ export async function transcribeVideoWorkflow(
 		throw error;
 	}
 
-	await cleanupTempAudio(videoId, userId, videoData.video);
-
+	// The title is written from the finished transcript right away. Cleanup
+	// starts next and carries that title through its cut, so the temporary
+	// audio is removed only after both are on their way.
 	if (aiGenerationEnabled) {
 		await queueAiGeneration(videoId, userId);
 	}
 
 	await queueAutomaticCleanup(videoId, userId, aiGenerationEnabled);
+
+	await cleanupTempAudio(videoId, userId, videoData.video);
 
 	return { success: true, message: "Transcription completed successfully" };
 }
@@ -528,9 +535,13 @@ async function extractAudio(
 	video: typeof videos.$inferSelect,
 	tempAudioFilename?: string,
 	sourceKeyOverride?: string,
+	prewarmCleanup = false,
 ): Promise<ExtractedAudio | null> {
 	"use step";
 	tempAudioFilename ??= transcriptionAudioFilename(video);
+	// Cleanup needs the quiet ranges of this same recording, so they are
+	// measured while the speech is extracted and transcribed.
+	if (prewarmCleanup) startAutomaticCleanupSilencePrewarm(videoId, userId);
 
 	const [bucket] = await Storage.getAccessForVideo(
 		decodeStorageVideo(video),

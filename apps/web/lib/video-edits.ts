@@ -310,6 +310,51 @@ export function remapCurrentOutputTimeThroughEdit(
 	return mapSourceTimeToOutputTime(sourceTime, nextSourceSpec);
 }
 
+/**
+ * Moves chapter starts from the source timeline onto the edited one. A chapter
+ * that began inside a removed range starts at the next kept moment, and
+ * chapters that collapse onto the same second keep the earlier title.
+ */
+export function remapChaptersThroughEdit<T extends { start: number }>(
+	chapters: readonly T[],
+	editSpec: VideoEditSpec,
+): T[] {
+	const { keepRanges } = normalizeKeepRanges(
+		editSpec.keepRanges,
+		editSpec.sourceDuration,
+	);
+	const outputDuration = keepRanges.reduce(
+		(total, range) => total + (range.end - range.start),
+		0,
+	);
+	const lastStart = Math.max(0, Math.ceil(outputDuration) - 1);
+	const remapped: T[] = [];
+	for (const chapter of [...chapters].sort((a, b) => a.start - b.start)) {
+		if (!isFiniteNumber(chapter.start)) continue;
+		let elapsed = 0;
+		let start: number | null = null;
+		for (const range of keepRanges) {
+			if (chapter.start <= range.end + EPSILON) {
+				start =
+					elapsed +
+					clampEditTime(
+						chapter.start - range.start,
+						0,
+						range.end - range.start,
+					);
+				break;
+			}
+			elapsed += range.end - range.start;
+		}
+		if (start === null) continue;
+		const rounded = Math.min(lastStart, Math.max(0, Math.round(start)));
+		const previous = remapped.at(-1);
+		if (previous && rounded <= previous.start) continue;
+		remapped.push({ ...chapter, start: rounded });
+	}
+	return remapped;
+}
+
 export function subtractRanges(
 	baseRanges: VideoEditRange[],
 	deletedRanges: VideoEditRange[],

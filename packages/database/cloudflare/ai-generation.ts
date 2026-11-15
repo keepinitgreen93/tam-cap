@@ -28,6 +28,37 @@ export function ownsAiGeneration(
 	);
 }
 
+/**
+ * Automatic cleanup changes a recording's media revision twice (when the edit
+ * is claimed and when it is published) without changing what was said. Moving
+ * the run to the next revision lets the title and summary written from the
+ * finished transcript survive the cut instead of being generated again.
+ */
+export function rebindAiGenerationRun(
+	current: typeof videos.$inferSelect,
+	nextMetadata: VideoMetadata,
+	next: Partial<
+		Pick<typeof videos.$inferSelect, "source" | "duration" | "width" | "height">
+	> = {},
+): VideoMetadata {
+	const run = current.metadata?.aiGenerationRun;
+	if (
+		!run ||
+		nextMetadata.aiGenerationRun?.id !== run.id ||
+		!ownsAiGeneration(current, run.id)
+	)
+		return nextMetadata;
+	const nextVideo = { ...current, ...next, metadata: nextMetadata };
+	return {
+		...nextMetadata,
+		aiGenerationRun: {
+			...nextMetadata.aiGenerationRun,
+			mediaRevision: transcriptMediaRevision(nextVideo),
+			transcriptId: getTranscriptPublication(nextVideo)?.id ?? null,
+		},
+	};
+}
+
 export async function claimAiGeneration(
 	database: CloudflareDatabase,
 	videoId: Video.VideoId,

@@ -80,6 +80,7 @@ vi.mock("@/lib/transcription-dispatch", () => ({
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/automatic-video-cleanup", () => ({
 	queueAutomaticVideoCleanup: vi.fn(async () => ({ queued: false })),
+	startAutomaticCleanupSilencePrewarm: vi.fn(),
 }));
 
 vi.mock("workflow", () => ({

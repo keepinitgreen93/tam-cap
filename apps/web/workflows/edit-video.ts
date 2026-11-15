@@ -3,6 +3,10 @@ import {
 	CloudFrontClient,
 	CreateInvalidationCommand,
 } from "@aws-sdk/client-cloudfront";
+import {
+	ownsAiGeneration,
+	rebindAiGenerationRun,
+} from "@cap/database/cloudflare/ai-generation";
 import { db } from "@cap/database/cloudflare/application";
 import type { AtomicStatement } from "@cap/database/cloudflare/atomic";
 import { AtomicConflictError } from "@cap/database/cloudflare/atomic";
@@ -53,8 +57,11 @@ import {
 	withEditOperation,
 	withoutEditProcessing,
 } from "@/lib/video-edit-operation";
+import { ensureOriginalSourceCopy } from "@/lib/video-edit-start";
 import {
 	getEditSpecOutputDuration,
+	mapOutputTimeToSourceTime,
+	remapChaptersThroughEdit,
 	remapCurrentOutputTimeThroughEdit,
 } from "@/lib/video-edits";
 import { normalizeVideoFps } from "@/lib/video-metadata";
@@ -70,6 +77,13 @@ interface EditVideoWorkflowPayload {
 	keepRanges: VideoEditRange[];
 	aiGenerationEnabled: boolean;
 	operation: EditOperation;
+	/**
+	 * Automatic cleanup renders from the published recording while its
+	 * preserved original copy is still being written, so the copy no longer
+	 * delays the render. The copy is confirmed before the edit is published.
+	 */
+	renderSourceKey?: string;
+	confirmSourceCopy?: boolean;
 }
 
 interface VideoEditRenderResult {
@@ -81,7 +95,10 @@ interface VideoEditRenderResult {
 	};
 }
 
-const MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS = 720;
+// Each poll costs a queue round trip of a few seconds on top of this wait, so
+// the attempt budget still covers well over an hour of rendering.
+const MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS = 1440;
+const EDIT_COMPLETION_POLL_INTERVAL = "2s";
 const MEDIA_SERVER_DISPATCH_TIMEOUT_MS = 30_000;
 const MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS = 3 * 60 * 60;
 const MEDIA_SERVER_PRESIGNED_PUT_EXPIRES_SECONDS = 3 * 60 * 60;
@@ -146,7 +163,7 @@ export async function editVideoWorkflow(
 			attempt < MEDIA_SERVER_COMPLETION_MAX_ATTEMPTS;
 			attempt++
 		) {
-			await sleep("5s");
+			await sleep(EDIT_COMPLETION_POLL_INTERVAL);
 			result = await readEditCompletion(videoId, sourceKey, operation);
 			if (result) break;
 		}
@@ -154,6 +171,8 @@ export async function editVideoWorkflow(
 			throw new FatalError(
 				"Video edit timed out. Your previous video is preserved; please try again.",
 			);
+		if (payload.confirmSourceCopy)
+			await confirmEditSourceCopy(videoId, sourceKey, operation);
 		await verifyRenderedEditOutput(
 			videoId,
 			userId,
@@ -288,6 +307,7 @@ async function renderVideoEditOnMediaServer(
 	"use step";
 
 	const { videoId, userId, sourceKey, keepRanges, operation } = payload;
+	const renderSourceKey = payload.renderSourceKey ?? sourceKey;
 	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
 	const webhookBaseUrl =
 		serverEnv().MEDIA_SERVER_WEBHOOK_URL || serverEnv().WEB_URL;
@@ -312,7 +332,7 @@ async function renderVideoEditOnMediaServer(
 	).pipe(runWorkflowPromise);
 
 	const sourceUrl = await bucket
-		.getInternalSignedObjectUrl(sourceKey, {
+		.getInternalSignedObjectUrl(renderSourceKey, {
 			expiresIn: MEDIA_SERVER_PRESIGNED_GET_EXPIRES_SECONDS,
 		})
 		.pipe(runWorkflowPromise);
@@ -440,6 +460,26 @@ async function renderVideoEditOnMediaServer(
 		},
 	);
 	return dispatch;
+}
+
+async function confirmEditSourceCopy(
+	videoId: string,
+	sourceKey: string,
+	operation: EditOperation,
+): Promise<void> {
+	"use step";
+	const current = await withEditOperation(
+		videoId,
+		sourceKey,
+		operation,
+		async (_database, _snapshot, video, _upload, state) => ({
+			statements: [],
+			result: { video, published: state.resultCommitted === true },
+		}),
+	);
+	// Once the cut is published the recording's file is the edited one, so it
+	// must never be copied over the preserved original.
+	await ensureOriginalSourceCopy(current.video, sourceKey, !current.published);
 }
 
 async function markEditWaitingForCapacity(
@@ -576,6 +616,48 @@ export async function verifyRenderedEditOutput(
 	}
 
 	throw lastError ?? new Error("Rendered video verification failed");
+}
+
+function isAutomaticCleanupOperation(
+	metadata: VideoMetadata | null,
+	operation: EditOperation,
+) {
+	const cleanup = metadata?.automaticCleanup;
+	return (
+		cleanup?.status === "processing" &&
+		cleanup.operation.token === operation.token &&
+		cleanup.operation.startedAt === operation.startedAt
+	);
+}
+
+function getCarriedAiChapters(
+	video: typeof videos.$inferSelect,
+	operation: EditOperation,
+	transcriptRemapped: boolean,
+	previousSpec: VideoEditSpec,
+	editSpec: VideoEditSpec,
+) {
+	const metadata = video.metadata;
+	const run = metadata?.aiGenerationRun;
+	if (
+		!transcriptRemapped ||
+		!metadata ||
+		!run ||
+		!isAutomaticCleanupOperation(metadata, operation) ||
+		metadata.aiGenerationStatus !== "COMPLETE" ||
+		!metadata.summary ||
+		!Array.isArray(metadata.chapters) ||
+		!ownsAiGeneration(video, run.id)
+	)
+		return null;
+	return remapChaptersThroughEdit(
+		metadata.chapters.map((chapter) => ({
+			...chapter,
+			start:
+				mapOutputTimeToSourceTime(chapter.start, previousSpec) ?? chapter.start,
+		})),
+		editSpec,
+	);
 }
 
 function clearAiMetadata(metadata: VideoMetadata | null): VideoMetadata {
@@ -864,8 +946,32 @@ export async function saveEditResultAndComplete(
 					delete source.audioLevelSourceKey;
 					delete source.audioLevelOutputKey;
 				}
-				const nextMetadata = clearAiMetadata(lockedVideo.metadata);
+				// Automatic cleanup only removes fillers and pauses, so a title and
+				// summary already written from this transcript still describe the
+				// recording. Chapters follow the cut; nothing is generated twice.
+				const carriedChapters = getCarriedAiChapters(
+					lockedVideo,
+					operation,
+					originalTranscript !== null,
+					previousSpec,
+					editSpec,
+				);
+				const nextMetadata: VideoMetadata = carriedChapters
+					? { ...lockedVideo.metadata, chapters: carriedChapters }
+					: clearAiMetadata(lockedVideo.metadata);
 				delete nextMetadata.desktopRecordingUpload;
+				const published = metadataWithTranscriptPublication(
+					lockedVideo,
+					preparedTranscript,
+					{
+						...nextMetadata,
+						editProcessing: {
+							...state,
+							source: JSON.stringify(source),
+							resultCommitted: true,
+						},
+					},
+				);
 				statements.push(
 					database
 						.update(videos)
@@ -874,18 +980,14 @@ export async function saveEditResultAndComplete(
 							width: metadata.width,
 							height: metadata.height,
 							fps: normalizeVideoFps(metadata.fps),
-							metadata: metadataWithTranscriptPublication(
-								lockedVideo,
-								preparedTranscript,
-								{
-									...nextMetadata,
-									editProcessing: {
-										...state,
-										source: JSON.stringify(source),
-										resultCommitted: true,
-									},
-								},
-							),
+							metadata: carriedChapters
+								? rebindAiGenerationRun(lockedVideo, published, {
+										source,
+										width: metadata.width,
+										height: metadata.height,
+										...(duration === undefined ? {} : { duration }),
+									})
+								: published,
 							// Derivable captions keep the transcription COMPLETE; only legacy
 							// videos without a stored word transcript get re-transcribed.
 							...(originalTranscript ? {} : { transcriptionStatus: null }),
@@ -1010,15 +1112,16 @@ async function completeEditProcessing(
 			const statements: AtomicStatement[] = [];
 			if (!state.resultCommitted || upload.phase !== "complete")
 				throw new FatalError("Edit result has not been committed");
+			// A title carried through automatic cleanup follows the recording to
+			// its finished state; any other edit has already invalidated its run.
+			const metadata = rebindAiGenerationRun(video, {
+				...withoutEditProcessing(video.metadata),
+				completedVideoEdit: { ...operation, transcriptRemapped },
+			});
 			statements.push(
 				database
 					.update(videos)
-					.set({
-						metadata: {
-							...withoutEditProcessing(video.metadata),
-							completedVideoEdit: { ...operation, transcriptRemapped },
-						},
-					})
+					.set({ metadata })
 					.where(eq(videos.id, video.id)),
 			);
 			statements.push(

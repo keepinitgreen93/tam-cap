@@ -102,6 +102,7 @@ export const ShareVideo = forwardRef<
 		canFinalizeDesktopSegments?: boolean;
 		showPlaybackStatusBadge?: boolean;
 		isEditProcessing: boolean;
+		isAutomaticCleanupRender?: boolean;
 		recordingStopped?: boolean;
 		earlySegmentPlayback?: boolean;
 		defaultPlaybackSpeed?: number;
@@ -127,6 +128,7 @@ export const ShareVideo = forwardRef<
 			canFinalizeDesktopSegments = false,
 			showPlaybackStatusBadge = false,
 			isEditProcessing,
+			isAutomaticCleanupRender = false,
 			recordingStopped = false,
 			earlySegmentPlayback = false,
 			defaultPlaybackSpeed,
@@ -582,6 +584,7 @@ export const ShareVideo = forwardRef<
 							enableCrossOrigin={enableCrossOrigin}
 							hasActiveUpload={data.hasActiveUpload}
 							blockPlaybackDuringProcessing={isEditProcessing}
+							continuePlaybackThroughProcessing={isAutomaticCleanupRender}
 							onUploadComplete={handleUploadComplete}
 							comments={stampComments}
 							onSeek={handleSeek}
@@ -593,7 +596,9 @@ export const ShareVideo = forwardRef<
 								data.transcriptionStatus === "COMPLETE" ||
 								liveVttContent != null
 							}
-							canRetryProcessing={canRetryProcessing}
+							canRetryProcessing={
+								canRetryProcessing && !isAutomaticCleanupRender
+							}
 							callToAction={callToAction}
 						/>
 					) : (

@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
 	clear: vi.fn(),
 	analyze: vi.fn(),
 	artifacts: vi.fn(),
+	silence: null as unknown,
 }));
 vi.mock("server-only", () => ({}));
 vi.mock("@cap/database/cloudflare/schema", () => ({
@@ -49,12 +50,13 @@ vi.mock("@/lib/analyze-video-silence", () => ({
 }));
 vi.mock("@/lib/silence-analysis-storage", () => ({
 	loadSilenceSource: async () => ({ ...mocks.source, video: mocks.video }),
-	readSilenceResult: async () => null,
+	readSilenceResult: async () => mocks.silence,
 }));
 vi.mock("@/lib/video-edit-start", () => ({
 	ensureOriginalSourceCopy: mocks.copy,
 	markEditProcessing: mocks.claim,
 	getCompletedProcessingReceipt: () => undefined,
+	getPublishedResultKey: () => "published.mp4",
 }));
 vi.mock("@/lib/video-edit-operation", () => ({
 	clearPendingEdit: mocks.clear,
@@ -68,6 +70,7 @@ vi.mock("@/lib/workflow-runtime", () => ({
 import {
 	prepareAutomaticVideoCleanup,
 	queueAutomaticVideoCleanup,
+	startAutomaticCleanupSilencePrewarm,
 } from "@/lib/automatic-video-cleanup";
 
 const request = {
@@ -99,9 +102,14 @@ beforeEach(() => {
 		resultKey: "silence.json",
 		bucket: {
 			getObject: () => Effect.succeed(Option.none()),
-			putObject: () => Effect.succeed(undefined),
+			putObject: (_key: string, body: string) =>
+				Effect.sync(() => {
+					mocks.silence = JSON.parse(body);
+				}),
 		},
 	};
+	mocks.silence = null;
+	mocks.copy.mockResolvedValue("source.mp4");
 	mocks.edit = null;
 	mocks.artifacts.mockResolvedValue({
 		editTranscript: JSON.stringify({
@@ -149,7 +157,7 @@ describe("automatic cleanup service", () => {
 		expect(await prepareAutomaticVideoCleanup(request)).toBeNull();
 		expect(mocks.claim).not.toHaveBeenCalled();
 	});
-	it("preserves the original before dispatching the fenced measured cleanup", async () => {
+	it("preserves the original while dispatching the fenced measured cleanup", async () => {
 		const payload = await prepareAutomaticVideoCleanup(request);
 		expect(payload?.operation.token).toBe(request.requestId);
 		expect(mocks.claim).toHaveBeenCalledWith(
@@ -160,11 +168,69 @@ describe("automatic cleanup service", () => {
 				}),
 			}),
 		);
+		// The copy is started for the claimed source and the render reads the
+		// published recording; the edit workflow confirms the copy later.
 		expect(mocks.copy).toHaveBeenCalledOnce();
+		expect(mocks.copy.mock.calls[0]?.slice(1)).toEqual([
+			payload?.sourceKey,
+			true,
+		]);
+		expect(payload).toMatchObject({
+			renderSourceKey: "published.mp4",
+			confirmSourceCopy: true,
+		});
 		expect(payload?.editSpec.keepRanges).toEqual([
 			{ start: 0, end: 2.15 },
 			{ start: 9.85, end: 10 },
 		]);
+	});
+	it("renders from the existing editing base without another copy", async () => {
+		mocks.video.metadata = {
+			transcriptPublication: { id: "transcript-1", edit: true },
+			editingBase: {
+				version: 1,
+				id: "0d1c7d3a-6a3e-4b0b-9a43-0d6a8a8f7a11",
+				sourceKey: "owner-1/video-1/.recording/base/original.mp4",
+				duration: 10,
+			},
+		};
+		const payload = await prepareAutomaticVideoCleanup(request);
+		expect(payload?.sourceKey).toBe(
+			"owner-1/video-1/.recording/base/original.mp4",
+		);
+		expect(payload).not.toHaveProperty("renderSourceKey");
+		expect(payload).not.toHaveProperty("confirmSourceCopy");
+		expect(mocks.copy.mock.calls[0]?.slice(1)).toEqual([
+			"owner-1/video-1/.recording/base/original.mp4",
+		]);
+	});
+	it("measures quiet ranges once when started during transcription", async () => {
+		let finish: (value: unknown) => void = () => {};
+		mocks.analyze.mockReturnValue(
+			new Promise((resolve) => {
+				finish = resolve;
+			}),
+		);
+		mocks.video.transcriptionStatus = "PROCESSING";
+		startAutomaticCleanupSilencePrewarm(request.videoId, request.ownerId);
+		startAutomaticCleanupSilencePrewarm(request.videoId, request.ownerId);
+		await vi.waitFor(() => expect(mocks.analyze).toHaveBeenCalledOnce());
+		mocks.video.transcriptionStatus = "COMPLETE";
+		const prepared = prepareAutomaticVideoCleanup(request);
+		finish({ ranges: [{ startMs: 2150, endMs: 9850 }], durationMs: 10000 });
+		const payload = await prepared;
+		expect(mocks.analyze).toHaveBeenCalledOnce();
+		expect(payload?.editSpec.keepRanges).toEqual([
+			{ start: 0, end: 2.15 },
+			{ start: 9.85, end: 10 },
+		]);
+	});
+	it("falls back to measuring during cleanup when the early measurement fails", async () => {
+		mocks.analyze.mockRejectedValueOnce(new Error("media server unavailable"));
+		startAutomaticCleanupSilencePrewarm(request.videoId, request.ownerId);
+		const payload = await prepareAutomaticVideoCleanup(request);
+		expect(mocks.analyze).toHaveBeenCalledTimes(2);
+		expect(payload?.operation.token).toBe(request.requestId);
 	});
 	it("recovers the same operation after a step crashes following its claim", async () => {
 		const operation = {

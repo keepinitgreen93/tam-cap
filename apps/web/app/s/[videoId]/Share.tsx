@@ -196,6 +196,7 @@ interface ShareProps {
 	userOrganizations?: { id: string; name: string }[];
 	viewerId?: string | null;
 	isEditProcessing: boolean;
+	isAutomaticCleanupRender?: boolean;
 	recordingStopped?: boolean;
 	earlySegmentPlayback?: boolean;
 	defaultPlaybackSpeed?: number;
@@ -330,6 +331,7 @@ export const Share = ({
 	videoSettings,
 	viewerId,
 	isEditProcessing,
+	isAutomaticCleanupRender = false,
 	recordingStopped = false,
 	earlySegmentPlayback = false,
 	defaultPlaybackSpeed,
@@ -998,6 +1000,7 @@ export const Share = ({
 														}
 														showPlaybackStatusBadge={viewerId === data.owner.id}
 														isEditProcessing={isEditProcessing}
+														isAutomaticCleanupRender={isAutomaticCleanupRender}
 														recordingStopped={recordingStopped}
 														earlySegmentPlayback={earlySegmentPlayback}
 														defaultPlaybackSpeed={defaultPlaybackSpeed}

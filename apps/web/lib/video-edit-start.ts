@@ -1,6 +1,7 @@
 import "server-only";
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { rebindAiGenerationRun } from "@cap/database/cloudflare/ai-generation";
 import { db } from "@cap/database/cloudflare/application";
 import { type AtomicStatement, atomic } from "@cap/database/cloudflare/atomic";
 import {
@@ -94,6 +95,18 @@ export async function getVideoBucket(video: typeof videos.$inferSelect) {
 	return bucket;
 }
 
+/** The object the share page is currently playing for this recording. */
+export function getPublishedResultKey(video: typeof videos.$inferSelect) {
+	const resultKey =
+		(video.source.type === "desktopMP4" || video.source.type === "webMP4") &&
+		video.source.outputKey
+			? video.source.outputKey
+			: getResultKey(video.ownerId, video.id);
+	if (!isVideoStorageKey(video, resultKey))
+		throw new Error("Invalid video source");
+	return resultKey;
+}
+
 export async function ensureOriginalSourceCopy(
 	video: typeof videos.$inferSelect,
 	sourceKey = getEditSourceKey(video.ownerId, video.id, video.metadata),
@@ -105,13 +118,7 @@ export async function ensureOriginalSourceCopy(
 	if (!hasSource) {
 		if (!copyIfMissing)
 			throw new Error("Original editing base is no longer available");
-		const resultKey =
-			(video.source.type === "desktopMP4" || video.source.type === "webMP4") &&
-			video.source.outputKey
-				? video.source.outputKey
-				: getResultKey(video.ownerId, video.id);
-		if (!isVideoStorageKey(video, resultKey))
-			throw new Error("Invalid video source");
+		const resultKey = getPublishedResultKey(video);
 		await bucket
 			.copyObject(`${bucket.bucketName}/${resultKey}`, sourceKey)
 			.pipe(runWorkflowPromise);
@@ -243,7 +250,7 @@ export async function markEditProcessing({
 				updatedAt: startedAt,
 			}),
 		);
-		const metadata = {
+		const claimed = {
 			...(current.metadata ?? {}),
 			...(automaticCleanup ? { automaticCleanup } : {}),
 			editProcessing: {
@@ -257,6 +264,11 @@ export async function markEditProcessing({
 				dispatch: "pending" as const,
 			},
 		};
+		// The title and summary being written from this transcript stay valid
+		// while cleanup renders; a manual edit still invalidates them.
+		const metadata = automaticCleanup
+			? rebindAiGenerationRun(current, claimed)
+			: claimed;
 		statements.push(
 			database
 				.update(videos)

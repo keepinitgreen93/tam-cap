@@ -152,6 +152,7 @@ test("media uses burst CPU but never sleeps while a render is active", async () 
 	assert.equal(started.instance, "standard-4");
 	assert.equal(started.env.MEDIA_SERVER_MAX_CONCURRENT_VIDEO_PROCESSES, "1");
 	assert.equal(started.env.MEDIA_SERVER_EDIT_PRESET, "veryfast");
+	assert.equal(started.env.MEDIA_SERVER_VERIFY_DECODE_THREADS, "4");
 	assert.equal(app.sleepAfter, "1m");
 	let activeJobs = 1;
 	let renewed = 0;

@@ -964,13 +964,21 @@ async function AuthorizedContent({
 			? parseShareCallToAction(video.videoSettings)
 			: null,
 	};
-	const isEditProcessing =
+	const isEditRender =
 		isEditSourceKey({
 			ownerId: video.owner.id,
 			videoId,
 			rawFileKey: video.activeUploadRawFileKey,
 			metadata: video.metadata,
 		}) && !video.isScreenshot;
+	// Automatic cleanup renders in the background: the published recording
+	// stays the original until the cut is committed, so it remains watchable.
+	const isAutomaticCleanupRender =
+		isEditRender &&
+		video.metadata?.automaticCleanup?.status === "processing" &&
+		video.metadata.editProcessing?.token ===
+			video.metadata.automaticCleanup.operation.token;
+	const isEditProcessing = isEditRender && !isAutomaticCleanupRender;
 
 	const defaultPlaybackSpeed = resolveDefaultPlaybackSpeed(
 		video.videoSettings?.defaultPlaybackSpeed,
@@ -1049,6 +1057,7 @@ async function AuthorizedContent({
 				captionsInitiallyOff={captionsInitiallyOff}
 				canRecordMedia={canRecordMedia}
 				isEditProcessing={isEditProcessing}
+				isAutomaticCleanupRender={isAutomaticCleanupRender}
 				recordingStopped={recordingStopped}
 				earlySegmentPlayback={earlySegmentPlayback}
 				defaultPlaybackSpeed={defaultPlaybackSpeed}

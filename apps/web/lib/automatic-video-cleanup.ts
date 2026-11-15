@@ -14,6 +14,7 @@ import { writableVideo } from "@cap/web-backend/src/Videos/persistence";
 import { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import { Option } from "effect";
+import { RetryableError } from "workflow";
 import { start } from "workflow/api";
 import { analyzeVideoSilence } from "@/lib/analyze-video-silence";
 import { planAutomaticCleanup } from "@/lib/automatic-video-cleanup-plan";
@@ -30,6 +31,7 @@ import { getEditSourceKey } from "@/lib/video-edit-processing";
 import {
 	ensureOriginalSourceCopy,
 	getCompletedProcessingReceipt,
+	getPublishedResultKey,
 	markEditProcessing,
 } from "@/lib/video-edit-start";
 import { getVideoEditingBase } from "@/lib/video-editing-base";
@@ -82,7 +84,16 @@ export async function queueAutomaticVideoCleanup(
 	return { queued: true };
 }
 
-function editPayload(request: AutomaticCleanupRequest, cleanup: Cleanup) {
+/**
+ * A recording without an editing base renders from the published file while
+ * its preserved original is copied alongside; the edit workflow confirms that
+ * copy before it publishes the cut.
+ */
+function editPayload(
+	request: AutomaticCleanupRequest,
+	cleanup: Cleanup,
+	video: typeof videos.$inferSelect,
+) {
 	return {
 		videoId: request.videoId,
 		userId: request.ownerId,
@@ -92,7 +103,113 @@ function editPayload(request: AutomaticCleanupRequest, cleanup: Cleanup) {
 		keepRanges: cleanup.editSpec.keepRanges,
 		operation: cleanup.operation,
 		aiGenerationEnabled: request.aiGenerationEnabled,
+		...(getVideoEditingBase(video)
+			? {}
+			: {
+					renderSourceKey: getPublishedResultKey(video),
+					confirmSourceCopy: true,
+				}),
 	};
+}
+
+const PREWARM_MINIMUM_MS = 60_000;
+const PREWARM_MAXIMUM_MS = 15 * 60_000;
+const PREWARM_BUSY_ATTEMPTS = 8;
+const PREWARM_BUSY_WAIT_MS = 3_000;
+const silencePrewarms = new Map<string, Promise<boolean>>();
+const sourceCopies = new Map<string, Promise<boolean>>();
+
+/**
+ * Starts measuring quiet ranges without waiting for the result, so the
+ * measurement overlaps the transcription instead of following it. The work is
+ * a cache fill owned by this process: if the process stops, cleanup measures
+ * the audio itself exactly as it did before.
+ */
+export function startAutomaticCleanupSilencePrewarm(
+	videoId: string,
+	ownerId: string,
+) {
+	if (!automaticVideoCleanupEnabled() || silencePrewarms.has(videoId)) return;
+	const run = prewarmAutomaticCleanupSilence(videoId, ownerId).finally(() => {
+		if (silencePrewarms.get(videoId) === run) silencePrewarms.delete(videoId);
+	});
+	silencePrewarms.set(videoId, run);
+}
+
+async function prewarmAutomaticCleanupSilence(
+	videoId: string,
+	ownerId: string,
+) {
+	try {
+		const id = Video.VideoId.make(videoId);
+		const [video] = await db()
+			.select()
+			.from(videos)
+			.where(and(writableVideo, eq(videos.id, id)));
+		if (
+			!video ||
+			video.ownerId !== ownerId ||
+			video.isScreenshot ||
+			video.metadata?.automaticCleanup ||
+			video.metadata?.completedVideoEdit ||
+			video.metadata?.editProcessing
+		)
+			return false;
+		const source = await loadSilenceSource(id, ownerId);
+		if (await readSilenceResult(source)) return true;
+		const timeoutMs = Math.min(
+			PREWARM_MAXIMUM_MS,
+			PREWARM_MINIMUM_MS + Math.round(source.durationMs * 0.2),
+		);
+		let analysis: Awaited<ReturnType<typeof analyzeVideoSilence>> | undefined;
+		// The media server finishes publishing the recording's previews just
+		// after transcription starts, so a busy answer is asked again shortly.
+		for (let attempt = 0; !analysis; attempt++) {
+			try {
+				analysis = await analyzeVideoSilence(source, timeoutMs);
+			} catch (error) {
+				if (
+					!(error instanceof RetryableError) ||
+					attempt + 1 >= PREWARM_BUSY_ATTEMPTS
+				)
+					throw error;
+				await new Promise((resolve) =>
+					setTimeout(resolve, PREWARM_BUSY_WAIT_MS),
+				);
+			}
+		}
+		const current = await loadSilenceSource(id, ownerId);
+		if (source.revision !== current.revision) return false;
+		await source.bucket
+			.putObject(source.resultKey, JSON.stringify(analysis), {
+				contentType: "application/json",
+			})
+			.pipe(runWorkflowPromise);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Writes the preserved original while the render is already running. The
+ * render reads the published recording, which holds the same bytes, and the
+ * edit workflow confirms this copy exists before it publishes the cut.
+ */
+function startOriginalSourceCopy(
+	video: typeof videos.$inferSelect,
+	sourceKey: string,
+) {
+	if (sourceCopies.has(sourceKey)) return;
+	const run = ensureOriginalSourceCopy(video, sourceKey, true)
+		.then(
+			() => true,
+			() => false,
+		)
+		.finally(() => {
+			if (sourceCopies.get(sourceKey) === run) sourceCopies.delete(sourceKey);
+		});
+	sourceCopies.set(sourceKey, run);
 }
 
 export async function prepareAutomaticVideoCleanup(
@@ -114,12 +231,11 @@ export async function prepareAutomaticVideoCleanup(
 			getEditProcessingState(video.metadata)?.token !== existing.operation.token
 		)
 			return null;
-		await ensureOriginalSourceCopy(
-			video,
-			existing.sourceKey,
-			!getVideoEditingBase(video),
-		);
-		return editPayload(request, existing);
+		if (getVideoEditingBase(video))
+			await ensureOriginalSourceCopy(video, existing.sourceKey);
+		else if (!getEditProcessingState(video.metadata)?.resultCommitted)
+			startOriginalSourceCopy(video, existing.sourceKey);
+		return editPayload(request, existing, video);
 	}
 	if (
 		video.metadata?.editProcessing ||
@@ -133,6 +249,9 @@ export async function prepareAutomaticVideoCleanup(
 		.from(videoEdits)
 		.where(eq(videoEdits.videoId, videoId));
 	if (edit) return null;
+	// A measurement started during transcription is finished rather than
+	// repeated; the media server only runs one at a time.
+	await silencePrewarms.get(request.videoId);
 	const source = await loadSilenceSource(videoId, request.ownerId);
 	const artifacts = await readTranscriptArtifacts(video, {
 		getText: async (key) =>
@@ -217,12 +336,10 @@ export async function prepareAutomaticVideoCleanup(
 		completedUpload: getCompletedProcessingReceipt(video, upload),
 		automaticCleanup: cleanup,
 	});
-	await ensureOriginalSourceCopy(
-		video,
-		cleanup.sourceKey,
-		!getVideoEditingBase(video),
-	);
-	return editPayload(request, cleanup);
+	if (getVideoEditingBase(video))
+		await ensureOriginalSourceCopy(video, cleanup.sourceKey);
+	else startOriginalSourceCopy(video, cleanup.sourceKey);
+	return editPayload(request, cleanup, video);
 }
 
 export async function finishAutomaticVideoCleanup(

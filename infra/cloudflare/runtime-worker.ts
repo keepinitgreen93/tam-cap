@@ -232,6 +232,10 @@ export class CapMedia extends CapContainer {
 		MEDIA_SERVER_EDIT_PRESET: "veryfast",
 		MEDIA_SERVER_EDIT_DECODE_THREADS: "1",
 		MEDIA_SERVER_EDIT_ENCODE_THREADS: "4",
+		// The finished recording is decoded once to verify it before it is
+		// published. Decoded frames are identical for any thread count, so the
+		// check uses all four cores instead of one.
+		MEDIA_SERVER_VERIFY_DECODE_THREADS: "4",
 	};
 
 	async onActivityExpired() {

@@ -78,6 +78,7 @@ vi.mock("@cap/database/cloudflare/application", () => ({
 vi.mock("server-only", () => ({}));
 vi.mock("@/lib/automatic-video-cleanup", () => ({
 	queueAutomaticVideoCleanup: vi.fn(async () => ({ queued: false })),
+	startAutomaticCleanupSilencePrewarm: vi.fn(),
 }));
 
 vi.mock("workflow", async () => {
@@ -283,6 +284,14 @@ describe("transcribeVideoWorkflow", () => {
 
 		expect(result.success).toBe(true);
 		expect(mocks.transcribe).toHaveBeenCalledTimes(1);
+		// Cleanup's quiet ranges are measured while the speech is transcribed.
+		const { startAutomaticCleanupSilencePrewarm } = await import(
+			"@/lib/automatic-video-cleanup"
+		);
+		expect(startAutomaticCleanupSilencePrewarm).toHaveBeenCalledWith(
+			"video-123",
+			"user-456",
+		);
 		expect(mocks.transcribe.mock.calls[0]?.[0]).toMatchObject({
 			disfluencies: true,
 			speech_models: ["universal-3-5-pro", "universal-2"],

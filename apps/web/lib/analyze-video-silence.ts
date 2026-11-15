@@ -5,13 +5,21 @@ import { silenceAnalysisSchema } from "@/lib/silence-analysis-contract";
 import type { loadSilenceSource } from "@/lib/silence-analysis-storage";
 import { runWorkflowPromise } from "@/lib/workflow-runtime";
 
+const ANALYSIS_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+// The media container starts in about ten seconds; a longer pause only delays
+// the cleanup that is waiting on this measurement.
+const BUSY_RETRY_MS = 5_000;
+
 export async function analyzeVideoSilence(
 	source: Awaited<ReturnType<typeof loadSilenceSource>>,
+	timeoutMs = ANALYSIS_TIMEOUT_MS,
 ) {
 	const env = serverEnv();
 	if (!env.MEDIA_SERVER_URL || !env.MEDIA_SERVER_WEBHOOK_SECRET)
 		throw new FatalError("Media processing is unavailable");
-	const signal = AbortSignal.timeout(6 * 60 * 60 * 1000);
+	const signal = AbortSignal.timeout(
+		Math.min(ANALYSIS_TIMEOUT_MS, Math.max(1_000, timeoutMs)),
+	);
 	const sourceUrl =
 		source.bucket.provider === "googleDrive"
 			? null
@@ -83,7 +91,7 @@ export async function analyzeVideoSilence(
 		if (response.status === 429 || response.status >= 500)
 			throw new RetryableError(
 				"Silence processing is temporarily unavailable",
-				{ retryAfter: 30_000 },
+				{ retryAfter: BUSY_RETRY_MS },
 			);
 		throw new FatalError(`Silence processing failed (${response.status})`);
 	}

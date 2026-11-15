@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import type { CloudflareDatabase } from "@cap/database/cloudflare";
+import { rebindAiGenerationRun } from "@cap/database/cloudflare/ai-generation";
 import { db } from "@cap/database/cloudflare/application";
 import {
 	type AtomicPlan,
@@ -204,7 +205,12 @@ export async function clearPendingEdit(
 		statements.push(
 			database
 				.update(videos)
-				.set({ metadata: withoutEditProcessing(video.metadata) })
+				.set({
+					metadata: rebindAiGenerationRun(
+						video,
+						withoutEditProcessing(video.metadata),
+					),
+				})
 				.where(eq(videos.id, video.id)),
 		);
 		statements.push(
@@ -254,7 +260,12 @@ export async function clearFailedEdit(
 			database
 				.update(videos)
 				.set({
-					metadata: withoutEditProcessing(video.metadata),
+					metadata: state?.resultCommitted
+						? withoutEditProcessing(video.metadata)
+						: rebindAiGenerationRun(
+								video,
+								withoutEditProcessing(video.metadata),
+							),
 					...(state?.resultCommitted ? { transcriptionStatus: null } : {}),
 				})
 				.where(eq(videos.id, video.id)),

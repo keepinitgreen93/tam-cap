@@ -113,6 +113,12 @@ interface Props {
 	enableCrossOrigin?: boolean;
 	hasActiveUpload: boolean | undefined;
 	blockPlaybackDuringProcessing?: boolean;
+	/**
+	 * Background processing that leaves the published recording watchable. A
+	 * viewer who has started playback finishes the version they opened instead
+	 * of being returned to the start when the processed one is published.
+	 */
+	continuePlaybackThroughProcessing?: boolean;
 	disableCommentStamps?: boolean;
 	disableReactionStamps?: boolean;
 	disablePreviewGif?: boolean;
@@ -165,6 +171,7 @@ export function CapVideoPlayer({
 	enableCrossOrigin = false,
 	hasActiveUpload,
 	blockPlaybackDuringProcessing = false,
+	continuePlaybackThroughProcessing = false,
 	comments = NO_COMMENTS,
 	disableCommentStamps = false,
 	disableReactionStamps = false,
@@ -744,6 +751,15 @@ export function CapVideoPlayer({
 				includeFetching: trackUploadProgress,
 			})
 		) {
+			const playing = videoRef.current;
+			if (
+				continuePlaybackThroughProcessing &&
+				resolvedSrc.data?.type === "mp4" &&
+				playing &&
+				playing.currentTime > 0 &&
+				!playing.ended
+			)
+				return;
 			setHasError(false);
 			setHasTriedRawFallback(false);
 			initialPlaybackUrlUsed.current = initialPlaybackUrl;
@@ -773,6 +789,7 @@ export function CapVideoPlayer({
 			onUploadComplete?.();
 		}
 	}, [
+		continuePlaybackThroughProcessing,
 		enableCrossOrigin,
 		initialPlaybackUrl,
 		onUploadComplete,
@@ -781,6 +798,7 @@ export function CapVideoPlayer({
 		resolvedSrc.data,
 		trackUploadProgress,
 		uploadProgressRaw,
+		videoRef,
 		videoSrc,
 	]);
 

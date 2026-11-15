@@ -45,9 +45,11 @@ function isRecent(value: Timestamp, windowMs: number, now: number) {
 
 /**
  * Describes the automatic work still running on a recording after its upload:
- * finalization, transcription, automatic cleanup, then the AI title and
- * summary. Every stage is bounded by the time of its last recorded activity so
- * an abandoned or failed run cannot leave a card marked as processing forever.
+ * finalization, transcription, the AI title and summary, then automatic
+ * cleanup. The title is written from the finished transcript while cleanup is
+ * prepared, and cleanup keeps it, so the title stage comes first and is short.
+ * Every stage is bounded by the time of its last recorded activity so an
+ * abandoned or failed run cannot leave a card marked as processing forever.
  */
 export function getRecordingPipelineStage(
 	input: RecordingPipelineInput,
@@ -56,15 +58,13 @@ export function getRecordingPipelineStage(
 	if (input.isScreenshot) return null;
 	const metadata = input.metadata ?? {};
 	const cleanup = metadata.automaticCleanup;
-
-	if (cleanup?.status === "processing")
-		return isRecent(cleanup.operation?.startedAt, ACTIVE_STEP_WINDOW, now)
-			? "cleaning"
-			: null;
-
 	const status = input.transcriptionStatus ?? null;
+	const cleaning =
+		cleanup?.status === "processing" &&
+		isRecent(cleanup.operation?.startedAt, ACTIVE_STEP_WINDOW, now);
 
-	if (status === "PROCESSING")
+	if (status === "PROCESSING") {
+		if (cleaning) return "cleaning";
 		return isRecent(
 			metadata.transcriptionRun?.requestedAt ?? input.updatedAt,
 			ACTIVE_STEP_WINDOW,
@@ -72,27 +72,46 @@ export function getRecordingPipelineStage(
 		)
 			? "transcribing"
 			: null;
+	}
 
 	if (status === "COMPLETE") {
 		const ai = metadata.aiGenerationStatus;
-		if (ai === "QUEUED" || ai === "PROCESSING")
-			return isRecent(
+		if (
+			(ai === "QUEUED" || ai === "PROCESSING") &&
+			isRecent(
 				metadata.aiGenerationRun?.requestedAt ?? input.updatedAt,
 				ACTIVE_STEP_WINDOW,
 				now,
 			)
-				? "titling"
-				: null;
-		if (ai || metadata.aiTitle || metadata.summary || metadata.chapters?.length)
-			return null;
-		const transcriptRequestedAt = metadata.transcriptionRun?.requestedAt;
-		if (
-			transcriptRequestedAt &&
-			!isRecent(transcriptRequestedAt, ACTIVE_STEP_WINDOW, now)
 		)
-			return null;
-		if (!isRecent(input.updatedAt, HANDOFF_WINDOW, now)) return null;
-		return cleanup ? "titling" : "cleaning";
+			return "titling";
+		if (cleaning) return "cleaning";
+		if (ai === "QUEUED" || ai === "PROCESSING") return null;
+		if (cleanup?.status === "processing") return null;
+
+		const transcriptRequestedAt = metadata.transcriptionRun?.requestedAt;
+		const handoff =
+			(!transcriptRequestedAt ||
+				isRecent(transcriptRequestedAt, ACTIVE_STEP_WINDOW, now)) &&
+			isRecent(input.updatedAt, HANDOFF_WINDOW, now);
+		const hasAiOutput = Boolean(
+			ai || metadata.aiTitle || metadata.summary || metadata.chapters?.length,
+		);
+
+		// Cleanup has run (or an edit replaced it): only a title that still
+		// has to be written after the cut keeps the card busy.
+		if (cleanup || metadata.completedVideoEdit)
+			return !hasAiOutput && handoff ? "titling" : null;
+
+		// Cleanup has not claimed the recording yet. Without any AI output the
+		// title is next; with it, the cut is being prepared. An older recording
+		// without a recorded transcription run never reaches cleanup this way.
+		if (!hasAiOutput) return handoff ? "titling" : null;
+		return transcriptRequestedAt &&
+			metadata.transcriptPublication?.edit &&
+			handoff
+			? "cleaning"
+			: null;
 	}
 
 	if (status === null) {
@@ -108,7 +127,7 @@ export function getRecordingPipelineStage(
 				: null;
 	}
 
-	return null;
+	return cleaning ? "cleaning" : null;
 }
 
 export function getRecordingPipelineLabel(stage: RecordingPipelineStage) {
