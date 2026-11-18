@@ -1,3 +1,10 @@
+import {
+	type AudioChunk,
+	indexMp3Frames,
+	mp3DurationMs,
+	splitMp3,
+} from "./mp3-chunks";
+
 export const CLOUDFLARE_SPEECH_MODEL = "@cf/openai/whisper-large-v3-turbo";
 
 export interface CloudflareTranscriptWord {
@@ -135,7 +142,7 @@ export function parseCloudflareTranscription(
 	};
 }
 
-export async function transcribeWithCloudflare(
+async function requestCloudflareTranscription(
 	audio: Uint8Array,
 	language: string,
 	credentials: { accountId?: string; apiToken?: string },
@@ -205,4 +212,169 @@ export async function transcribeWithCloudflare(
 		);
 	}
 	return parseCloudflareTranscription(result, sourceDurationMs);
+}
+
+type Fetcher = (
+	input: RequestInfo | URL,
+	init?: RequestInit,
+) => Promise<Response>;
+
+/**
+ * One Whisper call is limited by the 120 second request timeout, and Whisper
+ * needs about 4-5 seconds per audio minute, so a single request cannot cover a
+ * recording longer than roughly 20 minutes (a 21 minute recording failed four
+ * times in a row). Longer audio is cut into short frame-aligned pieces that
+ * are transcribed in parallel, which also shortens ordinary recordings.
+ */
+export const CLOUDFLARE_CHUNK_THRESHOLD_MS = 270_000;
+export const CLOUDFLARE_CHUNK_MS = 180_000;
+export const CLOUDFLARE_CHUNK_OVERLAP_MS = 2_000;
+export const CLOUDFLARE_CHUNK_CONCURRENCY = 4;
+const CLOUDFLARE_CHUNK_ATTEMPTS = 2;
+const CHUNK_DURATION_SLACK_MS = 2_000;
+
+async function transcribeChunk(
+	chunk: AudioChunk,
+	language: string,
+	credentials: { accountId?: string; apiToken?: string },
+	fetcher: Fetcher,
+): Promise<CloudflareTranscript> {
+	const durationMs = chunk.endMs - chunk.startMs + CHUNK_DURATION_SLACK_MS;
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return await requestCloudflareTranscription(
+				chunk.audio,
+				language,
+				credentials,
+				fetcher,
+				"audio/mpeg",
+				durationMs,
+			);
+		} catch (error) {
+			if (
+				!(error instanceof CloudflareTranscriptionError) ||
+				!error.retryable ||
+				attempt >= CLOUDFLARE_CHUNK_ATTEMPTS
+			)
+				throw error;
+		}
+	}
+}
+
+async function transcribeChunked(
+	chunks: AudioChunk[],
+	language: string,
+	credentials: { accountId?: string; apiToken?: string },
+	fetcher: Fetcher,
+	sourceDurationMs: number,
+): Promise<CloudflareTranscript> {
+	const results: CloudflareTranscript[] = new Array(chunks.length);
+	let nextIndex = 0;
+	let chunkLanguage = language;
+	if (language === "auto") {
+		// Detect the language once so every piece is decoded in the same language.
+		const first = await transcribeChunk(
+			chunks[0] as AudioChunk,
+			language,
+			credentials,
+			fetcher,
+		);
+		results[0] = first;
+		nextIndex = 1;
+		if (first.language_code) chunkLanguage = first.language_code;
+	}
+	const workers = Array.from(
+		{
+			length: Math.min(CLOUDFLARE_CHUNK_CONCURRENCY, chunks.length - nextIndex),
+		},
+		async () => {
+			while (nextIndex < chunks.length) {
+				const index = nextIndex++;
+				results[index] = await transcribeChunk(
+					chunks[index] as AudioChunk,
+					chunkLanguage,
+					credentials,
+					fetcher,
+				);
+			}
+		},
+	);
+	await Promise.all(workers);
+
+	const words: CloudflareTranscriptWord[] = [];
+	for (const [index, result] of results.entries()) {
+		const chunk = chunks[index] as AudioChunk;
+		for (const word of result.words) {
+			const start = word.start + Math.round(chunk.startMs);
+			const end = word.end + Math.round(chunk.startMs);
+			const middle = (start + end) / 2;
+			if (middle < chunk.coreStartMs || middle >= chunk.coreEndMs) continue;
+			if (start >= sourceDurationMs) continue;
+			const clampedEnd = Math.min(end, sourceDurationMs);
+			words.push({
+				...word,
+				start: Math.min(start, clampedEnd - 1),
+				end: clampedEnd,
+			});
+		}
+	}
+	words.sort((a, b) => a.start - b.start || a.end - b.end);
+	return {
+		id: "cloudflare",
+		status: words.length ? "completed" : "error",
+		...(words.length ? {} : { error: "No spoken audio" }),
+		words,
+		audio_duration: sourceDurationMs / 1000,
+		language_code:
+			results.find((result) => result.language_code)?.language_code ?? null,
+		speech_model_used: CLOUDFLARE_SPEECH_MODEL,
+	};
+}
+
+export async function transcribeWithCloudflare(
+	audio: Uint8Array,
+	language: string,
+	credentials: { accountId?: string; apiToken?: string },
+	fetcher: Fetcher = fetch,
+	contentType = "audio/mpeg",
+	sourceDurationMs?: number,
+): Promise<CloudflareTranscript> {
+	if (
+		finiteNumber(sourceDurationMs) &&
+		sourceDurationMs > CLOUDFLARE_CHUNK_THRESHOLD_MS &&
+		audio.byteLength > 0 &&
+		credentials.accountId &&
+		/^[a-f0-9]{32}$/i.test(credentials.accountId) &&
+		credentials.apiToken?.trim()
+	) {
+		const frames = indexMp3Frames(audio);
+		// Only split a stream that really covers the recording; otherwise word
+		// times could not be placed on its timeline.
+		if (
+			frames &&
+			Math.abs(mp3DurationMs(frames) - sourceDurationMs) <=
+				Math.max(5_000, sourceDurationMs * 0.02)
+		) {
+			return transcribeChunked(
+				splitMp3(
+					audio,
+					frames,
+					CLOUDFLARE_CHUNK_MS,
+					CLOUDFLARE_CHUNK_OVERLAP_MS,
+				),
+				language,
+				credentials,
+				fetcher,
+				sourceDurationMs,
+			);
+		}
+	}
+	return requestCloudflareTranscription(
+		audio,
+		language,
+		credentials,
+		fetcher,
+		contentType,
+		sourceDurationMs,
+	);
 }
