@@ -1,6 +1,6 @@
 # TAM Cap Cloudflare infrastructure
 
-This directory contains the platform foundation and the application runtime for the Cap fork. The application is live at https://videos.trulyauthenticmarketing.com with production readiness and maintenance enabled. The separate platform health endpoint returns `applicationReady: false`; it is an infrastructure probe, not the application status. Current component digests are pinned in `releases/production-cd640f6-fast-pipeline.json`; `EXECUTION_LEDGER.md` records acceptance and its qualifications.
+This directory contains the platform foundation and the application runtime for the Cap fork. The application is live at https://videos.trulyauthenticmarketing.com with production readiness and maintenance enabled. The separate platform health endpoint returns `applicationReady: false`; it is an infrastructure probe, not the application status. Current component digests are pinned in `releases/production-bd95370-long-transcription.json`; `EXECUTION_LEDGER.md` records acceptance and its qualifications.
 
 ## Start using Cap
 

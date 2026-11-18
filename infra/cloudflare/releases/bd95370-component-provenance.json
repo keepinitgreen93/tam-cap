@@ -1,0 +1,7 @@
+{
+	"webSourceRevision": "bd953700cd06e3d3b189fcb5210f41d33d648d7c",
+	"mediaSourceRevision": "a72295c8e044bc3f57c6dd1028c29b6ed1ddd56e",
+	"webImage": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-web@sha256:5ef74da0409fc8a0e48f0bb441e5167a3d64da36f800b210d69c3046f5ccbb87",
+	"mediaImage": "registry.cloudflare.com/c1e96a4b36c73f3cf4ddf50a90082d94/tam-cap-media@sha256:7bf7c85a6d29206429342ac6ee395c7c1083cc4d1e529b1c65a95889fbb69e7c",
+	"webBuildRun": "https://github.com/keepinitgreen93/tam-cap/actions/runs/44371353937"
+}
